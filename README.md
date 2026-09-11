@@ -112,9 +112,9 @@ Then ask: _"Open Safari, find the cheapest flight to Denver on Tuesday and put i
 | Zoom into a region at full resolution       | **✅**                 | ❌                 | ✅                       | ❌          | ❌        | ❌                | ❌                        | Anthropic's toolset has `zoom`; here it is a tool on every platform.                                                                                                                                                                            |
 | Screenshots carry screen-coordinate mapping | **✅**                 | n/a                | n/a                      | ❌          | ❌        | ❌                | ❌                        | Origin and pixels-per-point in every capture, so clicks from Retina or downscaled images land.                                                                                                                                                  |
 | Hover, wait, label query                    | **✅**                 | ⚠️                 | ⚠️                       | ✅          | ⚠️        | ❌                | ⚠️                        | Windows-MCP has Wait/WaitFor; MacOS-MCP has Wait; Anthropic has `wait`/`mouse_move`.                                                                                                                                                            |
-| Your signed-in Chrome, own tab group        | **✅**                 | ⚠️                 | ❌                       | ⚠️          | ❌        | ❌                | ❌                        | Codex uses its in-app browser; Windows-MCP reads the DOM of open browsers. Munim Computer Use opens its own labelled tab group in your real Chrome and never touches your tabs.                                                                 |
+| Your signed-in Chrome, own tab group or yours | **✅**                 | ⚠️                 | ❌                       | ⚠️          | ❌        | ❌                | ❌                        | Codex uses its in-app browser; Windows-MCP reads the DOM of open browsers. Munim Computer Use opens its own labelled tab group in your real Chrome, and can also take over a tab you already have open when you ask it to.                                                                 |
 | Works with any MCP client                   | **✅**                 | ❌                 | ❌                       | ✅          | ✅        | ✅                | ✅                        | Codex Computer Use is Codex only; the Anthropic demo is Claude only.                                                                                                                                                                            |
-| Identical tool surface on every platform    | **✅**                 | n/a                | n/a                      | n/a         | n/a       | ⚠️                | ✅                        | 26 tools with byte-identical schemas across the Swift and Rust servers.                                                                                                                                                                         |
+| Identical tool surface on every platform    | **✅**                 | n/a                | n/a                      | n/a         | n/a       | ⚠️                | ✅                        | 28 tools with byte-identical schemas across the Swift and Rust servers.                                                                                                                                                                         |
 | Prebuilt signed binaries + npm launcher     | **✅**                 | ✅                 | ❌                       | ❌          | ❌        | ✅ (npm)          | ✅ (npm)                  | macOS universal (Developer ID signed) and Windows x64 on Releases.                                                                                                                                                                              |
 | Open source                                 | **✅ Apache-2.0**      | ❌                 | ✅                       | ✅ MIT      | ✅ MIT    | ✅ MIT            | ✅ MIT                    |                                                                                                                                                                                                                                                 |
 
@@ -126,17 +126,18 @@ Also looked at: [mediar-ai/mcp-server-macos-use](https://github.com/mediar-ai/mc
 - **Background control.** Events are addressed to the target window (SkyLight on macOS, posted window messages on Windows, XTEST on Linux). No focus stealing, no hijacked mouse.
 - **Pointer overlay, not your pointer.** A soft lavender agent pointer shows where the agent is acting. Your cursor is untouched.
 - **Coordinates that land.** Every screenshot and zoom carries its screen origin and pixels-per-point. `zoom` captures any region at full physical resolution.
-- **Your browser, your logins.** The Chrome extension gives the agent its own labelled tab group in your signed-in Chrome and never touches your tabs.
+- **Your browser, your logins.** The Chrome extension gives the agent its own labelled tab group in your signed-in Chrome, and leaves your tabs alone unless you point it at one.
+- **Or the tab you already have open.** `browser_list_tabs all=true` shows every tab in the browser and `browser_use_tab` takes one over in place — useful when the page is already signed in or mid-flow and re-opening the URL would throw that away. An adopted tab is not moved into the agent's group, not activated and not reloaded; cleanup releases it rather than closing it, and `browser_release_tab` hands it back early.
 - **Model-agnostic.** No vision model is required for interaction; local models work too.
 - **Look → act → verify.** `hover` for mouse-over menus, `wait` for loads, `query` to find a control by label without reading a whole tree.
 
-## Tools (26)
+## Tools (28)
 
 | Area    | Tools                                                                                                                                                                                                      |
 | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | See     | `list_apps`, `get_app_state` (with `query`), `screenshot`, `zoom`, `list_displays`                                                                                                                         |
 | Act     | `click`, `right_click`, `hover`, `drag`, `scroll`, `type_text`, `set_value`, `select_text`, `press_key`, `activate_app`, `wait`                                                                            |
-| Browser | `browser_open_tab`, `browser_list_tabs`, `browser_select_tab`, `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_press_key`, `browser_close_tab`, `browser_close_all_tabs` |
+| Browser | `browser_open_tab`, `browser_list_tabs`, `browser_use_tab`, `browser_release_tab`, `browser_select_tab`, `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_press_key`, `browser_close_tab`, `browser_close_all_tabs` |
 
 Names, argument shapes and descriptions are identical on every platform; a model that learned them on a Mac needs nothing new on Windows.
 
@@ -146,7 +147,7 @@ Names, argument shapes and descriptions are identical on every platform; a model
 | ------------------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------- |
 | `macos/`            | Swift server on the Accessibility API and ScreenCaptureKit (macOS 14+) | `swift build -c release` → `.build/release/munim-computer-use`          |
 | `windows-linux/`    | Rust server: UI Automation on Windows, AT-SPI + X11 on Linux           | `cargo build --release` → `target/release/munim-computer-use`           |
-| `chrome-extension/` | Chrome extension + native messaging host for the `browser_*` tools     | Load unpacked; `sh install.sh` / `install.ps1` registers the host |
+| `chrome-extension/` | Chrome extension + native messaging host for the `browser_*` tools     | Load unpacked; `sh install.sh` / `install.ps1` registers the host; `node background.test.mjs` |
 
 ### Build from source
 

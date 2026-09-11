@@ -242,8 +242,34 @@ fn all_tool_defs() -> Value {
         },
         {
             "name": "browser_list_tabs",
-            "description": "List the tabs in the agent's own Chrome window, marking the active one.",
-            "inputSchema": { "type": "object", "properties": {} }
+            "description": "List the tabs in the agent's own Chrome window, marking the active one. Pass all=true to see every tab open in the browser, including the user's, so you can pick one to drive with browser_use_tab.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "all": {
+                        "type": "boolean",
+                        "description": "List every tab in the browser, not just the agent's (default false)"
+                    }
+                }
+            }
+        },
+        {
+            "name": "browser_use_tab",
+            "description": "Take over a tab the user already has open, instead of opening a new one. Use this when the page is already signed in or mid-flow — a checkout, a draft, a dashboard behind SSO — and re-opening the URL would lose that state. Find the tab_id with browser_list_tabs all=true. The tab stays exactly where it is in the user's window; it is not moved into the agent's group, not activated, and not reloaded. It is never closed by cleanup — call browser_release_tab to hand it back. Ask the user before taking over a tab they are actively working in.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "tab_id": { "type": "integer", "description": "From browser_list_tabs all=true" } },
+                "required": ["tab_id"]
+            }
+        },
+        {
+            "name": "browser_release_tab",
+            "description": "Hand a tab taken over with browser_use_tab back to the user: the agent stops driving it and the page is left exactly as it is.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "tab_id": { "type": "integer" } },
+                "required": ["tab_id"]
+            }
         },
         {
             "name": "browser_select_tab",
@@ -258,7 +284,7 @@ fn all_tool_defs() -> Value {
         },
         {
             "name": "browser_close_tab",
-            "description": "Close one of the agent's tabs.",
+            "description": "Close one of the agent's tabs. A tab taken over with browser_use_tab is released rather than closed — it belongs to the user.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -313,7 +339,7 @@ fn all_tool_defs() -> Value {
         },
         {
             "name": "browser_close_all_tabs",
-            "description": "Close every tab the agent opened and remove its tab group. Call this when finished with the browser so no empty group is left in the user's tab strip. The MCP process also runs this automatically when the Computer Use session ends.",
+            "description": "Close every tab the agent opened and remove its tab group. Tabs taken over with browser_use_tab are released back to the user, not closed. Call this when finished with the browser so no empty group is left in the user's tab strip. The MCP process also runs this automatically when the Computer Use session ends.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -344,7 +370,7 @@ mod tests {
             .map(|tool| tool["name"].as_str().expect("tool has a name"))
             .collect();
 
-        assert_eq!(names.len(), 26, "tool count drifted from the macOS server");
+        assert_eq!(names.len(), 28, "tool count drifted from the macOS server");
         for expected in [
             "list_apps",
             "get_app_state",
@@ -364,6 +390,8 @@ mod tests {
             "select_text",
             "browser_open_tab",
             "browser_list_tabs",
+            "browser_use_tab",
+            "browser_release_tab",
             "browser_select_tab",
             "browser_close_tab",
             "browser_snapshot",

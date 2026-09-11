@@ -1,11 +1,18 @@
 // MT Code desktop control — Chrome side.
 //
-// The agent works only in tabs it created, collected into a labelled tab group,
-// so the user's own tabs are never touched and they can keep browsing while a
-// task runs. Page interaction goes through the DevTools protocol rather than
-// synthetic mouse input, which is what makes it work in a *background* tab: a
-// window only renders its active tab, so anything coordinate-based would be
-// blind the moment the user switches away.
+// The agent works in tabs it owns. Ownership is acquired two ways:
+//
+//   - `open_tab` creates a new background tab and collects it into a labelled
+//     tab group. The user's own tabs are untouched and they keep browsing.
+//   - `use_tab` adopts a tab the user already had open, on request, so the
+//     agent can drive a page that is already signed in / mid-flow rather than
+//     re-opening it. An adopted tab is never moved into the group and never
+//     closed on cleanup — releasing it just hands it back.
+//
+// Page interaction goes through the DevTools protocol rather than synthetic
+// mouse input, which is what makes it work in a *background* tab: a window only
+// renders its active tab, so anything coordinate-based would be blind the
+// moment the user switches away.
 //
 // Commands arrive from the desktop app over native messaging; every reply
 // carries the originating request id.
@@ -23,7 +30,11 @@ const OWNED_STATE_KEY = "ownedState";
  * one extension via the desktop bridge; each process has its own clientId so
  * one client's cleanup cannot close another client's tabs.
  *
- * @typedef {{ tabs: Set<number>, groupId: number|null }} ClientOwned
+ * `tabs` is every owned tab; `adopted` is the subset that was the user's,
+ * mapped to the favicon it had before we badged it, so a release can put the
+ * tab back the way we found it.
+ *
+ * @typedef {{ tabs: Set<number>, adopted: Map<number, string|null>, groupId: number|null }} ClientOwned
  * @type {Map<string, ClientOwned>}
  */
 const clients = new Map();
@@ -54,7 +65,7 @@ function requireClientId(params) {
 function clientState(clientId) {
   let state = clients.get(clientId);
   if (!state) {
-    state = { tabs: new Set(), groupId: null };
+    state = { tabs: new Set(), adopted: new Map(), groupId: null };
     clients.set(clientId, state);
   }
   return state;
@@ -72,6 +83,7 @@ async function persistOwnedState() {
     for (const [clientId, state] of clients) {
       serialized[clientId] = {
         tabs: Array.from(state.tabs),
+        adopted: Array.from(state.adopted.entries()),
         groupId: state.groupId,
       };
     }
@@ -103,6 +115,7 @@ async function restoreOwnedState() {
           // Tab closed while the service worker was asleep.
         }
       }
+      // The legacy shape predates adoption, so every restored tab is agent-created.
       legacy.groupId = typeof state.groupId === "number" ? state.groupId : null;
       if (legacy.groupId !== null) {
         try {
@@ -127,6 +140,13 @@ async function restoreOwnedState() {
           tabOwner.set(tabId, clientId);
         } catch {
           // Tab closed while the service worker was asleep.
+        }
+      }
+      for (const pair of Array.isArray(entry.adopted) ? entry.adopted : []) {
+        const [tabId, favIconUrl] = Array.isArray(pair) ? pair : [];
+        // Only tabs that survived the ownership restore above can stay adopted.
+        if (typeof tabId === "number" && next.tabs.has(tabId)) {
+          next.adopted.set(tabId, typeof favIconUrl === "string" ? favIconUrl : null);
         }
       }
       next.groupId = typeof entry.groupId === "number" ? entry.groupId : null;
@@ -298,28 +318,146 @@ async function openTab(clientId, url) {
   return { tabId: tab.id, url: tab.url, title: tab.title, clientId };
 }
 
-async function listTabs(clientId) {
+async function listTabs(clientId, all = false) {
   const state = clientState(clientId);
   const out = [];
+  if (all) {
+    // Every tab in every window, so the agent can pick one the user already has
+    // open and adopt it with use_tab. Ownership is reported per tab rather than
+    // filtered out: an unowned row is still a valid use_tab target.
+    for (const tab of await chrome.tabs.query({})) {
+      if (typeof tab.id !== "number") continue;
+      const owner = tabOwner.get(tab.id);
+      out.push({
+        tabId: tab.id,
+        windowId: tab.windowId,
+        title: tab.title,
+        url: tab.url,
+        active: tab.active,
+        owned: owner === clientId,
+        adopted: state.adopted.has(tab.id),
+        // A tab held by a peer MCP client is not ours to take.
+        otherAgent: owner !== undefined && owner !== clientId,
+        attachable: isAttachable(tab.url),
+      });
+    }
+    return { groupId: state.groupId, tabs: out, clientId, scope: "all" };
+  }
   // Snapshot first: the loop drops ids for tabs the user closed behind us.
   const known = Array.from(state.tabs);
   for (const tabId of known) {
     try {
       const tab = await chrome.tabs.get(tabId);
-      out.push({ tabId, title: tab.title, url: tab.url, active: tab.active });
+      out.push({
+        tabId,
+        title: tab.title,
+        url: tab.url,
+        active: tab.active,
+        owned: true,
+        adopted: state.adopted.has(tabId),
+      });
     } catch {
-      state.tabs.delete(tabId);
-      tabOwner.delete(tabId);
+      forgetTab(clientId, tabId);
     }
   }
-  return { groupId: state.groupId, tabs: out, clientId };
+  return { groupId: state.groupId, tabs: out, clientId, scope: "agent" };
+}
+
+/// Chrome refuses a debugger attach on its own pages and on the Web Store, so
+/// adopting one would hand back a tab_id that fails on the first snapshot.
+function isAttachable(url) {
+  const target = String(url || "");
+  if (!target || target === "about:blank") return true;
+  if (/^(chrome|devtools|chrome-extension|edge|about):/i.test(target)) return false;
+  if (/^https:\/\/chromewebstore\.google\.com\//i.test(target)) return false;
+  if (/^https:\/\/chrome\.google\.com\/webstore/i.test(target)) return false;
+  return true;
+}
+
+/// Drop every trace of one tab from one client's bookkeeping.
+function forgetTab(clientId, tabId) {
+  const state = clients.get(clientId);
+  if (state) {
+    state.tabs.delete(tabId);
+    state.adopted.delete(tabId);
+  }
+  tabOwner.delete(tabId);
+  attached.delete(tabId);
+}
+
+/// Take over a tab the user already had open. The tab keeps its place in the
+/// strip — no group move, no activation, no reload — because the user may be
+/// looking straight at it.
+async function adoptTab(clientId, tabId) {
+  if (typeof tabId !== "number") throw new Error("tabId is required");
+  const owner = tabOwner.get(tabId);
+  if (owner !== undefined && owner !== clientId) {
+    throw new Error(`tab ${tabId} is already being used by another agent`);
+  }
+  const tab = await chrome.tabs.get(tabId).catch(() => {
+    throw new Error(`there is no open tab with id ${tabId} — call list_tabs with all:true`);
+  });
+  if (!isAttachable(tab.url)) {
+    throw new Error(`Chrome does not allow automating ${tab.url || "that page"}`);
+  }
+  const state = clientState(clientId);
+  const alreadyOwned = state.tabs.has(tabId);
+  state.tabs.add(tabId);
+  tabOwner.set(tabId, clientId);
+  // Only tabs that arrived through adoption are release-on-cleanup; one that
+  // the agent opened itself stays agent-created even if use_tab is called on it.
+  if (!alreadyOwned) state.adopted.set(tabId, tab.favIconUrl || null);
+  await persistOwnedState();
+  // Badge it the way agent-opened tabs are badged: with a user tab especially,
+  // the strip is the only place they can see the agent has it.
+  if (state.adopted.has(tabId)) await markTab(tabId);
+  return {
+    tabId,
+    url: tab.url,
+    title: tab.title,
+    windowId: tab.windowId,
+    adopted: state.adopted.has(tabId),
+    clientId,
+  };
+}
+
+/// Hand an adopted tab back to the user: detach the debugger, clear the agent
+/// cursor, restore the favicon we replaced. The tab itself is left alone.
+async function releaseTab(clientId, tabId) {
+  const state = clientState(clientId);
+  if (!state.adopted.has(tabId)) {
+    if (state.tabs.has(tabId)) {
+      throw new Error(`tab ${tabId} was opened by the agent — close it with close_tab`);
+    }
+    throw new Error(`tab ${tabId} is not one of this agent's tabs`);
+  }
+  const favIconUrl = state.adopted.get(tabId);
+  await hideCursor(tabId);
+  await detachTab(tabId);
+  await restoreFavicon(tabId, favIconUrl);
+  forgetTab(clientId, tabId);
+  if (state.tabs.size === 0 && state.groupId === null) clients.delete(clientId);
+  await persistOwnedState();
+  return { released: tabId, clientId };
 }
 
 /// Close a captured set of one client's agent tabs. Only mutates that client's
 /// ownership so a peer MCP client's tabs survive.
 async function closeOwnedTabs(clientId, ids, expectedGroupId) {
   const state = clients.get(clientId);
+  let released = 0;
   for (const id of ids) {
+    // An adopted tab is the user's. Cleanup hands it back; it is never closed,
+    // which is the whole reason adoption is tracked separately from ownership.
+    if (state?.adopted.has(id)) {
+      const favIconUrl = state.adopted.get(id);
+      await hideCursor(id);
+      await detachTab(id);
+      await restoreFavicon(id, favIconUrl);
+      forgetTab(clientId, id);
+      released += 1;
+      continue;
+    }
     if (state) state.tabs.delete(id);
     tabOwner.delete(id);
     attached.delete(id);
@@ -347,7 +485,7 @@ async function closeOwnedTabs(clientId, ids, expectedGroupId) {
     clients.delete(clientId);
   }
   await persistOwnedState();
-  return { closed: ids.length, clientId };
+  return { closed: ids.length - released, released, clientId };
 }
 
 async function closeAllTabs(clientId) {
@@ -367,6 +505,18 @@ async function attach(tabId) {
   if (attached.has(tabId)) return;
   await chrome.debugger.attach({ tabId }, "1.3");
   attached.add(tabId);
+}
+
+/// Let go of a tab's debugger session, clearing Chrome's "is debugging this
+/// browser" banner. Safe to call for a tab that was never attached.
+async function detachTab(tabId) {
+  if (!attached.has(tabId)) return;
+  attached.delete(tabId);
+  try {
+    await chrome.debugger.detach({ tabId });
+  } catch {
+    // Tab gone, or Chrome already tore the session down.
+  }
 }
 
 async function send(tabId, method, params = {}) {
@@ -774,6 +924,32 @@ function applyFavicon(url) {
   document.head.appendChild(link);
 }
 
+/// Undo applyFavicon on a tab we are handing back. Best effort: the page's own
+/// icon is re-pointed at the URL Chrome had for it, and if there was none the
+/// injected link is simply removed rather than reloading the user's page.
+function revertFavicon(url) {
+  for (const link of document.querySelectorAll("link[rel~='icon'], link[rel='shortcut icon']")) {
+    link.remove();
+  }
+  if (!url) return;
+  const link = document.createElement("link");
+  link.rel = "icon";
+  link.href = url;
+  document.head.appendChild(link);
+}
+
+async function restoreFavicon(tabId, favIconUrl) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: revertFavicon,
+      args: [favIconUrl || ""],
+    });
+  } catch {
+    // Same restricted-page case markTab tolerates.
+  }
+}
+
 async function markTab(tabId) {
   try {
     await chrome.scripting.executeScript({
@@ -792,7 +968,9 @@ async function markTab(tabId) {
 const handlers = {
   ping: async () => ({ pong: true }),
   open_tab: async (p) => openTab(requireClientId(p), p.url),
-  list_tabs: async (p) => listTabs(requireClientId(p)),
+  list_tabs: async (p) => listTabs(requireClientId(p), p.all === true),
+  use_tab: async (p) => adoptTab(requireClientId(p), p.tabId),
+  release_tab: async (p) => releaseTab(requireClientId(p), p.tabId),
   select_tab: async (p) => {
     const clientId = requireClientId(p);
     assertOwned(clientId, p.tabId);
@@ -816,11 +994,11 @@ const handlers = {
   close_tab: async (p) => {
     const clientId = requireClientId(p);
     assertOwned(clientId, p.tabId);
+    // Closing a tab the user opened would destroy their work, so an adopted tab
+    // is released instead. The reply says which happened.
+    if (clientState(clientId).adopted.has(p.tabId)) return releaseTab(clientId, p.tabId);
     await chrome.tabs.remove(p.tabId);
-    const state = clientState(clientId);
-    state.tabs.delete(p.tabId);
-    tabOwner.delete(p.tabId);
-    attached.delete(p.tabId);
+    forgetTab(clientId, p.tabId);
     await persistOwnedState();
     return { closed: p.tabId };
   },
@@ -865,7 +1043,11 @@ async function handleCommand(msg, replyPort = port) {
 chrome.tabs.onRemoved.addListener((tabId) => {
   if (!tabOwner.has(tabId) && !attached.has(tabId)) return;
   const clientId = tabOwner.get(tabId);
-  if (clientId) clients.get(clientId)?.tabs.delete(tabId);
+  if (clientId) {
+    const state = clients.get(clientId);
+    state?.tabs.delete(tabId);
+    state?.adopted.delete(tabId);
+  }
   tabOwner.delete(tabId);
   attached.delete(tabId);
   void persistOwnedState();

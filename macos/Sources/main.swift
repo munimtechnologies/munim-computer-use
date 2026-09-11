@@ -2157,9 +2157,11 @@ func toolBrowserOpenTab(_ args: [String: Any]) -> String {
 }
 
 func toolBrowserListTabs(_ args: [String: Any]) -> String {
+    let all = args["all"] as? Bool ?? false
     if BrowserBridge.shared.isConnected {
-        return bridgeText(BrowserBridge.shared.call("list_tabs"), describeTabs)
+        return bridgeText(BrowserBridge.shared.call("list_tabs", ["all": all]), describeTabs)
     }
+    if all { return listEveryChromeTabViaAppleScript() }
     guard let id = Chrome.liveAgentWindowID() else {
         return "no agent window yet — call browser_open_tab first"
     }
@@ -2326,9 +2328,11 @@ func toolBrowserCloseAllTabs(_ args: [String: Any]) -> String {
     }
     return bridgeText(BrowserBridge.shared.call("close_all_tabs")) { payload in
         let closed = payload["closed"] as? Int ?? 0
-        return closed == 0
-            ? "nothing to clean up — the agent had no tabs open"
-            : "closed \(closed) agent tab\(closed == 1 ? "" : "s") and removed the tab group"
+        let released = payload["released"] as? Int ?? 0
+        var parts: [String] = []
+        if closed > 0 { parts.append("closed \(closed) agent tab\(closed == 1 ? "" : "s") and removed the tab group") }
+        if released > 0 { parts.append("released \(released) of the user's tab\(released == 1 ? "" : "s") back to them") }
+        return parts.isEmpty ? "nothing to clean up — the agent had no tabs open" : parts.joined(separator: ", ")
     }
 }
 
@@ -2340,14 +2344,96 @@ func toolBrowserNavigate(_ args: [String: Any]) -> String {
     }
 }
 
+/// Whole-browser tab list for the no-extension path. The accessibility
+/// fallback cannot hand a tab to the agent, but showing what is open still
+/// tells the model (and the user) what is there.
+func listEveryChromeTabViaAppleScript() -> String {
+    return Chrome.preservingFocus {
+        switch Chrome.run("""
+        tell application "Google Chrome"
+            set out to ""
+            repeat with w in windows
+                set out to out & "window " & (id of w as string) & ":" & linefeed
+                set activeIndex to active tab index of w
+                repeat with i from 1 to (count tabs of w)
+                    set t to tab i of w
+                    set marker to "  "
+                    if i is activeIndex then set marker to "* "
+                    set out to out & marker & (i as string) & ". " & (title of t) & "  [" & (URL of t) & "]" & linefeed
+                end repeat
+            end repeat
+            return out
+        end tell
+        """) {
+        case .failure(let e):
+            return "error: \(e)"
+        case .success(let s):
+            let body = s.isEmpty ? "  (no tabs)" : s
+            return "every Chrome tab (* = active in its window):\n" + body
+                + "\nthe Chrome extension is not connected, so the agent cannot take one of these over"
+        }
+    }
+}
+
+func toolBrowserUseTab(_ args: [String: Any]) -> String {
+    guard let tabId = args["tab_id"] as? Int else { return "error: missing required argument 'tab_id'" }
+    guard BrowserBridge.shared.isConnected else {
+        return "error: taking over one of the user's tabs needs the MT Desktop MCP Chrome extension, "
+            + "which is not connected. Without it, use browser_open_tab, or drive Chrome with "
+            + "get_app_state + click."
+    }
+    return bridgeText(BrowserBridge.shared.call("use_tab", ["tabId": tabId])) { payload in
+        let title = payload["title"] as? String ?? ""
+        let url = payload["url"] as? String ?? ""
+        let adopted = payload["adopted"] as? Bool ?? false
+        if !adopted {
+            return "tab \(tabId) was already the agent's — nothing to take over"
+        }
+        return "now driving the user's tab \(tabId) — \(title)  [\(url)]. It stayed where it was; "
+            + "call browser_release_tab when done, and never browser_close_tab it."
+    }
+}
+
+func toolBrowserReleaseTab(_ args: [String: Any]) -> String {
+    guard let tabId = args["tab_id"] as? Int else { return "error: missing required argument 'tab_id'" }
+    guard BrowserBridge.shared.isConnected else {
+        return "error: the MT Desktop MCP Chrome extension is not connected"
+    }
+    return bridgeText(BrowserBridge.shared.call("release_tab", ["tabId": tabId])) { _ in
+        "released tab \(tabId) back to the user"
+    }
+}
+
 func describeTabs(_ payload: [String: Any]) -> String {
     let tabs = payload["tabs"] as? [[String: Any]] ?? []
-    if tabs.isEmpty { return "the agent has no tabs open yet — call browser_open_tab" }
-    var lines = ["agent tab group (\(tabs.count) tab\(tabs.count == 1 ? "" : "s")):"]
+    let everyTab = (payload["scope"] as? String) == "all"
+    if tabs.isEmpty {
+        return everyTab ? "Chrome has no tabs open" : "the agent has no tabs open yet — call browser_open_tab"
+    }
+    let count = "\(tabs.count) tab\(tabs.count == 1 ? "" : "s")"
+    var lines = [everyTab ? "every Chrome tab (\(count)):" : "agent tab group (\(count)):"]
     for tab in tabs {
         let marker = (tab["active"] as? Bool == true) ? "* " : "  "
-        lines.append("\(marker)tab_id=\(tab["tabId"] as? Int ?? -1)  \(tab["title"] as? String ?? "")"
-            + "  [\(tab["url"] as? String ?? "")]")
+        var line = "\(marker)tab_id=\(tab["tabId"] as? Int ?? -1)  \(tab["title"] as? String ?? "")"
+            + "  [\(tab["url"] as? String ?? "")]"
+        // Only the whole-browser view mixes ownership, so only it needs the tag.
+        if everyTab {
+            if tab["adopted"] as? Bool == true {
+                line += "  (agent is driving this — the user's tab)"
+            } else if tab["owned"] as? Bool == true {
+                line += "  (agent's own tab)"
+            } else if tab["otherAgent"] as? Bool == true {
+                line += "  (another agent's tab)"
+            } else if tab["attachable"] as? Bool == false {
+                line += "  (Chrome page — cannot be automated)"
+            } else {
+                line += "  (the user's — browser_use_tab to drive it)"
+            }
+        }
+        lines.append(line)
+    }
+    if everyTab {
+        lines.append("* = active in its window")
     }
     return lines.joined(separator: "\n")
 }
@@ -2497,8 +2583,34 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "browser_list_tabs",
-        "description": "List the tabs in the agent's own Chrome window, marking the active one.",
-        "inputSchema": ["type": "object", "properties": [:] as [String: Any]],
+        "description": "List the tabs in the agent's own Chrome window, marking the active one. Pass all=true to see every tab open in the browser, including the user's, so you can pick one to drive with browser_use_tab.",
+        "inputSchema": [
+            "type": "object",
+            "properties": [
+                "all": [
+                    "type": "boolean",
+                    "description": "List every tab in the browser, not just the agent's (default false)",
+                ]
+            ],
+        ],
+    ],
+    [
+        "name": "browser_use_tab",
+        "description": "Take over a tab the user already has open, instead of opening a new one. Use this when the page is already signed in or mid-flow — a checkout, a draft, a dashboard behind SSO — and re-opening the URL would lose that state. Find the tab_id with browser_list_tabs all=true. The tab stays exactly where it is in the user's window; it is not moved into the agent's group, not activated, and not reloaded. It is never closed by cleanup — call browser_release_tab to hand it back. Ask the user before taking over a tab they are actively working in.",
+        "inputSchema": [
+            "type": "object",
+            "properties": ["tab_id": ["type": "integer", "description": "From browser_list_tabs all=true"]],
+            "required": ["tab_id"],
+        ],
+    ],
+    [
+        "name": "browser_release_tab",
+        "description": "Hand a tab taken over with browser_use_tab back to the user: the agent stops driving it and the page is left exactly as it is.",
+        "inputSchema": [
+            "type": "object",
+            "properties": ["tab_id": ["type": "integer"]],
+            "required": ["tab_id"],
+        ],
     ],
     [
         "name": "browser_select_tab",
@@ -2513,7 +2625,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "browser_close_tab",
-        "description": "Close one of the agent's tabs.",
+        "description": "Close one of the agent's tabs. A tab taken over with browser_use_tab is released rather than closed — it belongs to the user.",
         "inputSchema": [
             "type": "object",
             "properties": [
@@ -2567,7 +2679,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "browser_close_all_tabs",
-        "description": "Close every tab the agent opened and remove its tab group. Call this when finished with the browser so no empty group is left in the user's tab strip. The MCP process also runs this automatically when the Computer Use session ends.",
+        "description": "Close every tab the agent opened and remove its tab group. Tabs taken over with browser_use_tab are released back to the user, not closed. Call this when finished with the browser so no empty group is left in the user's tab strip. The MCP process also runs this automatically when the Computer Use session ends.",
         "inputSchema": ["type": "object", "properties": [:] as [String: Any]],
     ],
     [
@@ -2660,6 +2772,8 @@ func dispatch(_ name: String, _ args: [String: Any]) -> String {
     case "wait": return toolWait(args)
     case "browser_open_tab": return toolBrowserOpenTab(args)
     case "browser_list_tabs": return toolBrowserListTabs(args)
+    case "browser_use_tab": return toolBrowserUseTab(args)
+    case "browser_release_tab": return toolBrowserReleaseTab(args)
     case "browser_select_tab": return toolBrowserSelectTab(args)
     case "browser_close_tab": return toolBrowserCloseTab(args)
     case "browser_snapshot": return toolBrowserSnapshot(args)

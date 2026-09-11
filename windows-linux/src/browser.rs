@@ -1,5 +1,9 @@
 //! Agent-owned Chrome tabs, via the MT Code Chrome extension.
 //!
+//! A tab becomes the agent's either by being opened (`open_tab`) or by being
+//! adopted from the user on request (`use_tab`). Adopted tabs are released, not
+//! closed, on cleanup — the extension tracks the difference.
+//!
 //! Chrome owns the lifetime of a native messaging host: it spawns the host when
 //! the extension connects and speaks 4-byte-length-prefixed JSON over that
 //! process's stdio. The MCP server is a different process with its own
@@ -476,7 +480,7 @@ fn normalise(_command: &str, args: &Value) -> Value {
     if let Some(tab) = args.get("tab_id").and_then(Value::as_i64) {
         map.insert("tabId".into(), json!(tab));
     }
-    for key in ["url", "text", "key", "index", "x", "y"] {
+    for key in ["url", "text", "key", "index", "x", "y", "all"] {
         if let Some(value) = args.get(key) {
             map.insert(key.into(), value.clone());
         }
@@ -508,16 +512,51 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
             }
         }
         "list_tabs" => describe_tabs(result),
+        "use_tab" => {
+            let tab = result
+                .get("tabId")
+                .and_then(Value::as_i64)
+                .or_else(|| args.get("tab_id").and_then(Value::as_i64))
+                .unwrap_or(-1);
+            if result.get("adopted").and_then(Value::as_bool) != Some(true) {
+                return format!("tab {tab} was already the agent's — nothing to take over");
+            }
+            format!(
+                "now driving the user's tab {tab} — {}  [{}]. It stayed where it was; \
+                 call browser_release_tab when done, and never browser_close_tab it.",
+                result.get("title").and_then(Value::as_str).unwrap_or(""),
+                result.get("url").and_then(Value::as_str).unwrap_or("")
+            )
+        }
+        "release_tab" => {
+            let tab = result
+                .get("released")
+                .and_then(Value::as_i64)
+                .or_else(|| args.get("tab_id").and_then(Value::as_i64))
+                .unwrap_or(-1);
+            format!("released tab {tab} back to the user")
+        }
         "snapshot" => describe_snapshot(result),
         "close_all_tabs" => {
             let closed = result.get("closed").and_then(Value::as_i64).unwrap_or(0);
-            if closed == 0 {
-                "nothing to clean up — the agent had no tabs open".to_string()
-            } else {
-                format!(
+            let released = result.get("released").and_then(Value::as_i64).unwrap_or(0);
+            let mut parts: Vec<String> = Vec::new();
+            if closed > 0 {
+                parts.push(format!(
                     "closed {closed} agent tab{} and removed the tab group",
                     if closed == 1 { "" } else { "s" }
-                )
+                ));
+            }
+            if released > 0 {
+                parts.push(format!(
+                    "released {released} of the user's tab{} back to them",
+                    if released == 1 { "" } else { "s" }
+                ));
+            }
+            if parts.is_empty() {
+                "nothing to clean up — the agent had no tabs open".to_string()
+            } else {
+                parts.join(", ")
             }
         }
         // The remaining commands have no interesting payload, so the useful
@@ -529,6 +568,7 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
                 "close_tab" => result
                     .get("closed")
                     .and_then(Value::as_i64)
+                    .or_else(|| result.get("released").and_then(Value::as_i64))
                     .or_else(|| result.get("tabId").and_then(Value::as_i64)),
                 _ => None,
             }
@@ -550,6 +590,10 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
                     args.get("url").and_then(Value::as_str).unwrap_or("")
                 ),
                 "select_tab" => format!("switched the agent group to tab {tab}"),
+                // An adopted tab comes back as a release, so say what happened.
+                "close_tab" if result.get("released").is_some() => {
+                    format!("tab {tab} was the user's — released it instead of closing")
+                }
                 "close_tab" => format!("closed tab {tab}"),
                 _ => format!("{other} ok"),
             }
@@ -559,16 +603,22 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
 
 fn describe_tabs(result: &Value) -> String {
     let tabs = result.get("tabs").and_then(Value::as_array).cloned().unwrap_or_default();
+    let every_tab = result.get("scope").and_then(Value::as_str) == Some("all");
     if tabs.is_empty() {
-        return "the agent has no tabs open yet — call browser_open_tab".to_string();
+        return if every_tab {
+            "Chrome has no tabs open".to_string()
+        } else {
+            "the agent has no tabs open yet — call browser_open_tab".to_string()
+        };
     }
-    let mut lines = vec![format!(
-        "agent tab group ({} tab{}):",
-        tabs.len(),
-        if tabs.len() == 1 { "" } else { "s" }
-    )];
+    let count = format!("{} tab{}", tabs.len(), if tabs.len() == 1 { "" } else { "s" });
+    let mut lines = vec![if every_tab {
+        format!("every Chrome tab ({count}):")
+    } else {
+        format!("agent tab group ({count}):")
+    }];
     for tab in tabs {
-        lines.push(format!(
+        let mut line = format!(
             "{}tab_id={}  {}  [{}]",
             if tab.get("active").and_then(Value::as_bool) == Some(true) {
                 "* "
@@ -578,7 +628,26 @@ fn describe_tabs(result: &Value) -> String {
             tab.get("tabId").and_then(Value::as_i64).unwrap_or(-1),
             tab.get("title").and_then(Value::as_str).unwrap_or(""),
             tab.get("url").and_then(Value::as_str).unwrap_or("")
-        ));
+        );
+        // Only the whole-browser view mixes ownership, so only it needs the tag.
+        if every_tab {
+            let flag = |key: &str| tab.get(key).and_then(Value::as_bool);
+            line.push_str(if flag("adopted") == Some(true) {
+                "  (agent is driving this — the user's tab)"
+            } else if flag("owned") == Some(true) {
+                "  (agent's own tab)"
+            } else if flag("otherAgent") == Some(true) {
+                "  (another agent's tab)"
+            } else if flag("attachable") == Some(false) {
+                "  (Chrome page — cannot be automated)"
+            } else {
+                "  (the user's — browser_use_tab to drive it)"
+            });
+        }
+        lines.push(line);
+    }
+    if every_tab {
+        lines.push("* = active in its window".to_string());
     }
     lines.join("\n")
 }
@@ -724,6 +793,81 @@ mod tests {
         }));
         assert!(rendered.contains("  tab_id=1"), "{rendered}");
         assert!(rendered.contains("* tab_id=2"), "{rendered}");
+    }
+
+    #[test]
+    fn the_whole_browser_view_says_which_tabs_can_be_taken_over() {
+        let rendered = describe_tabs(&json!({
+            "scope": "all",
+            "tabs": [
+                { "tabId": 1, "title": "Inbox", "url": "https://mail", "owned": false,
+                  "adopted": false, "otherAgent": false, "attachable": true },
+                { "tabId": 2, "title": "Docs", "url": "https://docs", "owned": true,
+                  "adopted": false, "otherAgent": false, "attachable": true },
+                { "tabId": 3, "title": "Checkout", "url": "https://shop", "owned": true,
+                  "adopted": true, "otherAgent": false, "attachable": true },
+                { "tabId": 4, "title": "Settings", "url": "chrome://settings", "owned": false,
+                  "adopted": false, "otherAgent": false, "attachable": false }
+            ]
+        }));
+        assert!(rendered.contains("every Chrome tab (4 tabs)"), "{rendered}");
+        assert!(rendered.contains("browser_use_tab to drive it"), "{rendered}");
+        assert!(rendered.contains("(agent's own tab)"), "{rendered}");
+        assert!(rendered.contains("agent is driving this"), "{rendered}");
+        assert!(rendered.contains("cannot be automated"), "{rendered}");
+    }
+
+    #[test]
+    fn the_agent_only_view_stays_free_of_ownership_tags() {
+        let rendered = describe_tabs(&json!({
+            "scope": "agent",
+            "tabs": [{ "tabId": 1, "title": "One", "url": "https://one", "owned": true, "adopted": false }]
+        }));
+        assert!(rendered.starts_with("agent tab group"), "{rendered}");
+        assert!(!rendered.contains("browser_use_tab"), "{rendered}");
+    }
+
+    #[test]
+    fn list_all_is_forwarded_to_the_extension() {
+        let params = normalise("list_tabs", &json!({ "all": true }));
+        assert_eq!(params["all"], json!(true));
+    }
+
+    #[test]
+    fn taking_over_a_tab_warns_against_closing_it() {
+        let rendered = describe(
+            "use_tab",
+            &json!({ "tabId": 9, "title": "Checkout", "url": "https://shop", "adopted": true }),
+            &json!({ "tab_id": 9 }),
+        );
+        assert!(rendered.contains("now driving the user's tab 9"), "{rendered}");
+        assert!(rendered.contains("browser_release_tab"), "{rendered}");
+        assert!(rendered.contains("never browser_close_tab"), "{rendered}");
+    }
+
+    #[test]
+    fn re_taking_an_agent_tab_is_reported_as_a_no_op() {
+        let rendered = describe("use_tab", &json!({ "tabId": 9, "adopted": false }), &json!({ "tab_id": 9 }));
+        assert!(rendered.contains("already the agent's"), "{rendered}");
+    }
+
+    #[test]
+    fn closing_a_taken_over_tab_reports_the_release_instead() {
+        let rendered = describe("close_tab", &json!({ "released": 4 }), &json!({ "tab_id": 4 }));
+        assert!(rendered.contains("released it instead of closing"), "{rendered}");
+        // An agent-created tab still reads as a close.
+        let rendered = describe("close_tab", &json!({ "closed": 4 }), &json!({ "tab_id": 4 }));
+        assert_eq!(rendered, "closed tab 4");
+    }
+
+    #[test]
+    fn cleanup_separates_closed_agent_tabs_from_returned_user_tabs() {
+        let rendered = describe("close_all_tabs", &json!({ "closed": 2, "released": 1 }), &json!({}));
+        assert!(rendered.contains("closed 2 agent tabs"), "{rendered}");
+        assert!(rendered.contains("released 1 of the user's tab back to them"), "{rendered}");
+        // Releasing only must not claim a group was removed.
+        let rendered = describe("close_all_tabs", &json!({ "closed": 0, "released": 1 }), &json!({}));
+        assert!(!rendered.contains("removed the tab group"), "{rendered}");
     }
 
     #[test]
