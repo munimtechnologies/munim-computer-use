@@ -6,4 +6,4 @@ npm launcher for [Computer Use](https://github.com/munimtechnologies/munim-compu
 claude mcp add munim-computer-use -- npx -y munim-computer-use
 ```
 
-macOS (universal) and Windows x64 are prebuilt. On Linux build from source and set `COMPUTER_USE_BINARY` to the result. Full documentation: https://github.com/munimtechnologies/munim-computer-use
+macOS (universal), Windows x64 and Linux x64/arm64 (glibc 2.39+, X11) are prebuilt. Elsewhere, build from source and set `COMPUTER_USE_BINARY` to the result. Full documentation: https://github.com/munimtechnologies/munim-computer-use

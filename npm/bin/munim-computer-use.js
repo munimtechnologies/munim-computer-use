@@ -22,6 +22,8 @@ function assetFor(platform, arch) {
     return { asset: "munim-computer-use-macos-universal.zip", binary: "munim-computer-use" };
   if (platform === "win32" && arch === "x64")
     return { asset: "munim-computer-use-windows-x64.zip", binary: "munim-computer-use.exe" };
+  if (platform === "linux" && (arch === "x64" || arch === "arm64"))
+    return { asset: `munim-computer-use-linux-${arch}.tar.gz`, binary: "munim-computer-use" };
   return null;
 }
 
