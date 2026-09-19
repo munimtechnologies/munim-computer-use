@@ -953,13 +953,21 @@ func toolListApps() -> String {
     return out.isEmpty ? "No apps found." : out.joined(separator: "\n")
 }
 
+/// `max_width` for screenshot and zoom, bounded like the Rust server. 0 keeps
+/// full resolution.
+func clampedMaxWidth(_ args: [String: Any]) -> Int {
+    min(max((args["max_width"] as? Int) ?? 1400, 0), 8000)
+}
+
 func toolGetAppState(_ args: [String: Any]) -> String {
     guard let query = args["app"] as? String else { return "error: missing required argument 'app'" }
     guard let resolved = resolveApp(query) else { return "error: no running app matching \(query)" }
 
     let app = resolved.app
-    let maxDepth = (args["max_depth"] as? Int) ?? 18
-    var budget = (args["max_elements"] as? Int) ?? 800
+    // Same bounds as the Rust server: a huge depth or budget can walk an
+    // Electron app's tree for minutes and blow the client's context.
+    let maxDepth = min(max((args["max_depth"] as? Int) ?? 18, 1), 60)
+    var budget = min(max((args["max_elements"] as? Int) ?? 800, 1), 5000)
 
     Registry.reset()
     Registry.targetPid = app.processIdentifier
@@ -2611,6 +2619,7 @@ let toolDefs: [[String: Any]] = [
                     "description": "Maximum elements to emit before the outline is truncated (default 800). Prefer `query` over raising this.",
                 ],
                 "window": [
+                    "type": ["integer", "string"],
                     "description": "Limit to one window: a 0-based index, or \"agent\" for the browser window this agent owns",
                 ],
                 "query": [
@@ -3524,7 +3533,7 @@ while let line = readLine(strippingNewline: true) {
                         "error: zoom region must be at least 4×4 points", isError: true))
                     break
                 }
-                let maxWidth = (args["max_width"] as? Int) ?? 1400
+                let maxWidth = clampedMaxWidth(args)
                 guard let shot = captureRegionPNG(rect: rect, maxWidth: maxWidth) else {
                     respond(id: id, result: textResult(
                         "error: could not capture that region — check Screen Recording permission and "
@@ -3536,7 +3545,7 @@ while let line = readLine(strippingNewline: true) {
             }
             if name == "screenshot" {
                 if let display = args["display"] as? Int {
-                    let maxWidth = (args["max_width"] as? Int) ?? 1400
+                    let maxWidth = clampedMaxWidth(args)
                     guard let shot = captureDisplayPNG(index: display, maxWidth: maxWidth) else {
                         respond(id: id, result: textResult(
                             "error: could not capture display \(display) — check Screen Recording "
@@ -3552,7 +3561,7 @@ while let line = readLine(strippingNewline: true) {
                         isError: true))
                     break
                 }
-                let maxWidth = (args["max_width"] as? Int) ?? 1400
+                let maxWidth = clampedMaxWidth(args)
                 guard let shot = captureWindowPNG(pid: resolved.app.processIdentifier, maxWidth: maxWidth) else {
                     respond(id: id, result: textResult(
                         "error: screen capture failed. The host app may be missing Screen Recording "
