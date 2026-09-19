@@ -1150,7 +1150,7 @@ impl Desktop for LinuxDesktop {
             self.tap_button(BUTTON_LEFT)?;
         }
         Ok(format!(
-            "clicked at ({x:.0}, {y:.0}){}",
+            "clicked at ({x:.0}, {y:.0}) via cursor{}",
             if click_count > 1 {
                 format!(" x{click_count}")
             } else {
@@ -1169,7 +1169,7 @@ impl Desktop for LinuxDesktop {
             let _ = self.button(BUTTON_RIGHT, false);
             return Err(error);
         }
-        Ok(format!("right-clicked at ({x:.0}, {y:.0})"))
+        Ok(format!("right-clicked at ({x:.0}, {y:.0}) via cursor"))
     }
 
     fn hover(&mut self, target: Point) -> Result<String> {
@@ -1178,7 +1178,7 @@ impl Desktop for LinuxDesktop {
         AgentCursor::shared().show(x, y);
         self.move_pointer(x, y)?;
         Ok(format!(
-            "hovering at ({x:.0}, {y:.0}) — call get_app_state or screenshot to see what appeared"
+            "hovering at ({x:.0}, {y:.0}) via cursor — call get_app_state or screenshot to see what appeared"
         ))
     }
 
@@ -1211,7 +1211,7 @@ impl Desktop for LinuxDesktop {
         motion?;
         release?;
         Ok(format!(
-            "dragged ({from_x:.0}, {from_y:.0}) → ({to_x:.0}, {to_y:.0})"
+            "dragged ({from_x:.0}, {from_y:.0}) → ({to_x:.0}, {to_y:.0}) via cursor"
         ))
     }
 
@@ -1371,6 +1371,9 @@ impl Desktop for LinuxDesktop {
         element: Option<u32>,
     ) -> Result<String> {
         self.ensure_accessibility();
+        // XTEST scrolls whatever is under the real pointer, so an element
+        // target means moving the pointer there first.
+        let moved = element.is_some();
         if let Some(id) = element {
             // Route through point_coordinates so Wayland refuses window-relative
             // AT-SPI bounds the same way click / right_click / drag do.
@@ -1387,7 +1390,8 @@ impl Desktop for LinuxDesktop {
         for _ in 0..amount.max(1) {
             self.tap_button(button)?;
         }
-        Ok(format!("scrolled {direction:?} by {amount}").to_lowercase())
+        let label = format!("scrolled {direction:?} by {amount}").to_lowercase();
+        Ok(if moved { format!("{label} via cursor") } else { format!("{label} at the pointer") })
     }
 
     fn set_value(&mut self, element: u32, value: &str) -> Result<String> {

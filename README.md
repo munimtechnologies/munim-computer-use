@@ -62,6 +62,7 @@
 - [Quick start](#quick-start)
 - [Capability matrix](#capability-matrix)
 - [Why it works well](#why-it-works-well)
+- [Works alongside you](#works-alongside-you)
 - [Tools](#tools-30)
 - [Repository layout](#repository-layout)
 - [Environment flags](#environment-flags)
@@ -107,7 +108,7 @@ Then ask: _"Open Safari, find the cheapest flight to Denver on Tuesday and put i
 | Windows                                     | **✅**                 | ✅                 | ❌                       | ✅          | ❌        | ✅                | ✅                        | Windows-MCP is Windows only; MacOS-MCP is macOS only.                                                                                                                                                                                           |
 | Linux                                       | **✅**                 | ❌                 | ✅ (sandbox)             | ❌          | ❌        | ✅                | ✅                        | Munim Computer Use uses AT-SPI + X11; native Wayland apps get element actions but not coordinate clicks.                                                                                                                                        |
 | Accessibility tree with element ids         | **✅**                 | ❌                 | ❌                       | ✅          | ✅        | ✅                | ✅                        | Codex and the Anthropic demo are screenshot-driven. Ids let the agent press _the button_ instead of a pixel.                                                                                                                                    |
-| Background input (your mouse never moves)   | **✅**                 | ✅                 | n/a                      | ❌          | ❌        | ❌                | ❌                        | Munim Computer Use addresses events to the target window (SkyLight on macOS, posted window messages on Windows, XTEST on Linux). Codex does this too, with a second cursor of its own. Every other server in this table drives the real cursor. |
+| Background input (your mouse never moves)   | **✅**                 | ✅                 | n/a                      | ❌          | ❌        | ❌                | ❌                        | Munim Computer Use addresses events to the target window: always on macOS (SkyLight and per-process events), for UI Automation patterns and classic Win32 controls on Windows; other Windows UI and all Linux pointer input (XTEST) still move the real pointer. Codex does this too, with a second cursor of its own. Every other server in this table drives the real cursor. |
 | Agent pointer overlay                       | **✅**                 | ✅                 | ❌                       | ⚠️          | ❌        | ❌                | ❌                        | Windows-MCP flashes a border around captures; Codex draws its own cursor on your screen.                                                                                                                                                        |
 | Zoom into a region at full resolution       | **✅**                 | ❌                 | ✅                       | ❌          | ❌        | ❌                | ❌                        | Anthropic's toolset has `zoom`; here it is a tool on every platform.                                                                                                                                                                            |
 | Screenshots carry screen-coordinate mapping | **✅**                 | n/a                | n/a                      | ❌          | ❌        | ❌                | ❌                        | Origin and pixels-per-point in every capture, so clicks from Retina or downscaled images land.                                                                                                                                                  |
@@ -123,13 +124,25 @@ Also looked at: [mediar-ai/mcp-server-macos-use](https://github.com/mediar-ai/mc
 ## Why it works well
 
 - **Accessibility first, pixels second.** `get_app_state` returns the app's accessibility tree with stable element ids, so the agent presses _the button_ instead of guessing at a coordinate. It costs a fraction of the tokens of a screenshot and it is what scores highest on OSWorld-style tasks. Screenshots are for verifying and for content the tree cannot describe.
-- **Background control.** Events are addressed to the target window (SkyLight on macOS, posted window messages on Windows, XTEST on Linux). No focus stealing, no hijacked mouse.
+- **Background control.** Events are addressed to the target window (SkyLight on macOS, UI Automation patterns and posted window messages on Windows). On macOS the agent never takes your mouse or keyboard; see [Works alongside you](#works-alongside-you) for the exact guarantee on each platform.
 - **Pointer overlay, not your pointer.** A soft lavender agent pointer shows where the agent is acting. Your cursor is untouched.
 - **Coordinates that land.** Every screenshot and zoom carries its screen origin and pixels-per-point. `zoom` captures any region at full physical resolution.
 - **Your browser, your logins.** The Chrome extension gives the agent its own labelled tab group in your signed-in Chrome, and leaves your tabs alone unless you point it at one.
 - **Or the tab you already have open.** `browser_list_tabs all=true` shows every tab in the browser and `browser_use_tab` takes one over in place — useful when the page is already signed in or mid-flow and re-opening the URL would throw that away. An adopted tab is not moved into the agent's group, not activated and not reloaded; cleanup releases it rather than closing it, and `browser_release_tab` hands it back early.
 - **Model-agnostic.** No vision model is required for interaction; local models work too.
 - **Look → act → verify.** `hover` for mouse-over menus, `wait` for loads, `query` to find a control by label without reading a whole tree.
+
+## Works alongside you
+
+The agent has its own pointer; yours stays yours.
+
+**macOS — guaranteed.** Every action goes through accessibility (press, set value, select text, show menu, scroll bars) or through events addressed to the target app's process and window. The server never moves your pointer, never posts into the system-wide input stream, and never holds or blocks your input, so you can keep clicking and typing in other apps while the agent works — even in the same app, on another window. Events come from a private source, so a modifier you are holding does not leak into the agent's clicks. The target app may be brought forward when that is the point of the step (`activate_app`, or handing you a password field), but not on every action.
+
+The exceptions refuse instead of borrowing your pointer: a click, hover or scroll with no target app (coordinates over the desktop before any `get_app_state`), and drags that leave the source window (between apps, or onto the desktop). The error says what to pass instead.
+
+**Windows — best effort, reported.** Element presses (Invoke), `set_value`, `select_text` and scrolling through UI Automation's ScrollPattern never touch your pointer, and classic Win32 controls also take clicks, hovers, wheel and drags as posted window messages. Other UI (Chromium, Electron, WPF, UWP) only reacts to real mouse input, so those clicks, hovers and drags move your pointer, and `type_text`/`press_key` go to the focused window. Whenever the real pointer was used, the result says `via cursor`.
+
+**Linux — pointer actions use it.** XTEST input moves the real pointer and goes to the focused window, and results say `via cursor`. Element actions through AT-SPI (press, set value, insert text, select) do not move it.
 
 ## Tools (30)
 
@@ -175,7 +188,6 @@ Linux notes: element actions work everywhere; coordinate clicks need an X11 or X
 | `COMPUTER_USE_AGENT_CURSOR=0`              | Do not draw the agent pointer                                   |
 | `COMPUTER_USE_AGENT_CURSOR_TASK_FADE_SECS` | How long the pointer stays after the last tool call (default 8) |
 | `COMPUTER_USE_ALLOW_SECURE_FIELD_INPUT=1`  | Allow typing into password fields (refused by default)          |
-| `COMPUTER_USE_COMPUTER_USE_YIELD_SECS`     | Pause the agent while the user is actively using the machine    |
 
 ## Prompting your agent
 

@@ -103,7 +103,7 @@ fn all_tool_defs() -> Value {
         },
         {
             "name": "click",
-            "description": "Click an element by element_id (preferred: it uses the accessibility press action, so it works even when the element is scrolled out of view) or at absolute screen coordinates taken from a screenshot or zoom. Pass element_id or x and y, not both. Use browser_click for pages in the agent's Chrome tabs, right_click for context menus, and drag for press-move-release. The click reaches the target app for real and can trigger any action the user could, so read the target with get_app_state first. The agent pointer overlay moves to the target; the user's own mouse pointer does not.",
+            "description": "Click an element by element_id (preferred: it uses the accessibility press action, so it works even when the element is scrolled out of view) or at absolute screen coordinates taken from a screenshot or zoom. Pass element_id or x and y, not both. Use browser_click for pages in the agent's Chrome tabs, right_click for context menus, and drag for press-move-release. The click reaches the target app for real and can trigger any action the user could, so read the target with get_app_state first. The agent's own pointer overlay moves to the target. On macOS the user's mouse pointer never moves; on Windows and Linux a target that ignores background input gets real mouse input, which moves the user's pointer, and the result then says via cursor.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -188,7 +188,7 @@ fn all_tool_defs() -> Value {
         },
         {
             "name": "scroll",
-            "description": "Scroll the content under the pointer up, down, left or right by a number of lines, optionally moving the pointer over element_id first so the right pane scrolls. Use it to bring off-screen content into view before get_app_state or screenshot. It only scrolls; nothing is clicked or selected.",
+            "description": "Scroll up, down, left or right by a number of lines, over element_id when given so the right pane scrolls. Use it to bring off-screen content into view before get_app_state or screenshot. It only scrolls; nothing is clicked or selected. On macOS it scrolls the target app in the background without moving the user's pointer. On Windows and Linux, without element_id it scrolls whatever is under the user's pointer, and an element with no background route gets the real pointer moved onto it (the result then says via cursor).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -199,11 +199,11 @@ fn all_tool_defs() -> Value {
                     },
                     "amount": {
                         "type": "integer",
-                        "description": "Number of scroll lines (default 5)"
+                        "description": "Number of scroll lines, 1 to 100 (default 5)"
                     },
                     "element_id": {
                         "type": "string",
-                        "description": "Element to position the pointer over before scrolling, from get_app_state. Omit to scroll at the current pointer position."
+                        "description": "Element to scroll, from get_app_state; the nearest scrollable area around it moves. Omit to scroll the last inspected app (macOS) or whatever is under the pointer (Windows, Linux)."
                     }
                 }
             },
@@ -286,7 +286,7 @@ fn all_tool_defs() -> Value {
         },
         {
             "name": "right_click",
-            "description": "Right-click (secondary click) an element or screen position to open its context menu. Follow with get_app_state to read the menu items, then click one. Use click for normal activation. Pass element_id or x and y, not both.",
+            "description": "Right-click (secondary click) an element or screen position to open its context menu. Follow with get_app_state to read the menu items, then click one. Use click for normal activation. Pass element_id or x and y, not both. The user's pointer is treated as for click.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -314,7 +314,7 @@ fn all_tool_defs() -> Value {
         },
         {
             "name": "drag",
-            "description": "Press at one point, move, and release at another to drag and drop, move a slider, or select a range. Give each end as an element id or as screen coordinates; the two ends may use different forms. A drop can move or reorder items in the app, so verify the result with get_app_state.",
+            "description": "Press at one point, move, and release at another to drag and drop, move a slider, or select a range. Give each end as an element id or as screen coordinates; the two ends may use different forms. A drop can move or reorder items in the app, so verify the result with get_app_state. On macOS a drag must stay inside one app window and never moves the user's pointer; on Windows and Linux most drags use real mouse input, which moves the user's pointer (the result then says via cursor).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -416,7 +416,7 @@ fn all_tool_defs() -> Value {
         },
         {
             "name": "hover",
-            "description": "Move the agent pointer over an element or screen position without clicking, to reveal hover menus, toolbars, tooltips or drag handles. Follow with get_app_state or screenshot to see what appeared. Use click to activate. Pass element_id or x and y, not both. The user's own mouse pointer is not moved.",
+            "description": "Move the agent pointer over an element or screen position without clicking, to reveal hover menus, toolbars, tooltips or drag handles. Follow with get_app_state or screenshot to see what appeared. Use click to activate. Pass element_id or x and y, not both. On macOS the user's own mouse pointer is not moved; on Windows and Linux it may be, and the result then says via cursor.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
