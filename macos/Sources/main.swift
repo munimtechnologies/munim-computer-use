@@ -259,80 +259,29 @@ func walk(_ el: AXUIElement, depth: Int, lines: inout [String], budget: inout In
 //   * click/drag by coordinates  -> SkyLight background path, cursor stays put
 //   * any of the above, degraded -> global HID tap, takes over the pointer
 
-/// Whether a human is currently using this machine.
+/// Deliver an event to one process.
 ///
-/// Everything below degrades to the global HID tap when the background path
-/// does not apply, and that path takes over: it warps the physical cursor and
-/// delivers events to whatever window the user has focused. Pulling the pointer
-/// out from under someone mid-sentence is the worst thing this tool can do, so
-/// a takeover yields to a human who is mid-action instead of fighting them for
-/// it. Background-routed actions are unaffected — they never disturb anyone.
-///
-/// Tune with `COMPUTER_USE_COMPUTER_USE_YIELD_SECS`; `0` disables the guard.
-enum UserPresence {
-    static let yieldWindow: TimeInterval = {
-        if let raw = ProcessInfo.processInfo.environment["COMPUTER_USE_COMPUTER_USE_YIELD_SECS"],
-            let parsed = Double(raw), parsed >= 0
-        {
-            return parsed
-        }
-        return 2.0
-    }()
-
-    /// `kCGAnyInputEventType` has no CGEventType case in Swift, so take the most
-    /// recent of the event types a person actually produces.
-    private static let humanEvents: [CGEventType] = [
-        .keyDown, .flagsChanged, .mouseMoved, .leftMouseDown, .rightMouseDown,
-        .otherMouseDown, .leftMouseDragged, .scrollWheel,
-    ]
-
-    /// Monotonic timestamp of our own last takeover, so the guard can tell the
-    /// user's input apart from the events we just synthesized.
-    private static var lastTakeoverAt: TimeInterval = -.greatestFiniteMagnitude
-
-    static func secondsSinceInput() -> TimeInterval {
-        humanEvents
-            .map { CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: $0) }
-            .min() ?? .greatestFiniteMagnitude
-    }
-
-    static func noteTakeover() { lastTakeoverAt = ProcessInfo.processInfo.systemUptime }
-
-    /// Non-nil when a takeover should be refused, carrying the message to return.
-    static func refuseTakeover(_ action: String) -> String? {
-        guard yieldWindow > 0 else { return nil }
-        let idle = secondsSinceInput()
-        guard idle < yieldWindow else { return nil }
-        // Events we post to the global tap also reset the HID idle timer, so a
-        // multi-step takeover would otherwise block itself after its first
-        // click. When our own takeover is at least as recent as the newest
-        // input, that input was ours and no human is being interrupted.
-        let sinceOurs = ProcessInfo.processInfo.systemUptime - lastTakeoverAt
-        if sinceOurs <= idle + 0.25 { return nil }
-        return
-            "error: not taking over the pointer to \(action) — the user typed or moved the mouse "
-            + String(format: "%.1f", idle)
-            + "s ago, and the background path does not apply here, so this would warp the real "
-            + "cursor and steal focus. Wait a moment and retry, or target a window "
-            + "(get_app_state, or an element_id) so it runs in the background instead."
-    }
+/// Every synthetic event this server makes is addressed to a specific pid.
+/// Nothing is ever posted to the global HID or session event tap and the real
+/// cursor is never warped, so the user keeps their own mouse and keyboard — and
+/// can go on clicking and typing elsewhere — while the agent works. When no
+/// target process is known, callers refuse instead of falling back to a global
+/// takeover.
+func post(_ event: CGEvent?, to pid: pid_t) {
+    event?.postToPid(pid)
 }
 
-/// Deliver an event to a specific process when we know one, otherwise to the
-/// global HID tap.
-///
-/// Targeting a pid is what lets the agent work in the background: the event goes
-/// straight to that application, so the physical cursor does not jump, focus is
-/// not stolen, and the user can keep working in another app meanwhile. The global
-/// tap is a fallback for raw-coordinate calls where no app is known, and it does
-/// take over the machine.
-func post(_ event: CGEvent?, to pid: pid_t?) {
-    guard let event else { return }
-    if let pid {
-        event.postToPid(pid)
-    } else {
-        event.post(tap: .cghidEventTap)
-    }
+/// Source for every synthetic event. A private state keeps the user's own held
+/// modifiers and buttons out of the agent's events (a combined-session source
+/// would turn the agent's click into a cmd-click while the user holds cmd).
+func agentEventSource() -> CGEventSource? {
+    CGEventSource(stateID: .privateState)
+}
+
+/// Why an action was refused rather than taking over the user's pointer.
+func refuseGlobalInput(_ action: String, _ hint: String) -> String {
+    "error: cannot \(action) without taking over the user's mouse pointer, which this server never "
+        + "does — the user may be working at the same time. \(hint)"
 }
 
 func pidOf(_ element: AXUIElement) -> pid_t? {
@@ -583,7 +532,7 @@ func backgroundClick(_ target: WindowTarget, at point: CGPoint, clickCount: Int)
 
     clickGroupCounter += 1
     let group = clickGroupCounter
-    let src = CGEventSource(stateID: .combinedSessionState)
+    let src = agentEventSource()
 
     // A background window has stale cursor-tracking state, so a bare mouseDown
     // hit-tests "outside" the control and never fires.
@@ -623,7 +572,7 @@ func backgroundScroll(_ target: WindowTarget, at point: CGPoint, dx: Int32, dy: 
 
     // Prime the window's hit-test location. A background window keeps a stale
     // one, and the wheel then lands on nothing even though it is delivered.
-    if let move = CGEvent(mouseEventSource: CGEventSource(stateID: .hidSystemState),
+    if let move = CGEvent(mouseEventSource: agentEventSource(),
                           mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) {
         SkyLight.postMouse(move, pid: target.pid, wid: target.wid, windowOrigin: target.origin,
                            screen: point, clickState: 0, button: 0, subtype: 3, groupID: group)
@@ -633,7 +582,7 @@ func backgroundScroll(_ target: WindowTarget, at point: CGPoint, dx: Int32, dy: 
     let local = CGPoint(x: point.x - target.origin.x, y: point.y - target.origin.y)
     var delivered = 0
     for _ in 0..<max(1, steps) {
-        guard let wheel = CGEvent(scrollWheelEvent2Source: CGEventSource(stateID: .hidSystemState),
+        guard let wheel = CGEvent(scrollWheelEvent2Source: agentEventSource(),
                                   units: .line, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0)
         else { continue }
         // Scroll events are created at (0, 0) and the receiver hit-tests the
@@ -663,7 +612,7 @@ func backgroundRightClick(_ target: WindowTarget, at point: CGPoint) -> Bool {
     usleep(80_000)
     clickGroupCounter += 1
     let group = clickGroupCounter
-    let src = CGEventSource(stateID: .combinedSessionState)
+    let src = agentEventSource()
     // Prime hit-testing the same way left-click and scroll do; a bare
     // rightMouseDown against a background window often lands outside the control.
     if let moved = CGEvent(mouseEventSource: src, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) {
@@ -701,7 +650,7 @@ func backgroundDrag(_ target: WindowTarget, from start: CGPoint, to end: CGPoint
     usleep(80_000)
     clickGroupCounter += 1
     let group = clickGroupCounter
-    let src = CGEventSource(stateID: .combinedSessionState)
+    let src = agentEventSource()
     var delivered = false
 
     func send(_ type: CGEventType, _ point: CGPoint, _ clickState: Int64, _ subtype: Int64) {
@@ -731,9 +680,11 @@ func backgroundDrag(_ target: WindowTarget, from start: CGPoint, to end: CGPoint
     return delivered
 }
 
-func postClick(at point: CGPoint, clickCount: Int = 1, pid: pid_t?) {
+/// Plain per-process click, for when SkyLight window routing is unavailable.
+/// The app hit-tests the event's screen location itself; the cursor stays put.
+func postClick(at point: CGPoint, clickCount: Int = 1, pid: pid_t) {
     CursorOverlay.shared.press(at: point)
-    let src = CGEventSource(stateID: .combinedSessionState)
+    let src = agentEventSource()
     for i in 1...clickCount {
         let down = CGEvent(mouseEventSource: src, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left)
         let up = CGEvent(mouseEventSource: src, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left)
@@ -745,8 +696,8 @@ func postClick(at point: CGPoint, clickCount: Int = 1, pid: pid_t?) {
     }
 }
 
-func typeText(_ text: String, pid: pid_t?) {
-    let src = CGEventSource(stateID: .combinedSessionState)
+func typeText(_ text: String, pid: pid_t) {
+    let src = agentEventSource()
     // Send in small UTF-16 chunks: keyboardSetUnicodeString has a length cap,
     // and per-chunk events keep long strings from being dropped.
     for chunk in Array(text).chunked(into: 16) {
@@ -1088,10 +1039,11 @@ func toolClick(_ args: [String: Any]) -> String {
         if let target = windowTarget(for: el), backgroundClick(target, at: center, clickCount: clickCount) {
             return "clicked \(id) at (\(Int(center.x)), \(Int(center.y))) in background"
         }
-        if let refusal = UserPresence.refuseTakeover("click \(id)") { return refusal }
-        UserPresence.noteTakeover()
-        postClick(at: center, clickCount: clickCount, pid: nil)
-        return "clicked \(id) at (\(Int(center.x)), \(Int(center.y))) via cursor"
+        guard let pid = pidOf(el) else {
+            return refuseGlobalInput("click \(id)", "Its app could not be identified; call get_app_state again.")
+        }
+        postClick(at: center, clickCount: clickCount, pid: pid)
+        return "clicked \(id) at (\(Int(center.x)), \(Int(center.y))) by posting to its app"
     }
 
     if let x = args["x"] as? Double, let y = args["y"] as? Double {
@@ -1124,12 +1076,13 @@ func toolClick(_ args: [String: Any]) -> String {
         if let target, backgroundClick(target, at: point, clickCount: clickCount) {
             return "clicked at (\(Int(x)), \(Int(y))) in background"
         }
-        if let refusal = UserPresence.refuseTakeover("click (\(Int(x)), \(Int(y)))") {
-            return refusal
+        guard let pid = target?.pid else {
+            return refuseGlobalInput(
+                "click (\(Int(x)), \(Int(y)))",
+                "No app window was found at that point. Pass `app`, or click an element_id from get_app_state.")
         }
-        UserPresence.noteTakeover()
-        postClick(at: point, clickCount: clickCount, pid: nil)
-        return "clicked at (\(Int(x)), \(Int(y))) via cursor"
+        postClick(at: point, clickCount: clickCount, pid: pid)
+        return "clicked at (\(Int(x)), \(Int(y))) by posting to pid \(pid)"
     }
     return "error: provide either element_id, or both x and y"
 }
@@ -1146,7 +1099,7 @@ func toolTypeText(_ args: [String: Any]) -> String {
         AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
         usleep(60_000)
     }
-    let pid: pid_t?
+    let pid: pid_t
     switch resolveTargetPid(args, element: element) {
     case .failure(let message):
         return message
@@ -1187,10 +1140,37 @@ func toolPressKey(_ args: [String: Any]) -> String {
     return "pressed \(mods.isEmpty ? key : mods.joined(separator: "+") + "+" + key)"
 }
 
+/// Scroll through accessibility when events cannot be routed: step the scroll
+/// bar of the nearest scroll area around `element`.
+func axScroll(_ element: AXUIElement, vertical: Bool, towardStart: Bool, lines: Int) -> Bool {
+    var node: AXUIElement? = element
+    while let current = node {
+        if axString(current, kAXRoleAttribute as String) == (kAXScrollAreaRole as String) {
+            let barAttribute = vertical ? kAXVerticalScrollBarAttribute : kAXHorizontalScrollBarAttribute
+            guard let bar = axElement(current, barAttribute as String) else { return false }
+            let action = (towardStart ? kAXDecrementAction : kAXIncrementAction) as String
+            if axActions(bar).contains(action) {
+                for _ in 0..<lines { AXUIElementPerformAction(bar, action as CFString) }
+                return true
+            }
+            if let value = axCopy(bar, kAXValueAttribute as String) as? Double {
+                let step = 0.02 * Double(lines)
+                let next = min(1, max(0, value + (towardStart ? -step : step)))
+                return AXUIElementSetAttributeValue(bar, kAXValueAttribute as CFString, next as CFNumber) == .success
+            }
+            return false
+        }
+        node = axElement(current, kAXParentAttribute as String)
+    }
+    return false
+}
+
 func toolScroll(_ args: [String: Any]) -> String {
     let direction = ((args["direction"] as? String) ?? "down").lowercased()
-    let amount = (args["amount"] as? Int) ?? 5
-    guard amount != Int.min else { return "error: amount is out of range" }
+    let requested = (args["amount"] as? Int) ?? 5
+    guard requested > 0 else { return "error: amount must be a positive number of lines" }
+    // Same ceiling as the Rust server.
+    let amount = min(requested, 100)
 
     var dy: Int32 = 0
     var dx: Int32 = 0
@@ -1207,39 +1187,43 @@ func toolScroll(_ args: [String: Any]) -> String {
     }
     let element = (args["element_id"] as? String).flatMap { Registry.get($0) }
     let target: WindowTarget?
+    let pid: pid_t?
     if let element {
         target = windowTarget(for: element)
+        pid = pidOf(element)
     } else {
         switch resolveTargetPid(args) {
         case .failure(let message):
             return message
-        case .success(let pid):
-            target = pid.flatMap { windowTarget(forPid: $0) }
+        case .success(let resolved):
+            target = resolved.flatMap { windowTarget(forPid: $0) }
+            pid = resolved
         }
     }
 
-    if let target {
-        // Scroll follows the pointer, so aim at the element when given one and
-        // otherwise at the middle of the window.
-        let point = element.flatMap { visibleCenter(of: $0) }
-            ?? CGPoint(x: target.origin.x + 200, y: target.origin.y + 200)
-        if backgroundScroll(target, at: point, dx: dx, dy: dy, steps: abs(amount)) {
-            return "scrolled \(direction) by \(amount) in background"
-        }
+    // Scroll follows the pointer, so aim at the element when given one and
+    // otherwise at the middle of the window.
+    let point = element.flatMap { visibleCenter(of: $0) }
+        ?? target.map { CGPoint(x: $0.frame.midX, y: $0.frame.midY) }
+    if let target, let point, backgroundScroll(target, at: point, dx: dx, dy: dy, steps: amount) {
+        return "scrolled \(direction) by \(amount) in background"
     }
-
-    // Fallback: drive the real pointer.
-    if let el = element, let center = elementCenter(el) {
-        CGWarpMouseCursorPosition(center)
-        usleep(30_000)
+    if let element, axScroll(element, vertical: dy != 0, towardStart: dy > 0 || dx > 0, lines: amount) {
+        return "scrolled \(direction) by \(amount) through its scroll bar"
     }
-    let src = CGEventSource(stateID: .combinedSessionState)
-    for _ in 0..<abs(amount) {
-        post(CGEvent(scrollWheelEvent2Source: src, units: .line, wheelCount: 2,
-                     wheel1: dy, wheel2: dx, wheel3: 0), to: nil)
+    guard let pid, let point else {
+        return refuseGlobalInput(
+            "scroll", "Call get_app_state first (or pass `app` or element_id) so the scroll can go to that app.")
+    }
+    let src = agentEventSource()
+    for _ in 0..<amount {
+        let wheel = CGEvent(scrollWheelEvent2Source: src, units: .line, wheelCount: 2,
+                            wheel1: dy, wheel2: dx, wheel3: 0)
+        wheel?.location = point
+        post(wheel, to: pid)
         usleep(15_000)
     }
-    return "scrolled \(direction) by \(amount) via cursor"
+    return "scrolled \(direction) by \(amount) by posting to pid \(pid)"
 }
 
 func toolActivateApp(_ args: [String: Any]) -> String {
@@ -1504,24 +1488,19 @@ func toolListDisplays(_ args: [String: Any]) -> String {
 
 // MARK: - Additional input synthesis
 
-func postRightClick(at point: CGPoint, pid: pid_t?) {
+func postRightClick(at point: CGPoint, pid: pid_t) {
     CursorOverlay.shared.press(at: point)
-    let src = CGEventSource(stateID: .combinedSessionState)
+    let src = agentEventSource()
     post(CGEvent(mouseEventSource: src, mouseType: .rightMouseDown, mouseCursorPosition: point, mouseButton: .right), to: pid)
     post(CGEvent(mouseEventSource: src, mouseType: .rightMouseUp, mouseCursorPosition: point, mouseButton: .right), to: pid)
 }
 
-func postDrag(from start: CGPoint, to end: CGPoint, pid: pid_t?) {
-    let src = CGEventSource(stateID: .combinedSessionState)
+func postDrag(from start: CGPoint, to end: CGPoint, pid: pid_t) {
+    let src = agentEventSource()
     // Deliver a move to the press location first: many views only begin drag
     // tracking when the press arrives where the pointer already is, and without
-    // it the gesture degrades into a plain click.
-    //
-    // When targeting a pid this is a synthetic move sent to that app only, so
-    // the user's real cursor stays put. Only the no-pid fallback warps it.
-    if pid == nil {
-        CGWarpMouseCursorPosition(start)
-    }
+    // it the gesture degrades into a plain click. It is a synthetic move sent
+    // to that app only, so the user's real cursor stays put.
     post(CGEvent(mouseEventSource: src, mouseType: .mouseMoved, mouseCursorPosition: start, mouseButton: .left), to: pid)
     usleep(80_000)
     post(CGEvent(mouseEventSource: src, mouseType: .leftMouseDown, mouseCursorPosition: start, mouseButton: .left), to: pid)
@@ -1587,14 +1566,19 @@ func toolRightClick(_ args: [String: Any]) -> String {
     if let target, backgroundRightClick(target, at: point) {
         return "right-clicked at (\(Int(point.x)), \(Int(point.y))) in background"
     }
-    if let refusal = UserPresence.refuseTakeover(
-        "right-click (\(Int(point.x)), \(Int(point.y)))")
+    // The accessibility way to open a context menu, with no pointer at all.
+    if let element, axActions(element).contains(kAXShowMenuAction as String),
+       AXUIElementPerformAction(element, kAXShowMenuAction as CFString) == .success
     {
-        return refusal
+        return "opened the context menu of \(args["element_id"] as? String ?? "the element") via AXShowMenu"
     }
-    UserPresence.noteTakeover()
-    postRightClick(at: point, pid: nil)
-    return "right-clicked at (\(Int(point.x)), \(Int(point.y))) via cursor"
+    guard let pid = target?.pid ?? element.flatMap({ pidOf($0) }) else {
+        return refuseGlobalInput(
+            "right-click (\(Int(point.x)), \(Int(point.y)))",
+            "No app window was found there. Pass `app`, or use an element_id from get_app_state.")
+    }
+    postRightClick(at: point, pid: pid)
+    return "right-clicked at (\(Int(point.x)), \(Int(point.y))) by posting to pid \(pid)"
 }
 
 /// Move the pointer without pressing. Hover-revealed UI (menus, toolbars that
@@ -1606,7 +1590,7 @@ func backgroundHover(_ target: WindowTarget, at point: CGPoint) -> Bool {
     guard SkyLight.activateWithoutRaise(pid: target.pid, wid: target.wid) else { return false }
     usleep(60_000)
     clickGroupCounter += 1
-    let src = CGEventSource(stateID: .combinedSessionState)
+    let src = agentEventSource()
     guard let move = CGEvent(mouseEventSource: src, mouseType: .mouseMoved,
                              mouseCursorPosition: point, mouseButton: .left)
     else { return false }
@@ -1640,15 +1624,15 @@ func toolHover(_ args: [String: Any]) -> String {
     if let target, backgroundHover(target, at: point) {
         return "hovering at (\(Int(point.x)), \(Int(point.y))) in background — call get_app_state or screenshot to see what appeared"
     }
-    if let refusal = UserPresence.refuseTakeover("hover (\(Int(point.x)), \(Int(point.y)))") {
-        return refusal
+    guard let pid = target?.pid ?? element.flatMap({ pidOf($0) }) else {
+        return refuseGlobalInput(
+            "hover at (\(Int(point.x)), \(Int(point.y)))",
+            "No app window was found there. Pass `app`, or use an element_id from get_app_state.")
     }
-    UserPresence.noteTakeover()
     CursorOverlay.shared.show(at: point)
-    CGWarpMouseCursorPosition(point)
-    post(CGEvent(mouseEventSource: CGEventSource(stateID: .combinedSessionState), mouseType: .mouseMoved,
-                 mouseCursorPosition: point, mouseButton: .left), to: nil)
-    return "hovering at (\(Int(point.x)), \(Int(point.y))) via cursor — call get_app_state or screenshot to see what appeared"
+    post(CGEvent(mouseEventSource: agentEventSource(), mouseType: .mouseMoved,
+                 mouseCursorPosition: point, mouseButton: .left), to: pid)
+    return "hovering at (\(Int(point.x)), \(Int(point.y))) by posting to pid \(pid) — call get_app_state or screenshot to see what appeared"
 }
 
 /// Blocks the request loop on purpose: the client is waiting on this call, and
@@ -1716,10 +1700,14 @@ func toolDrag(_ args: [String: Any]) -> String {
     if let target, backgroundDrag(target, from: start, to: end) {
         return "dragged from (\(Int(start.x)), \(Int(start.y))) to (\(Int(end.x)), \(Int(end.y))) in background"
     }
-    if let refusal = UserPresence.refuseTakeover("drag") { return refusal }
-    UserPresence.noteTakeover()
-    postDrag(from: start, to: end, pid: nil)
-    return "dragged from (\(Int(start.x)), \(Int(start.y))) to (\(Int(end.x)), \(Int(end.y))) via cursor"
+    guard let pid = target?.pid else {
+        return refuseGlobalInput(
+            "drag there",
+            "Drags must start in a window of a known app and stay inside it; dragging between apps or "
+                + "onto the desktop needs the real pointer. Use from_element_id, or pass `app`.")
+    }
+    postDrag(from: start, to: end, pid: pid)
+    return "dragged from (\(Int(start.x)), \(Int(start.y))) to (\(Int(end.x)), \(Int(end.y))) by posting to pid \(pid)"
 }
 
 /// Refuse to write into a macOS password field unless explicitly allowed.
