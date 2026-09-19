@@ -1438,7 +1438,10 @@ impl Desktop for LinuxDesktop {
 
 #[cfg(test)]
 mod tests {
-    use super::{char_to_keysym, modifier_keysym, named_keysym, to_xtest_coord, truncate};
+    use super::{
+        char_to_keysym, match_application, modifier_keysym, named_keysym, to_xtest_coord, truncate,
+        ElementRef,
+    };
 
     #[test]
     fn latin1_characters_map_to_themselves() {
