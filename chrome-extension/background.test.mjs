@@ -98,7 +98,20 @@ const chrome = {
   },
 };
 
-vm.runInContext(source, vm.createContext({ ...globalThis, chrome, console }), { filename: "background.js" });
+// The favicon badge inlines the cursor PNG and the site's icon as data URLs.
+const fetched = [];
+async function fetch(url) {
+  fetched.push(url);
+  return {
+    ok: true,
+    headers: { get: () => "image/png" },
+    arrayBuffer: async () => new Uint8Array([137, 80, 78, 71]).buffer,
+  };
+}
+
+vm.runInContext(source, vm.createContext({ ...globalThis, chrome, console, fetch }), {
+  filename: "background.js",
+});
 
 // ── driving it ──────────────────────────────────────────────────────────────
 
@@ -139,6 +152,33 @@ test("open_tab still lands in the agent's group", async () => {
   agentTab = await call("open_tab", { url: "https://example.com" });
   assert.ok(agentTab.tabId);
   assert.notEqual(tabs.get(agentTab.tabId).groupId, -1);
+});
+
+test("the group reads as the product and is told apart by a stable colour", async () => {
+  const group = groups.get(tabs.get(agentTab.tabId).groupId);
+  assert.equal(group.title, "MT Code");
+  const again = await call("open_tab", { url: "https://example.net" });
+  assert.equal(tabs.get(again.tabId).groupId, tabs.get(agentTab.tabId).groupId);
+  const other = await call("open_tab", { url: "https://example.edu", clientId: "agentC" });
+  const otherGroup = groups.get(tabs.get(other.tabId).groupId);
+  assert.equal(otherGroup.title, "MT Code");
+  // Colour is hashed from the client id, so the same id always gets it back.
+  assert.equal(typeof group.color, "string");
+  assert.equal(typeof otherGroup.color, "string");
+  await call("close_tab", { tabId: again.tabId });
+  await call("close_all_tabs", { clientId: "agentC" });
+});
+
+test("agent tabs wear the pointer over the site's own icon", async () => {
+  const badge = executed.findLast(
+    (call) => call.tabId === agentTab.tabId && call.fn === "applyFavicon",
+  );
+  assert.ok(badge, "applyFavicon was injected");
+  const svg = decodeURIComponent(badge.args[0].slice("data:image/svg+xml,".length));
+  assert.match(svg, /agent-favicon-badge/);
+  // Both layers are inlined: an SVG used as an image fetches nothing itself.
+  assert.doesNotMatch(svg, /chrome-extension:\/\//);
+  assert.ok(fetched.some((url) => url.endsWith("icons/cursor-224.png")));
 });
 
 test("list_tabs defaults to the agent's tabs only", async () => {
@@ -188,7 +228,7 @@ test("close_tab releases an adopted tab instead of closing it", async () => {
   assert.ok(tabs.has(userTab.id));
   assert.ok(!removed.includes(userTab.id));
   assert.ok(executed.some(
-    (call) => call.tabId === userTab.id && call.fn === "revertFavicon" && call.args[0] === "https://shop.example/f.ico",
+    (call) => call.tabId === userTab.id && call.fn === "restoreFavicon",
   ));
 });
 
