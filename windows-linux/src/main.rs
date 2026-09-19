@@ -14,6 +14,8 @@ mod browser;
 mod capture;
 mod clipboard;
 mod history;
+mod identity;
+mod install;
 // Only the Windows and Linux backends press keys; macOS builds compile this for tests.
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 mod keys;
@@ -68,25 +70,40 @@ impl Drop for DesktopToolGuard {
 }
 
 fn main() {
+    // `--profile` may appear anywhere; it is consumed here so every mode below
+    // (server, native host, history recorder) runs under the same identity.
+    let args = identity::init_from_args(std::env::args().collect());
+    let mode = args.get(1).map(String::as_str);
+
     // Chrome spawns this same binary as its native messaging host; in that mode
     // the process is a relay, not a server.
-    if std::env::args().nth(1).as_deref() == Some("native-host") {
+    if mode == Some("native-host") {
         if let Err(error) = browser::run_native_host() {
             eprintln!("munim-computer-use: native host stopped: {error}");
         }
         return;
     }
 
-    if std::env::args().nth(1).as_deref() == Some("computer-history") {
-        let mut root: Option<std::path::PathBuf> = None;
-        let mut args = std::env::args().skip(2);
-        while let Some(arg) = args.next() {
+    if mode == Some("install-native-host") {
+        std::process::exit(install::run(&args[2..]));
+    }
+
+    // Print the resolved identity (paths, names) as JSON, for embedders to check.
+    if mode == Some("identity") {
+        println!("{:#}", identity::get().describe());
+        return;
+    }
+
+    if mode == Some("computer-history") {
+        let mut root: Option<std::path::PathBuf> = identity::get().history_dir.clone();
+        let mut rest = args.iter().skip(2);
+        while let Some(arg) = rest.next() {
             if arg == "--root" {
-                root = args.next().map(std::path::PathBuf::from);
+                root = rest.next().map(std::path::PathBuf::from);
             }
         }
         let Some(root) = root else {
-            eprintln!("munim-computer-use: computer-history requires --root <dir>");
+            eprintln!("munim-computer-use: computer-history requires --root <dir> (or a historyDir in the profile)");
             std::process::exit(2);
         };
         if let Err(error) = history::run(root) {
@@ -95,7 +112,6 @@ fn main() {
         }
         return;
     }
-
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();

@@ -54,16 +54,10 @@ fn new_browser_client_id() -> String {
 /// Abstract / global names are intentionally avoided — they have no ownership.
 #[cfg(unix)]
 fn bridge_socket_path() -> Option<PathBuf> {
-    let dir = if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-        PathBuf::from(runtime).join("munim-computer-use")
-    } else if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".local/share/munim-computer-use")
-    } else {
-        // Prefer a UID-owned private dir over a USER-named /tmp path another
-        // local account can pre-create. Fail closed if we cannot claim it.
-        let uid = unsafe { libc::getuid() };
-        std::env::temp_dir().join(format!("munim-computer-use-{uid}"))
-    };
+    // The directory comes from the identity (`name` / `bridgeSocket`), so an app
+    // embedding this server gets its own bridge. Fail closed below if the
+    // directory cannot be claimed as private.
+    let (dir, file) = crate::identity::get().bridge_socket_path();
 
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -128,16 +122,14 @@ fn bridge_socket_path() -> Option<PathBuf> {
         eprintln!("munim-computer-use: bridge dir mode {mode:o} is not 0700");
         return None;
     }
-    Some(dir.join("bridge.sock"))
+    Some(dir.join(file))
 }
 
 #[cfg(windows)]
 fn bridge_pipe_name() -> String {
-    let user = std::env::var("USERNAME")
-        .or_else(|_| std::env::var("USER"))
-        .unwrap_or_else(|_| "user".into());
-    // Named-pipe namespace is global; embed the username so sessions do not collide.
-    format!("munim-computer-use-bridge-{user}")
+    // Named-pipe namespace is global; the identity embeds the username so
+    // sessions do not collide, and its name so embedders do not either.
+    crate::identity::get().bridge_pipe_name()
 }
 
 pub struct BrowserBridge {

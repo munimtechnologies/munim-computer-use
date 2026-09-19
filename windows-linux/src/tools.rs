@@ -7,8 +7,10 @@
 use serde_json::{Value, json};
 
 /// Host settings pass `COMPUTER_USE_BROWSER=0` when browser control is off.
+/// `name` is the tunable without its prefix (`BROWSER`); an embedder's
+/// `envPrefix` is read first (see identity.rs).
 pub fn env_flag_disabled(name: &str) -> bool {
-    match std::env::var(name) {
+    match crate::identity::env_var(name).ok_or(()) {
         Ok(raw) => {
             let trimmed = raw.trim().to_ascii_lowercase();
             matches!(trimmed.as_str(), "0" | "false" | "off" | "no")
@@ -18,7 +20,7 @@ pub fn env_flag_disabled(name: &str) -> bool {
 }
 
 pub fn browser_control_enabled() -> bool {
-    !env_flag_disabled("COMPUTER_USE_BROWSER")
+    !env_flag_disabled("BROWSER")
 }
 
 /// Returned in the `initialize` result; identical in the Swift server.
