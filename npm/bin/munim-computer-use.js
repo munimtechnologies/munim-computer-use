@@ -37,8 +37,18 @@ function cacheDir() {
   return path.join(base, VERSION);
 }
 
+// A stalled connection must not hang the MCP client's startup forever.
+const DOWNLOAD_TIMEOUT_MS = Number(process.env.COMPUTER_USE_DOWNLOAD_TIMEOUT_MS) || 120_000;
+
 async function download(url, dest) {
-  const res = await fetch(url, { redirect: "follow" });
+  const res = await fetch(url, {
+    redirect: "follow",
+    signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
+  }).catch((error) => {
+    if (error && (error.name === "TimeoutError" || error.name === "AbortError"))
+      throw new Error(`download timed out after ${DOWNLOAD_TIMEOUT_MS / 1000}s: ${url}`);
+    throw error;
+  });
   if (!res.ok) throw new Error(`download failed: ${res.status} ${res.statusText} for ${url}`);
   const bytes = Buffer.from(await res.arrayBuffer());
   fs.writeFileSync(dest, bytes);
@@ -52,6 +62,11 @@ function extractZip(zipPath, dir) {
 }
 
 async function ensureBinary() {
+  // The override comes first so platforms without a prebuilt binary (Linux,
+  // Windows on ARM) can still run a binary built from source.
+  const override = process.env.COMPUTER_USE_BINARY;
+  if (override) return override;
+
   const target = assetFor(process.platform, process.arch);
   if (!target) {
     console.error(
@@ -61,22 +76,40 @@ async function ensureBinary() {
     );
     process.exit(1);
   }
-  const override = process.env.COMPUTER_USE_BINARY;
-  if (override) return override;
 
   const dir = cacheDir();
   const binary = path.join(dir, target.binary);
   if (fs.existsSync(binary)) return binary;
 
-  fs.mkdirSync(dir, { recursive: true });
-  const url = `https://github.com/${REPO}/releases/download/v${VERSION}/${target.asset}`;
-  const zipPath = path.join(dir, target.asset);
-  console.error(`munim-computer-use: downloading ${target.asset} (v${VERSION})…`);
-  await download(url, zipPath);
-  extractZip(zipPath, dir);
-  fs.rmSync(zipPath, { force: true });
-  if (!fs.existsSync(binary)) throw new Error(`archive did not contain ${target.binary}`);
-  if (process.platform !== "win32") fs.chmodSync(binary, 0o755);
+  // Download and extract into a private staging directory, then rename it into
+  // place. A crash, a timeout or two MCP clients starting at once can then never
+  // leave a half-written binary in the cache that later runs would trust.
+  const parent = path.dirname(dir);
+  fs.mkdirSync(parent, { recursive: true });
+  const staging = fs.mkdtempSync(path.join(parent, `.${VERSION}-download-`));
+  try {
+    const url = `https://github.com/${REPO}/releases/download/v${VERSION}/${target.asset}`;
+    const zipPath = path.join(staging, target.asset);
+    console.error(`munim-computer-use: downloading ${target.asset} (v${VERSION})…`);
+    await download(url, zipPath);
+    extractZip(zipPath, staging);
+    fs.rmSync(zipPath, { force: true });
+    const staged = path.join(staging, target.binary);
+    if (!fs.existsSync(staged)) throw new Error(`archive did not contain ${target.binary}`);
+    if (process.platform !== "win32") fs.chmodSync(staged, 0o755);
+    // A cache directory without the binary is debris from an older launcher
+    // that extracted in place and was interrupted; replace it.
+    if (fs.existsSync(dir) && !fs.existsSync(binary)) fs.rmSync(dir, { recursive: true, force: true });
+    try {
+      fs.renameSync(staging, dir);
+    } catch (error) {
+      // Another launcher finished first; its copy is just as good.
+      if (!fs.existsSync(binary)) throw error;
+    }
+  } finally {
+    fs.rmSync(staging, { recursive: true, force: true });
+  }
+  if (!fs.existsSync(binary)) throw new Error(`could not install ${target.binary} into ${dir}`);
   return binary;
 }
 
