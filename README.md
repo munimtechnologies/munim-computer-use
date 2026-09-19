@@ -62,7 +62,7 @@
 - [Quick start](#quick-start)
 - [Capability matrix](#capability-matrix)
 - [Why it works well](#why-it-works-well)
-- [Tools](#tools-26)
+- [Tools](#tools-30)
 - [Repository layout](#repository-layout)
 - [Environment flags](#environment-flags)
 - [Prompting your agent](#prompting-your-agent)
@@ -114,7 +114,7 @@ Then ask: _"Open Safari, find the cheapest flight to Denver on Tuesday and put i
 | Hover, wait, label query                    | **✅**                 | ⚠️                 | ⚠️                       | ✅          | ⚠️        | ❌                | ⚠️                        | Windows-MCP has Wait/WaitFor; MacOS-MCP has Wait; Anthropic has `wait`/`mouse_move`.                                                                                                                                                            |
 | Your signed-in Chrome, own tab group or yours | **✅**                 | ⚠️                 | ❌                       | ⚠️          | ❌        | ❌                | ❌                        | Codex uses its in-app browser; Windows-MCP reads the DOM of open browsers. Munim Computer Use opens its own labelled tab group in your real Chrome, and can also take over a tab you already have open when you ask it to.                                                                 |
 | Works with any MCP client                   | **✅**                 | ❌                 | ❌                       | ✅          | ✅        | ✅                | ✅                        | Codex Computer Use is Codex only; the Anthropic demo is Claude only.                                                                                                                                                                            |
-| Identical tool surface on every platform    | **✅**                 | n/a                | n/a                      | n/a         | n/a       | ⚠️                | ✅                        | 28 tools with byte-identical schemas across the Swift and Rust servers.                                                                                                                                                                         |
+| Identical tool surface on every platform    | **✅**                 | n/a                | n/a                      | n/a         | n/a       | ⚠️                | ✅                        | 30 tools with byte-identical schemas across the Swift and Rust servers.                                                                                                                                                                         |
 | Prebuilt signed binaries + npm launcher     | **✅**                 | ✅                 | ❌                       | ❌          | ❌        | ✅ (npm)          | ✅ (npm)                  | macOS universal (Developer ID signed) and Windows x64 on Releases.                                                                                                                                                                              |
 | Open source                                 | **✅ Apache-2.0**      | ❌                 | ✅                       | ✅ MIT      | ✅ MIT    | ✅ MIT            | ✅ MIT                    |                                                                                                                                                                                                                                                 |
 
@@ -131,15 +131,16 @@ Also looked at: [mediar-ai/mcp-server-macos-use](https://github.com/mediar-ai/mc
 - **Model-agnostic.** No vision model is required for interaction; local models work too.
 - **Look → act → verify.** `hover` for mouse-over menus, `wait` for loads, `query` to find a control by label without reading a whole tree.
 
-## Tools (28)
+## Tools (30)
 
 | Area    | Tools                                                                                                                                                                                                      |
 | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | See     | `list_apps`, `get_app_state` (with `query`), `screenshot`, `zoom`, `list_displays`                                                                                                                         |
 | Act     | `click`, `right_click`, `hover`, `drag`, `scroll`, `type_text`, `set_value`, `select_text`, `press_key`, `activate_app`, `wait`                                                                            |
+| Clipboard | `clipboard_read`, `clipboard_write` (plain text)                                                                                                                                                         |
 | Browser | `browser_open_tab`, `browser_list_tabs`, `browser_use_tab`, `browser_release_tab`, `browser_select_tab`, `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_press_key`, `browser_close_tab`, `browser_close_all_tabs` |
 
-Names, argument shapes and descriptions are identical on every platform; a model that learned them on a Mac needs nothing new on Windows.
+Names, argument shapes and descriptions are identical on every platform, and CI enforces it (`node scripts/check-tool-parity.mjs`); a model that learned them on a Mac needs nothing new on Windows.
 
 ## Repository layout
 

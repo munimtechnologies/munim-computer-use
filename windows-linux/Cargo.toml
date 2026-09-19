@@ -35,6 +35,11 @@ windows = { version = "0.62.2", features = [
   "Win32_Graphics_Gdi",
 ] }
 
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
+# clipboard_read / clipboard_write: the Win32 clipboard and the X11 CLIPBOARD
+# selection. Text only, so the image feature (and its dependencies) stay off.
+arboard = { version = "3.6.1", default-features = false }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

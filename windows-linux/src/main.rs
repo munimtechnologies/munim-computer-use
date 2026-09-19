@@ -12,6 +12,7 @@
 mod apps;
 mod browser;
 mod capture;
+mod clipboard;
 mod history;
 // Only the Windows and Linux backends press keys; macOS builds compile this for tests.
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
@@ -351,6 +352,31 @@ fn call_tool(
     if name == "zoom" {
         return match zoom_region(&args) {
             Ok(value) => value,
+            Err(error) => text_result(format!("error: {error}"), true),
+        };
+    }
+    // The clipboard needs no accessibility backend either.
+    if name == "clipboard_read" {
+        let max_chars = arg_i64(&args, "max_chars")
+            .unwrap_or(clipboard::DEFAULT_MAX_CHARS as i64)
+            .clamp(1, clipboard::MAX_CHARS_LIMIT as i64) as usize;
+        return match clipboard::read() {
+            Ok(text) => text_result(clipboard::describe_read(text, max_chars), false),
+            Err(error) => text_result(format!("error: {error}"), true),
+        };
+    }
+    if name == "clipboard_write" {
+        let Some(text) = arg_str(&args, "text") else {
+            return text_result("error: missing required argument 'text'", true);
+        };
+        return match clipboard::write(text) {
+            Ok(()) => text_result(
+                format!(
+                    "copied {} characters to the clipboard, replacing what was there",
+                    text.chars().count()
+                ),
+                false,
+            ),
             Err(error) => text_result(format!("error: {error}"), true),
         };
     }
