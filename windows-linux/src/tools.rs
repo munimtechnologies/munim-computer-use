@@ -157,7 +157,7 @@ fn all_tool_defs() -> Value {
                 "properties": {
                     "key": {
                         "type": "string",
-                        "description": "Key name: a single character such as 's', or a named key such as return, tab, escape, space, delete, backspace, up, down, left, right, home, end, pageup, pagedown"
+                        "description": "Key name: a single character such as 's' or '/' (resolved through the current keyboard layout), or a named key: return, tab, escape, space, delete, backspace, forwarddelete, up, down, left, right, home, end, pageup, pagedown, insert, f1 to f20, punctuation names (minus, equal, leftbracket, rightbracket, backslash, semicolon, quote, comma, period, slash, grave), numpad0 to numpad9, numpadadd, numpadsubtract, numpadmultiply, numpaddivide, numpaddecimal, numpadenter"
                     },
                     "modifiers": {
                         "type": "array",

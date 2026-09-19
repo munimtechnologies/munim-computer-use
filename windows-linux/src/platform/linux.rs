@@ -26,6 +26,7 @@ use xcap::Window;
 use super::{Desktop, DesktopError, Point, Result, ScrollDirection, format_app_list};
 use super::agent_cursor::AgentCursor;
 use crate::apps;
+use crate::keys::{Key, Named};
 
 /// X11 button numbers.
 const BUTTON_LEFT: u8 = 1;
@@ -866,35 +867,36 @@ fn char_to_keysym(character: char) -> u32 {
 
 /// Named keys the model can send, in X11 keysym terms.
 fn named_keysym(key: &str) -> Option<u32> {
-    Some(match key.to_lowercase().as_str() {
-        "return" | "enter" => 0xff0d,
-        "tab" => 0xff09,
-        "escape" | "esc" => 0xff1b,
-        "space" => 0x0020,
-        "backspace" => 0xff08,
-        "delete" => 0xffff,
-        "up" => 0xff52,
-        "down" => 0xff54,
-        "left" => 0xff51,
-        "right" => 0xff53,
-        "home" => 0xff50,
-        "end" => 0xff57,
-        "page_up" | "pageup" => 0xff55,
-        "page_down" | "pagedown" => 0xff56,
-        "f1" => 0xffbe,
-        "f2" => 0xffbf,
-        "f3" => 0xffc0,
-        "f4" => 0xffc1,
-        "f5" => 0xffc2,
-        "f6" => 0xffc3,
-        "f7" => 0xffc4,
-        "f8" => 0xffc5,
-        "f9" => 0xffc6,
-        "f10" => 0xffc7,
-        "f11" => 0xffc8,
-        "f12" => 0xffc9,
-        _ => return None,
-    })
+    match crate::keys::parse(key)? {
+        Key::Char(character) => Some(char_to_keysym(character)),
+        Key::Named(named) => Some(match named {
+            Named::Return => 0xff0d,
+            Named::Tab => 0xff09,
+            Named::Escape => 0xff1b,
+            Named::Space => 0x0020,
+            Named::Backspace => 0xff08,
+            Named::Delete | Named::ForwardDelete => 0xffff,
+            Named::Up => 0xff52,
+            Named::Down => 0xff54,
+            Named::Left => 0xff51,
+            Named::Right => 0xff53,
+            Named::Home => 0xff50,
+            Named::End => 0xff57,
+            Named::PageUp => 0xff55,
+            Named::PageDown => 0xff56,
+            Named::Insert => 0xff63,
+            // XK_F1 is 0xffbe and the function keys run contiguously to F35.
+            Named::F(n) => 0xffbe + u32::from(n) - 1,
+            Named::Numpad(digit) => 0xffb0 + u32::from(digit),
+            Named::NumpadAdd => 0xffab,
+            Named::NumpadSubtract => 0xffad,
+            Named::NumpadMultiply => 0xffaa,
+            Named::NumpadDivide => 0xffaf,
+            Named::NumpadDecimal => 0xffae,
+            Named::NumpadEnter => 0xff8d,
+            Named::NumpadEquals => 0xffbd,
+        }),
+    }
 }
 
 /// Modifier names to keysyms. `cmd` becomes Super, matching the Windows path.
@@ -1289,20 +1291,14 @@ impl Desktop for LinuxDesktop {
                  element, or run under X11",
             ));
         }
-        let keysym = if let Some(named) = named_keysym(key) {
-            named
-        } else {
-            let mut chars = key.chars();
-            let Some(first) = chars.next() else {
-                return Err(DesktopError::new("missing required argument 'key'"));
-            };
-            if chars.next().is_some() {
-                return Err(DesktopError::new(format!(
-                    "unsupported key '{key}' — use a single character or a named key (enter, escape, …)"
-                )));
-            }
-            char_to_keysym(first)
-        };
+        if key.is_empty() {
+            return Err(DesktopError::new("missing required argument 'key'"));
+        }
+        let keysym = named_keysym(key).ok_or_else(|| {
+            DesktopError::new(format!(
+                "unsupported key '{key}' — use a single character or a named key (enter, pageup, f5, comma, numpad1, …)"
+            ))
+        })?;
         let (keycode, needs_shift) = self.keycode_for(keysym)?.ok_or_else(|| {
             DesktopError::new(format!("'{key}' is not on the current keyboard layout"))
         })?;
@@ -1467,6 +1463,13 @@ mod tests {
         assert_eq!(named_keysym("return"), Some(0xff0d));
         assert_eq!(named_keysym("Escape"), Some(0xff1b));
         assert_eq!(named_keysym("nonsense"), None);
+        assert_eq!(named_keysym("pageup"), Some(0xff55));
+        assert_eq!(named_keysym("f13"), Some(0xffca));
+        assert_eq!(named_keysym("f20"), Some(0xffd1));
+        assert_eq!(named_keysym("numpad7"), Some(0xffb7));
+        assert_eq!(named_keysym("numpadenter"), Some(0xff8d));
+        assert_eq!(named_keysym("comma"), Some(0x2c));
+        assert_eq!(named_keysym("{"), Some(0x7b));
     }
 
     #[test]
