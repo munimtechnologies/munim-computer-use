@@ -79,21 +79,36 @@
 4. Register it with your agent:
 
 ```sh
-# Claude Code — fastest: the npm launcher fetches the signed binary on first run
+# Claude Code — fastest: the npm launcher fetches the signed binary on first run.
+# Add `--scope user` to register it for every project instead of just this one.
 claude mcp add munim-computer-use -- npx -y munim-computer-use
 # or point at a downloaded binary
 claude mcp add munim-computer-use -- /usr/local/bin/munim-computer-use
 ```
 
+```sh
+# Codex — writes the entry below into ~/.codex/config.toml for you (needs a Codex CLI
+# with `codex mcp`; check with `codex mcp --help`)
+codex mcp add munim-computer-use -- npx -y munim-computer-use
+```
+
 ```toml
-# Codex — ~/.codex/config.toml
+# Codex — ~/.codex/config.toml, if you would rather edit it yourself
 [mcp_servers.munim-computer-use]
 command = "npx"
 args = ["-y", "munim-computer-use"]
 ```
 
+```sh
+# Cursor — no MCP subcommand in its CLI, so write the config. ~/.cursor/mcp.json applies
+# to every project; .cursor/mcp.json in a repo applies to that one.
+mkdir -p ~/.cursor && [ -s ~/.cursor/mcp.json ] || echo '{}' > ~/.cursor/mcp.json
+jq '.mcpServers["munim-computer-use"] = {"command":"npx","args":["-y","munim-computer-use"]}' \
+  ~/.cursor/mcp.json > ~/.cursor/mcp.json.tmp && mv ~/.cursor/mcp.json.tmp ~/.cursor/mcp.json
+```
+
 ```json
-// Cursor — .cursor/mcp.json
+// Cursor — the entry that produces, in .cursor/mcp.json
 { "mcpServers": { "munim-computer-use": { "command": "npx", "args": ["-y", "munim-computer-use"] } } }
 ```
 
