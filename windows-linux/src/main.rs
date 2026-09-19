@@ -26,8 +26,14 @@ use serde_json::{Value, json};
 
 use platform::{Desktop, DesktopError, Point, ScrollDirection};
 
-const PROTOCOL_VERSION: &str = "2024-11-05";
+/// Protocol revisions this server speaks, newest first. The tool surface is the
+/// same in all of them; a client asking for one gets it echoed back.
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+/// Answered to clients that ask for anything else, including older drafts.
+const FALLBACK_PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "mt-desktop";
+const SERVER_TITLE: &str = "Munim Computer Use";
+const SERVER_WEBSITE: &str = "https://munimtech.com/computer-use";
 const SERVER_VERSION: &str = "0.3.1";
 
 /// Keeps the agent pointer up for the duration of a `tools/call`, then
@@ -185,6 +191,16 @@ fn main() {
     platform::agent_cursor::AgentCursor::shared().hide();
 }
 
+/// Echo the client's protocol version when it is one we speak, else fall back.
+fn negotiate_protocol_version(params: &Value) -> &'static str {
+    let requested = params.get("protocolVersion").and_then(Value::as_str);
+    SUPPORTED_PROTOCOL_VERSIONS
+        .iter()
+        .copied()
+        .find(|version| Some(*version) == requested)
+        .unwrap_or(FALLBACK_PROTOCOL_VERSION)
+}
+
 /// A JSON-RPC level failure: the request itself was unusable.
 struct RpcError(i64, String);
 
@@ -200,9 +216,15 @@ fn dispatch(
 ) -> Result<Value, RpcError> {
     match method {
         "initialize" => Ok(json!({
-            "protocolVersion": PROTOCOL_VERSION,
+            "protocolVersion": negotiate_protocol_version(params),
             "capabilities": { "tools": { "listChanged": false } },
-            "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION }
+            "serverInfo": {
+                "name": SERVER_NAME,
+                "title": SERVER_TITLE,
+                "version": SERVER_VERSION,
+                "websiteUrl": SERVER_WEBSITE
+            },
+            "instructions": tools::SERVER_INSTRUCTIONS
         })),
         "tools/list" => Ok(json!({ "tools": tools::tool_defs() })),
         "tools/call" => Ok(call_tool(params, desktop, browser)),
@@ -602,6 +624,33 @@ mod tests {
         let filtered = super::filter_app_state("App\n\n  [e1] Button \"Go\"", "zzz");
         assert!(filtered.contains("0 matching elements"), "{filtered}");
         assert!(filtered.contains("no elements match"), "{filtered}");
+    }
+
+    #[test]
+    fn protocol_version_is_echoed_when_supported() {
+        use super::negotiate_protocol_version;
+        for version in ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"] {
+            assert_eq!(negotiate_protocol_version(&json!({ "protocolVersion": version })), version);
+        }
+        assert_eq!(negotiate_protocol_version(&json!({ "protocolVersion": "2099-01-01" })), "2024-11-05");
+        assert_eq!(negotiate_protocol_version(&json!({})), "2024-11-05");
+    }
+
+    #[test]
+    fn initialize_advertises_identity_and_instructions() {
+        let mut browser = crate::browser::BrowserBridge::inert();
+        let result = super::dispatch(
+            "initialize",
+            &json!({ "protocolVersion": "2025-06-18" }),
+            None,
+            &mut browser,
+        )
+        .ok()
+        .expect("initialize succeeds");
+        assert_eq!(result["protocolVersion"], json!("2025-06-18"));
+        assert_eq!(result["serverInfo"]["name"], json!("mt-desktop"));
+        assert_eq!(result["serverInfo"]["title"], json!("Munim Computer Use"));
+        assert!(result["instructions"].as_str().is_some_and(|text| text.contains("get_app_state")));
     }
 
     #[test]

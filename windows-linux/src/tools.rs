@@ -21,23 +21,32 @@ pub fn browser_control_enabled() -> bool {
     !env_flag_disabled("COMPUTER_USE_BROWSER")
 }
 
+/// Returned in the `initialize` result; identical in the Swift server.
+pub const SERVER_INSTRUCTIONS: &str = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf.";
+
 pub fn tool_defs() -> Value {
-    let defs = all_tool_defs();
-    if browser_control_enabled() {
-        return defs;
-    }
-    let Some(array) = defs.as_array() else {
-        return defs;
+    let Value::Array(defs) = all_tool_defs() else {
+        unreachable!("tool defs are an array literal");
     };
+    let browser = browser_control_enabled();
     Value::Array(
-        array
-            .iter()
+        defs.into_iter()
             .filter(|tool| {
-                tool.get("name")
-                    .and_then(Value::as_str)
-                    .is_none_or(|name| !name.starts_with("browser_"))
+                browser
+                    || tool
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_none_or(|name| !name.starts_with("browser_"))
             })
-            .cloned()
+            .map(|mut tool| {
+                // Newer protocol revisions read a top-level title; older clients
+                // read annotations.title. Derive one from the other so they
+                // cannot drift.
+                if let Some(title) = tool.pointer("/annotations/title").cloned() {
+                    tool["title"] = title;
+                }
+                tool
+            })
             .collect(),
     )
 }
@@ -808,6 +817,14 @@ mod tests {
             "browser_navigate",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
+        }
+    }
+
+    #[test]
+    fn every_tool_has_a_top_level_title_matching_its_annotation() {
+        for tool in tool_defs().as_array().expect("tool defs are an array") {
+            assert!(tool["title"].is_string(), "{} has no title", tool["name"]);
+            assert_eq!(tool["title"], tool["annotations"]["title"]);
         }
     }
 

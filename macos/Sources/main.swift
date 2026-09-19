@@ -2709,7 +2709,7 @@ let toolDefs: [[String: Any]] = [
                     "items": [
                         "type": "string",
                     ],
-                    "description": "Modifier keys to hold while pressing: any of cmd, shift, alt, ctrl, fn",
+                    "description": "Modifier keys to hold while pressing: any of cmd, shift, alt, ctrl, fn. cmd maps to the Windows/Super key off macOS.",
                 ],
             ],
             "required": ["key"],
@@ -2904,6 +2904,120 @@ let toolDefs: [[String: Any]] = [
             "title": "Set field value",
             "readOnlyHint": false,
             "destructiveHint": true,
+            "idempotentHint": true,
+            "openWorldHint": false,
+        ],
+    ],
+    [
+        "name": "zoom",
+        "description": "Capture one region of the screen at full resolution, to read small text, dense tables, file names or tiny controls that a normal screenshot blurs. Give the region as two corners in screen coordinates (the same space click uses); the result text explains how to map pixels in the zoomed image back to screen coordinates. Use screenshot for a whole window and get_app_state when the text is exposed by accessibility. Read-only.",
+        "inputSchema": [
+            "type": "object",
+            "properties": [
+                "x0": [
+                    "type": "number",
+                    "description": "Left edge, screen coordinates",
+                ],
+                "y0": [
+                    "type": "number",
+                    "description": "Top edge, screen coordinates",
+                ],
+                "x1": [
+                    "type": "number",
+                    "description": "Right edge, screen coordinates",
+                ],
+                "y1": [
+                    "type": "number",
+                    "description": "Bottom edge, screen coordinates",
+                ],
+                "max_width": [
+                    "type": "integer",
+                    "description": "Downscale the zoomed image to this width in pixels (default 1400)",
+                ],
+            ],
+            "required": ["x0", "y0", "x1", "y1"],
+        ],
+        "annotations": [
+            "title": "Zoom into region",
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false,
+        ],
+    ],
+    [
+        "name": "hover",
+        "description": "Move the agent pointer over an element or screen position without clicking, to reveal hover menus, toolbars, tooltips or drag handles. Follow with get_app_state or screenshot to see what appeared. Use click to activate. Pass element_id or x and y, not both. The user's own mouse pointer is not moved.",
+        "inputSchema": [
+            "type": "object",
+            "properties": [
+                "element_id": [
+                    "type": "string",
+                    "description": "Element id from the most recent get_app_state snapshot, e.g. e12",
+                ],
+                "x": [
+                    "type": "number",
+                    "description": "Screen x coordinate in points, used together with y when no element_id is given",
+                ],
+                "y": [
+                    "type": "number",
+                    "description": "Screen y coordinate in points, used together with x when no element_id is given",
+                ],
+            ],
+        ],
+        "annotations": [
+            "title": "Hover",
+            "readOnlyHint": false,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false,
+        ],
+    ],
+    [
+        "name": "wait",
+        "description": "Pause before the next action so the UI can catch up: page loads, animations, dialogs opening, apps launching. Follow with get_app_state or screenshot to confirm the new state instead of guessing. Sends no input.",
+        "inputSchema": [
+            "type": "object",
+            "properties": [
+                "seconds": [
+                    "type": "number",
+                    "description": "Seconds to wait (default 1, maximum 30)",
+                ],
+            ],
+        ],
+        "annotations": [
+            "title": "Wait",
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false,
+        ],
+    ],
+    [
+        "name": "select_text",
+        "description": "Select a character range inside a text element through the accessibility API, for example to copy part of a value or to replace just that part with type_text. Defaults to selecting from `start` to the end of the value. Use set_value to replace the whole value instead. Only the selection changes; the text is not modified.",
+        "inputSchema": [
+            "type": "object",
+            "properties": [
+                "element_id": [
+                    "type": "string",
+                    "description": "Text element to select in, from get_app_state",
+                ],
+                "start": [
+                    "type": "integer",
+                    "description": "Zero-based character offset to start the selection at (default 0)",
+                ],
+                "length": [
+                    "type": "integer",
+                    "description": "Number of characters to select (default: through the end of the value)",
+                ],
+            ],
+            "required": ["element_id"],
+        ],
+        "annotations": [
+            "title": "Select text",
+            "readOnlyHint": false,
+            "destructiveHint": false,
             "idempotentHint": true,
             "openWorldHint": false,
         ],
@@ -3183,129 +3297,39 @@ let toolDefs: [[String: Any]] = [
             "openWorldHint": true,
         ],
     ],
-    [
-        "name": "zoom",
-        "description": "Capture one region of the screen at full resolution, to read small text, dense tables, file names or tiny controls that a normal screenshot blurs. Give the region as two corners in screen coordinates (the same space click uses); the result text explains how to map pixels in the zoomed image back to screen coordinates. Use screenshot for a whole window and get_app_state when the text is exposed by accessibility. Read-only.",
-        "inputSchema": [
-            "type": "object",
-            "properties": [
-                "x0": [
-                    "type": "number",
-                    "description": "Left edge, screen coordinates",
-                ],
-                "y0": [
-                    "type": "number",
-                    "description": "Top edge, screen coordinates",
-                ],
-                "x1": [
-                    "type": "number",
-                    "description": "Right edge, screen coordinates",
-                ],
-                "y1": [
-                    "type": "number",
-                    "description": "Bottom edge, screen coordinates",
-                ],
-                "max_width": [
-                    "type": "integer",
-                    "description": "Downscale the zoomed image to this width in pixels (default 1400)",
-                ],
-            ],
-            "required": ["x0", "y0", "x1", "y1"],
-        ],
-        "annotations": [
-            "title": "Zoom into region",
-            "readOnlyHint": true,
-            "destructiveHint": false,
-            "idempotentHint": true,
-            "openWorldHint": false,
-        ],
-    ],
-    [
-        "name": "hover",
-        "description": "Move the agent pointer over an element or screen position without clicking, to reveal hover menus, toolbars, tooltips or drag handles. Follow with get_app_state or screenshot to see what appeared. Use click to activate. Pass element_id or x and y, not both. The user's own mouse pointer is not moved.",
-        "inputSchema": [
-            "type": "object",
-            "properties": [
-                "element_id": [
-                    "type": "string",
-                    "description": "Element id from the most recent get_app_state snapshot, e.g. e12",
-                ],
-                "x": [
-                    "type": "number",
-                    "description": "Screen x coordinate in points, used together with y when no element_id is given",
-                ],
-                "y": [
-                    "type": "number",
-                    "description": "Screen y coordinate in points, used together with x when no element_id is given",
-                ],
-            ],
-        ],
-        "annotations": [
-            "title": "Hover",
-            "readOnlyHint": false,
-            "destructiveHint": false,
-            "idempotentHint": true,
-            "openWorldHint": false,
-        ],
-    ],
-    [
-        "name": "wait",
-        "description": "Pause before the next action so the UI can catch up: page loads, animations, dialogs opening, apps launching. Follow with get_app_state or screenshot to confirm the new state instead of guessing. Sends no input.",
-        "inputSchema": [
-            "type": "object",
-            "properties": [
-                "seconds": [
-                    "type": "number",
-                    "description": "Seconds to wait (default 1, maximum 30)",
-                ],
-            ],
-        ],
-        "annotations": [
-            "title": "Wait",
-            "readOnlyHint": true,
-            "destructiveHint": false,
-            "idempotentHint": true,
-            "openWorldHint": false,
-        ],
-    ],
-    [
-        "name": "select_text",
-        "description": "Select a character range inside a text element through the accessibility API, for example to copy part of a value or to replace just that part with type_text. Defaults to selecting from `start` to the end of the value. Use set_value to replace the whole value instead. Only the selection changes; the text is not modified.",
-        "inputSchema": [
-            "type": "object",
-            "properties": [
-                "element_id": [
-                    "type": "string",
-                    "description": "Text element to select in, from get_app_state",
-                ],
-                "start": [
-                    "type": "integer",
-                    "description": "Zero-based character offset to start the selection at (default 0)",
-                ],
-                "length": [
-                    "type": "integer",
-                    "description": "Number of characters to select (default: through the end of the value)",
-                ],
-            ],
-            "required": ["element_id"],
-        ],
-        "annotations": [
-            "title": "Select text",
-            "readOnlyHint": false,
-            "destructiveHint": false,
-            "idempotentHint": true,
-            "openWorldHint": false,
-        ],
-    ],
 ]
 
 func advertisedToolDefs() -> [[String: Any]] {
-    if browserControlEnabled { return toolDefs }
-    return toolDefs.filter { tool in
+    let visible = browserControlEnabled ? toolDefs : toolDefs.filter { tool in
         guard let name = tool["name"] as? String else { return true }
         return !name.hasPrefix("browser_")
     }
+    // Newer protocol revisions read a top-level title; older clients read
+    // annotations.title. Derive one from the other so they cannot drift.
+    return visible.map { tool in
+        var tool = tool
+        if let title = (tool["annotations"] as? [String: Any])?["title"] { tool["title"] = title }
+        return tool
+    }
 }
+
+// MARK: - Server identity
+
+let serverVersion = "0.3.1"
+/// Protocol revisions this server speaks. A client asking for one gets it
+/// echoed back; anything else gets the oldest, which every client understands.
+let supportedProtocolVersions: Set<String> = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
+let fallbackProtocolVersion = "2024-11-05"
+
+func negotiatedProtocolVersion(_ params: [String: Any]) -> String {
+    if let requested = params["protocolVersion"] as? String, supportedProtocolVersions.contains(requested) {
+        return requested
+    }
+    return fallbackProtocolVersion
+}
+
+/// Returned in the `initialize` result; identical in the Rust server.
+let serverInstructions = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf."
 
 func dispatch(_ name: String, _ args: [String: Any]) -> String {
     if name.hasPrefix("browser_"), !browserControlEnabled {
@@ -3477,18 +3501,40 @@ setvbuf(stdout, nil, _IOLBF, 0)
 func runJSONRPCLoop() {
 while let line = readLine(strippingNewline: true) {
     if line.trimmingCharacters(in: CharacterSet.whitespaces).isEmpty { continue }
-    guard let data = line.data(using: .utf8),
-          let msg = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-          let method = msg["method"] as? String else { continue }
+    let parsed: Any
+    do {
+        parsed = try JSONSerialization.jsonObject(with: Data(line.utf8))
+    } catch {
+        // Same reply as the Rust server: a client that sent garbage should
+        // hear about it rather than wait forever on a request it thinks is live.
+        fputs("munim-computer-use: malformed JSON: \(error.localizedDescription)\n", stderr)
+        respondError(id: NSNull(), code: -32700, message: "Parse error: \(error.localizedDescription)")
+        continue
+    }
+    guard let msg = parsed as? [String: Any], let method = msg["method"] as? String else {
+        // Valid JSON that is not a request. Answer only when there is an id to
+        // answer to (or no way to tell), never a notification.
+        let id = (parsed as? [String: Any])?["id"]
+        if (parsed as? [String: Any]) == nil || id != nil {
+            respondError(id: id ?? NSNull(), code: -32600, message: "Invalid Request: expected a JSON-RPC object with a method")
+        }
+        continue
+    }
 
     let id = msg["id"]
 
     switch method {
     case "initialize":
         respond(id: id ?? NSNull(), result: [
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": negotiatedProtocolVersion(msg["params"] as? [String: Any] ?? [:]),
             "capabilities": ["tools": ["listChanged": false]],
-            "serverInfo": ["name": "mt-desktop", "version": "0.3.1"],
+            "serverInfo": [
+                "name": "mt-desktop",
+                "title": "Munim Computer Use",
+                "version": serverVersion,
+                "websiteUrl": "https://munimtech.com/computer-use",
+            ],
+            "instructions": serverInstructions,
         ])
 
     case "tools/list":
