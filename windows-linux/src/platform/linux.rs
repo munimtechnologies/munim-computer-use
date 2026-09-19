@@ -38,7 +38,7 @@ const BUTTON_SCROLL_RIGHT: u8 = 7;
 
 /// Where an element lives on the AT-SPI bus. Proxies borrow their connection,
 /// so the registry stores addresses and rebuilds a proxy on demand.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ElementRef {
     bus: String,
     path: String,
