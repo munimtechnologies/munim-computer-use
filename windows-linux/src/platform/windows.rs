@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use uiautomation::UIAutomation;
 use uiautomation::UIElement;
 use uiautomation::inputs::{Keyboard, Mouse, MouseButton};
-use uiautomation::patterns::{UIInvokePattern, UITextPattern, UIValuePattern};
-use uiautomation::types::{Handle, Point as UIPoint};
+use uiautomation::patterns::{UIInvokePattern, UIScrollPattern, UITextPattern, UIValuePattern};
+use uiautomation::types::{Handle, Point as UIPoint, ScrollAmount};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::core::BOOL;
 use windows::Win32::Graphics::Gdi::ScreenToClient;
@@ -25,8 +25,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     ChildWindowFromPointEx, CWP_SKIPDISABLED, CWP_SKIPINVISIBLE, EnumWindows, GetClassNameW,
     GetWindowLongW, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, SW_RESTORE,
-    SetForegroundWindow, ShowWindow, WindowFromPoint, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, GWL_STYLE,
+    SetForegroundWindow, ShowWindow, WindowFromPoint, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, GWL_STYLE,
 };
 
 use super::agent_cursor::AgentCursor;
@@ -238,6 +238,102 @@ impl WindowsDesktop {
         }
         let lp = Self::pack_client_lparam(client.x, client.y);
         unsafe { PostMessageW(Some(hwnd), WM_MOUSEMOVE, WPARAM(0), lp) }.is_ok()
+    }
+
+    /// Drag inside one classic Win32 control with posted messages, so the
+    /// user's cursor stays put. Both ends must land in the same window.
+    fn background_drag(from: (f64, f64), to: (f64, f64)) -> bool {
+        let start = (from.0.round() as i32, from.1.round() as i32);
+        let end = (to.0.round() as i32, to.1.round() as i32);
+        let Some(hwnd) = Self::hwnd_at_screen(start.0, start.1) else {
+            return false;
+        };
+        if !Self::accepts_posted_mouse(hwnd)
+            || Self::hwnd_at_screen(end.0, end.1).map(|other| other.0) != Some(hwnd.0)
+        {
+            return false;
+        }
+        let client = |x: i32, y: i32| {
+            let mut point = POINT { x, y };
+            unsafe { ScreenToClient(hwnd, &mut point) }
+                .as_bool()
+                .then(|| Self::pack_client_lparam(point.x, point.y))
+        };
+        let (Some(down_at), Some(up_at)) = (client(start.0, start.1), client(end.0, end.1)) else {
+            return false;
+        };
+        const MK_LBUTTON: usize = 0x0001;
+        let post = |message, wparam: usize, lparam| unsafe {
+            PostMessageW(Some(hwnd), message, WPARAM(wparam), lparam)
+        }
+        .is_ok();
+        let mut delivered = post(WM_MOUSEMOVE, 0, down_at) && post(WM_LBUTTONDOWN, MK_LBUTTON, down_at);
+        let steps = 12;
+        for step in 1..=steps {
+            let t = f64::from(step) / f64::from(steps);
+            let x = start.0 + ((end.0 - start.0) as f64 * t).round() as i32;
+            let y = start.1 + ((end.1 - start.1) as f64 * t).round() as i32;
+            if let Some(at) = client(x, y) {
+                delivered &= post(WM_MOUSEMOVE, MK_LBUTTON, at);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        delivered && post(WM_LBUTTONUP, 0, up_at)
+    }
+
+    /// Scroll through UI Automation: the nearest ScrollPattern at or above the
+    /// element that can move along the requested axis. No input is synthesised.
+    fn uia_scroll(&self, element: &UIElement, horizontal: i32, vertical: i32) -> bool {
+        let Ok(walker) = self.automation.create_tree_walker() else {
+            return false;
+        };
+        // Wheel deltas are positive for up/right; ScrollPattern increments move
+        // down/right, so the vertical sign flips.
+        let amount = |delta: i32, invert: bool| match (delta.signum(), invert) {
+            (0, _) => ScrollAmount::NoAmount,
+            (1, false) | (-1, true) => ScrollAmount::SmallIncrement,
+            _ => ScrollAmount::SmallDecrement,
+        };
+        let (h, v) = (amount(horizontal, false), amount(vertical, true));
+        let steps = horizontal.unsigned_abs().max(vertical.unsigned_abs());
+        let mut node = Some(element.clone());
+        for _ in 0..24 {
+            let Some(current) = node else { break };
+            if let Ok(pattern) = current.get_pattern::<UIScrollPattern>()
+                && pattern.scroll(h, v).is_ok()
+            {
+                for _ in 1..steps {
+                    if pattern.scroll(h, v).is_err() {
+                        break;
+                    }
+                }
+                return true;
+            }
+            node = walker.get_parent(&current).ok();
+        }
+        false
+    }
+
+    /// Post wheel messages to the classic Win32 control under a point, one per
+    /// notch, without moving the cursor. Wheel messages carry screen coordinates.
+    fn post_wheel(x: f64, y: f64, horizontal: i32, vertical: i32) -> bool {
+        let (sx, sy) = (x.round() as i32, y.round() as i32);
+        let Some(hwnd) = Self::hwnd_at_screen(sx, sy) else {
+            return false;
+        };
+        if !Self::accepts_posted_mouse(hwnd) {
+            return false;
+        }
+        let lparam = Self::pack_client_lparam(sx, sy);
+        let (message, delta) = if horizontal != 0 {
+            (WM_MOUSEHWHEEL, horizontal)
+        } else {
+            (WM_MOUSEWHEEL, vertical)
+        };
+        let notch = (delta.signum() * WHEEL_DELTA) as i16 as u16 as usize;
+        (0..delta.unsigned_abs()).all(|_| {
+            unsafe { PostMessageW(Some(hwnd), message, WPARAM(notch << 16), lparam) }.is_ok()
+        })
     }
 
     fn scroll_wheel(horizontal: bool, notches: i32) -> Result<()> {
@@ -765,6 +861,14 @@ impl Desktop for WindowsDesktop {
         let (from_x, from_y) = self.point_coordinates(from)?;
         let (to_x, to_y) = self.point_coordinates(to)?;
         AgentCursor::shared().show(from_x, from_y);
+        if Self::background_drag((from_x, from_y), (to_x, to_y)) {
+            AgentCursor::shared().press(to_x, to_y);
+            return Ok(format!(
+                "dragged ({from_x:.0}, {from_y:.0}) → ({to_x:.0}, {to_y:.0}) in background"
+            ));
+        }
+        // Everything else (Chromium, WPF, UWP, drags between windows) only
+        // responds to real mouse input, which moves the user's pointer.
         let mouse = Mouse::default();
         mouse
             .move_to(&UIPoint::new(from_x as i32, from_y as i32))
@@ -775,7 +879,7 @@ impl Desktop for WindowsDesktop {
             .drag_to(MouseButton::LEFT, &UIPoint::new(to_x as i32, to_y as i32))
             .map_err(|error| DesktopError::new(format!("drag failed: {error}")))?;
         Ok(format!(
-            "dragged ({from_x:.0}, {from_y:.0}) → ({to_x:.0}, {to_y:.0})"
+            "dragged ({from_x:.0}, {from_y:.0}) → ({to_x:.0}, {to_y:.0}) via cursor"
         ))
     }
 
@@ -807,22 +911,41 @@ impl Desktop for WindowsDesktop {
         amount: i32,
         element: Option<u32>,
     ) -> Result<String> {
-        // The wheel goes to whatever is under the cursor, so move there first.
+        let (horizontal, vertical) = direction.deltas(amount);
+        let label = format!("scrolled {direction:?} by {amount}").to_lowercase();
         if let Some(id) = element {
-            let (x, y) = Self::center(self.element(id)?)?;
+            let target = self.element(id)?.clone();
+            let (x, y) = Self::center(&target)?;
             AgentCursor::shared().show(x, y);
+            // Neither of these touches the user's cursor: the control's own
+            // ScrollPattern first, then wheel messages posted to its window.
+            if self.uia_scroll(&target, horizontal, vertical) {
+                return Ok(format!("{label} in background (UI Automation)"));
+            }
+            if Self::post_wheel(x, y, horizontal, vertical) {
+                return Ok(format!("{label} in background"));
+            }
+            // Last resort: the wheel goes to whatever is under the real
+            // pointer, so the pointer has to move there.
             Mouse::default()
                 .move_to(&UIPoint::new(x as i32, y as i32))
                 .map_err(|error| DesktopError::new(format!("could not move cursor: {error}")))?;
+            if horizontal != 0 {
+                Self::scroll_wheel(true, horizontal)?;
+            }
+            if vertical != 0 {
+                Self::scroll_wheel(false, vertical)?;
+            }
+            return Ok(format!("{label} via cursor"));
         }
-        let (horizontal, vertical) = direction.deltas(amount);
+        // No element: scroll whatever is under the pointer where it already is.
         if horizontal != 0 {
             Self::scroll_wheel(true, horizontal)?;
         }
         if vertical != 0 {
             Self::scroll_wheel(false, vertical)?;
         }
-        Ok(format!("scrolled {direction:?} by {amount}").to_lowercase())
+        Ok(format!("{label} at the pointer"))
     }
 
     fn set_value(&mut self, element: u32, value: &str) -> Result<String> {
