@@ -1,2 +1,3 @@
 macos/.build/
 windows-linux/target/
+dist/

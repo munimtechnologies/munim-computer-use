@@ -1,0 +1,97 @@
+name: Release assets (Linux + Chrome extension)
+
+# The macOS (signed, universal) and Windows binaries are built on maintainer
+# machines. This adds the assets an embedding app also needs and that no
+# maintainer machine builds: Linux x64/arm64 binaries and the Chrome extension.
+#
+# Run it against the DRAFT release before publishing it (a draft has no tag,
+# so nothing else fires):  gh workflow run release-assets.yml -f version=0.5.0
+# It rewrites SHA256SUMS.txt over every asset on the release, so run it after
+# the macOS and Windows zips are uploaded.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without the v (the release must exist, draft is fine)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: linux-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    defaults:
+      run:
+        working-directory: windows-linux
+    steps:
+      # A draft release has no tag yet: build the dispatched ref (the release's
+      # target, normally main) and check the version it reports instead.
+      - uses: actions/checkout@v7
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang libclang-dev \
+            libpipewire-0.3-dev libspa-0.2-dev \
+            libdrm-dev libgbm-dev libegl-dev libwayland-dev \
+            libxcb1-dev libxcb-randr0-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - name: Check the version it reports
+        run: |
+          reported=$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+            | ./target/release/munim-computer-use | head -1 | grep -o '"version":"[^"]*"' | head -1)
+          echo "reported $reported"
+          test "$reported" = '"version":"${{ inputs.version }}"'
+      - name: Package
+        run: tar -czf "munim-computer-use-linux-${{ matrix.arch }}.tar.gz" -C target/release munim-computer-use
+      - uses: actions/upload-artifact@v5
+        with:
+          name: linux-${{ matrix.arch }}
+          path: windows-linux/munim-computer-use-linux-${{ matrix.arch }}.tar.gz
+
+  extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Build and zip (manifest.json at the zip root)
+        run: |
+          node scripts/build-extension.mjs --out dist/chrome-extension
+          (cd dist/chrome-extension && zip -qr ../../munim-computer-use-chrome-extension.zip .)
+      - uses: actions/upload-artifact@v5
+        with:
+          name: chrome-extension
+          path: munim-computer-use-chrome-extension.zip
+
+  upload:
+    needs: [linux, extension]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: v${{ inputs.version }}
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Upload and rewrite SHA256SUMS.txt
+        run: |
+          set -eu
+          gh release upload "$TAG" assets/* --clobber --repo "$GITHUB_REPOSITORY"
+          mkdir all && cd all
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'munim-computer-use-*'
+          sha256sum munim-computer-use-* | sort -k2 > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          gh release upload "$TAG" SHA256SUMS.txt --clobber --repo "$GITHUB_REPOSITORY"

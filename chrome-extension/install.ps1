@@ -19,7 +19,7 @@ $LegacyHostName = 'com.munimtech.computer-use.desktop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $binary = $env:COMPUTER_USE_PATH
 if (-not $binary) {
-  $binary = Join-Path $here '..\munim-computer-use-native\target\release\munim-computer-use.exe'
+  $binary = Join-Path $here '..\windows-linux\target\release\munim-computer-use.exe'
 }
 if (-not (Test-Path $binary)) {
   Write-Error "desktop server binary not found at: $binary`nbuild it first:  cargo build --release --manifest-path windows-linux/Cargo.toml"
