@@ -13,6 +13,9 @@ mod apps;
 mod browser;
 mod capture;
 mod history;
+// Only the Windows and Linux backends press keys; macOS builds compile this for tests.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+mod keys;
 mod platform;
 mod tools;
 

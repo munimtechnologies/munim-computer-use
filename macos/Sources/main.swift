@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import Carbon.HIToolbox
 import CoreGraphics
 import Foundation
 import ScreenCaptureKit
@@ -766,20 +767,147 @@ extension Array {
     }
 }
 
-let keyCodes: [String: CGKeyCode] = [
-    "return": 36, "enter": 36, "tab": 48, "space": 49, "delete": 51, "backspace": 51,
-    "escape": 53, "esc": 53, "left": 123, "right": 124, "down": 125, "up": 126,
-    "home": 115, "end": 119, "pageup": 116, "pagedown": 121, "forwarddelete": 117,
+// MARK: - Key names
+//
+// The same names are accepted on every platform (see keys.rs in the Rust
+// server). Named keys map to fixed virtual key codes; characters resolve
+// through the user's current keyboard layout so that "z" on a German layout,
+// or "/" on AZERTY, presses the key that actually produces it. The ANSI table
+// is the fallback when the layout cannot be read.
+
+/// Fixed-position keys: their codes do not depend on the layout.
+let namedKeyCodes: [String: CGKeyCode] = [
+    "return": 36, "enter": 36, "tab": 48, "space": 49, "spacebar": 49,
+    // "delete" is the Mac key of that name, which deletes backwards.
+    "delete": 51, "backspace": 51, "del": 51,
+    "forwarddelete": 117, "fwddelete": 117, "deleteforward": 117,
+    "escape": 53, "esc": 53,
+    "left": 123, "leftarrow": 123, "arrowleft": 123,
+    "right": 124, "rightarrow": 124, "arrowright": 124,
+    "down": 125, "downarrow": 125, "arrowdown": 125,
+    "up": 126, "uparrow": 126, "arrowup": 126,
+    "home": 115, "end": 119, "pageup": 116, "pgup": 116, "pagedown": 121, "pgdn": 121, "pgdown": 121,
+    // Insert shares the Help key's code on Mac keyboards.
+    "insert": 114, "ins": 114, "help": 114,
     "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97, "f7": 98, "f8": 100,
-    "f9": 101, "f10": 109, "f11": 103, "f12": 111,
+    "f9": 101, "f10": 109, "f11": 103, "f12": 111, "f13": 105, "f14": 107, "f15": 113,
+    "f16": 106, "f17": 64, "f18": 79, "f19": 80, "f20": 90,
+]
+
+/// Keypad keys, looked up after stripping a numpad/keypad/kp prefix.
+let numpadKeyCodes: [String: CGKeyCode] = [
+    "0": 82, "1": 83, "2": 84, "3": 85, "4": 86, "5": 87, "6": 88, "7": 89, "8": 91, "9": 92,
+    "add": 69, "plus": 69, "+": 69,
+    "subtract": 78, "minus": 78, "-": 78, "": 78,
+    "multiply": 67, "times": 67, "*": 67,
+    "divide": 75, "/": 75,
+    "decimal": 65, "period": 65, "dot": 65, ".": 65,
+    "enter": 76, "return": 76,
+    "equal": 81, "equals": 81, "=": 81,
+]
+
+/// Spelled-out punctuation, for models that avoid sending bare symbols.
+let punctuationNames: [String: Character] = [
+    "minus": "-", "hyphen": "-", "dash": "-", "equal": "=", "equals": "=", "plus": "+",
+    "leftbracket": "[", "bracketleft": "[", "openbracket": "[",
+    "rightbracket": "]", "bracketright": "]", "closebracket": "]",
+    "backslash": "\\", "semicolon": ";", "quote": "'", "apostrophe": "'", "singlequote": "'",
+    "comma": ",", "period": ".", "dot": ".", "fullstop": ".", "slash": "/", "forwardslash": "/",
+    "grave": "`", "backtick": "`", "backquote": "`",
+]
+
+/// US ANSI positions, used when the current layout cannot be read.
+let ansiKeyCodes: [Character: CGKeyCode] = [
     "a": 0, "b": 11, "c": 8, "d": 2, "e": 14, "f": 3, "g": 5, "h": 4, "i": 34, "j": 38,
     "k": 40, "l": 37, "m": 46, "n": 45, "o": 31, "p": 35, "q": 12, "r": 15, "s": 1,
     "t": 17, "u": 32, "v": 9, "w": 13, "x": 7, "y": 16, "z": 6,
     "0": 29, "1": 18, "2": 19, "3": 20, "4": 21, "5": 23, "6": 22, "7": 26, "8": 28, "9": 25,
+    "-": 27, "=": 24, "[": 33, "]": 30, "\\": 42, ";": 41, "'": 39, ",": 43, ".": 47,
+    "/": 44, "`": 50,
 ]
 
-func pressKey(_ key: String, modifiers: [String], pid: pid_t?) -> String? {
-    guard let code = keyCodes[key.lowercased()] else { return "unknown key: \(key)" }
+enum KeySpec: Equatable {
+    case code(CGKeyCode)
+    case character(Character)
+}
+
+/// Parse a press_key name. nil means the name is not recognised.
+func parseKeyName(_ raw: String) -> KeySpec? {
+    if raw.count == 1, let only = raw.first {
+        switch only {
+        case " ": return .code(49)
+        case "\n", "\r": return .code(36)
+        case "\t": return .code(48)
+        default: return .character(only)
+        }
+    }
+    // Case-insensitive, and "Page_Down" / "page down" / "page-down" all match.
+    let compact = raw.trimmingCharacters(in: .whitespaces).lowercased()
+        .filter { $0 != "_" && $0 != " " }
+    for prefix in ["numpad", "keypad", "kp"] where compact.hasPrefix(prefix) {
+        var rest = String(compact.dropFirst(prefix.count))
+        while rest.hasPrefix("-") && rest.count > 1 { rest.removeFirst() }
+        if rest == "-" { rest = "" }
+        return numpadKeyCodes[rest].map { .code($0) }
+    }
+    let name = compact.filter { $0 != "-" }
+    if let code = namedKeyCodes[name] { return .code(code) }
+    if let character = punctuationNames[name] { return .character(character) }
+    return nil
+}
+
+/// Map every character the current keyboard layout can type (unshifted or with
+/// Shift) to the key that types it. Text Input Sources must be read on the main
+/// thread on macOS 14 and later.
+func currentLayoutKeyMap() -> [String: (code: CGKeyCode, shift: Bool)] {
+    var map: [String: (code: CGKeyCode, shift: Bool)] = [:]
+    let build = {
+        guard let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue()
+            ?? TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?.takeRetainedValue(),
+            let raw = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData)
+        else { return }
+        let data = Unmanaged<CFData>.fromOpaque(raw).takeUnretainedValue()
+        guard let bytes = CFDataGetBytePtr(data) else { return }
+        let layout = UnsafeRawPointer(bytes).assumingMemoryBound(to: UCKeyboardLayout.self)
+        let keyboardType = UInt32(LMGetKbdType())
+        let shiftState = UInt32((shiftKey >> 8) & 0xFF)
+        for code in 0..<128 {
+            for (shift, state) in [(false, UInt32(0)), (true, shiftState)] {
+                var deadKeys: UInt32 = 0
+                var length = 0
+                var chars = [UniChar](repeating: 0, count: 4)
+                let status = UCKeyTranslate(
+                    layout, UInt16(code), UInt16(kUCKeyActionDown), state, keyboardType,
+                    OptionBits(kUCKeyTranslateNoDeadKeysMask), &deadKeys, chars.count, &length, &chars)
+                guard status == noErr, length > 0 else { continue }
+                let typed = String(utf16CodeUnits: chars, count: length)
+                // Lowest key code wins, which prefers the main block over the keypad.
+                if map[typed] == nil { map[typed] = (CGKeyCode(code), shift) }
+            }
+        }
+    }
+    if Thread.isMainThread { build() } else { DispatchQueue.main.sync(execute: build) }
+    return map
+}
+
+/// Resolve a key name to a key code plus whether Shift must be held.
+func resolveKey(_ key: String) -> Result<(code: CGKeyCode, shift: Bool), String> {
+    guard let spec = parseKeyName(key) else {
+        return .failure("unknown key: \(key) — use a single character or a named key (return, pageup, f5, comma, numpad1, …)")
+    }
+    switch spec {
+    case .code(let code):
+        return .success((code, false))
+    case .character(let raw):
+        // Letters name the key, not the case: "S" with cmd is cmd+s, as before.
+        let character = raw.isLetter ? Character(raw.lowercased()) : raw
+        if let hit = currentLayoutKeyMap()[String(character)] { return .success(hit) }
+        if let code = ansiKeyCodes[character] { return .success((code, false)) }
+        return .failure("'\(key)' is not on the current keyboard layout")
+    }
+}
+
+func pressKey(_ key: String, modifiers: [String], pid: pid_t) -> String? {
     var flags: CGEventFlags = []
     for m in modifiers.map({ $0.lowercased() }) {
         switch m {
@@ -791,13 +919,19 @@ func pressKey(_ key: String, modifiers: [String], pid: pid_t?) -> String? {
         default: return "unknown modifier: \(m)"
         }
     }
-    let src = CGEventSource(stateID: .combinedSessionState)
-    let down = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: true)
-    let up = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: false)
+    let resolved: (code: CGKeyCode, shift: Bool)
+    switch resolveKey(key) {
+    case .failure(let message): return message
+    case .success(let hit): resolved = hit
+    }
+    if resolved.shift { flags.insert(.maskShift) }
+    let src = CGEventSource(stateID: .privateState)
+    let down = CGEvent(keyboardEventSource: src, virtualKey: resolved.code, keyDown: true)
+    let up = CGEvent(keyboardEventSource: src, virtualKey: resolved.code, keyDown: false)
     down?.flags = flags
     up?.flags = flags
-    post(down, to: pid)
-    post(up, to: pid)
+    down?.postToPid(pid)
+    up?.postToPid(pid)
     return nil
 }
 
@@ -1026,7 +1160,7 @@ func toolTypeText(_ args: [String: Any]) -> String {
 func toolPressKey(_ args: [String: Any]) -> String {
     guard let key = args["key"] as? String else { return "error: missing required argument 'key'" }
     let mods = (args["modifiers"] as? [String]) ?? []
-    let pid: pid_t?
+    let pid: pid_t
     switch resolveTargetPid(args) {
     case .failure(let message):
         return message
@@ -2559,7 +2693,7 @@ let toolDefs: [[String: Any]] = [
             "properties": [
                 "key": [
                     "type": "string",
-                    "description": "Key name: a single character such as 's', or a named key such as return, tab, escape, space, delete, backspace, up, down, left, right, home, end, pageup, pagedown",
+                    "description": "Key name: a single character such as 's' or '/' (resolved through the current keyboard layout), or a named key: return, tab, escape, space, delete, backspace, forwarddelete, up, down, left, right, home, end, pageup, pagedown, insert, f1 to f20, punctuation names (minus, equal, leftbracket, rightbracket, backslash, semicolon, quote, comma, period, slash, grave), numpad0 to numpad9, numpadadd, numpadsubtract, numpadmultiply, numpaddivide, numpaddecimal, numpadenter",
                 ],
                 "modifiers": [
                     "type": "array",

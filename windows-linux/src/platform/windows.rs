@@ -17,7 +17,10 @@ use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::core::BOOL;
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
+    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC,
+    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_WHEEL, MOUSEINPUT, MapVirtualKeyW, SendInput, VIRTUAL_KEY,
+    VkKeyScanW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     ChildWindowFromPointEx, CWP_SKIPDISABLED, CWP_SKIPINVISIBLE, EnumWindows, GetClassNameW,
@@ -29,6 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::agent_cursor::AgentCursor;
 use super::{Desktop, DesktopError, Point, Result, ScrollDirection, format_app_list};
 use crate::apps;
+use crate::keys::{self, Key, Named};
 
 /// One wheel notch, as Windows defines it.
 const WHEEL_DELTA: i32 = 120;
@@ -371,7 +375,34 @@ fn truncate(value: &str, limit: usize) -> String {
     cleaned.chars().take(limit).collect::<String>() + "…"
 }
 
-/// Translate the tool's modifier names into the `uiautomation` key syntax.
+/// What one `press_key` call sends, before it becomes `SendInput` records.
+///
+/// Built directly from virtual-key codes rather than the `uiautomation` key
+/// syntax: that syntax only knows a few dozen names (anything else was typed as
+/// literal text, so `pageup` typed "pageup") and treats `{`, `}`, `(` and `)` as
+/// markup. Virtual keys have neither problem.
+#[derive(Debug, PartialEq, Eq)]
+struct KeyPlan {
+    /// Virtual keys held for the duration of the press, in press order.
+    modifiers: Vec<u16>,
+    stroke: Stroke,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Stroke {
+    /// A virtual key; `extended` sets KEYEVENTF_EXTENDEDKEY, which navigation
+    /// keys need so they are not read as their numeric-keypad twins.
+    Vk { vk: u16, extended: bool },
+    /// A character the active layout has no key for; sent as KEYEVENTF_UNICODE.
+    Unicode(char),
+}
+
+const VK_SHIFT: u16 = 0x10;
+const VK_CONTROL: u16 = 0x11;
+const VK_MENU: u16 = 0x12;
+const VK_LWIN: u16 = 0x5B;
+
+/// Translate the tool's modifier names into virtual keys.
 ///
 /// `cmd` maps to Win rather than failing: models trained on macOS reach for it
 /// constantly, and Win is the closest analogue.
@@ -379,41 +410,198 @@ fn truncate(value: &str, limit: usize) -> String {
 /// Unknown modifiers are rejected (except `fn`, which has no synthetic
 /// equivalent and is intentionally ignored) so a typo like `ctl` cannot
 /// silently send the bare key while reporting success.
-fn key_sequence(key: &str, modifiers: &[String]) -> Result<String> {
-    let mut sequence = String::new();
+fn modifier_vks(modifiers: &[String]) -> Result<Vec<u16>> {
+    let mut held = Vec::new();
     for modifier in modifiers {
-        let token = match modifier.to_lowercase().as_str() {
-            "cmd" | "command" | "win" | "super" | "meta" => "{win}",
-            "ctrl" | "control" => "{ctrl}",
-            "alt" | "option" => "{alt}",
-            "shift" => "{shift}",
+        let vk = match modifier.to_lowercase().as_str() {
+            "cmd" | "command" | "win" | "super" | "meta" => VK_LWIN,
+            "ctrl" | "control" => VK_CONTROL,
+            "alt" | "option" => VK_MENU,
+            "shift" => VK_SHIFT,
             // `fn` has no synthetic equivalent on Windows; dropping it is better
             // than refusing an otherwise valid chord.
-            "fn" => "",
+            "fn" => continue,
             other => {
                 return Err(DesktopError::new(format!(
                     "unsupported modifier '{other}' — use ctrl, shift, alt, or cmd"
                 )));
             }
         };
-        sequence.push_str(token);
+        if !held.contains(&vk) {
+            held.push(vk);
+        }
     }
-    sequence.push_str(&match key.to_lowercase().as_str() {
-        "return" | "enter" => "{enter}".to_string(),
-        "tab" => "{tab}".to_string(),
-        "escape" | "esc" => "{esc}".to_string(),
-        "space" => " ".to_string(),
-        "backspace" => "{backspace}".to_string(),
-        "delete" => "{delete}".to_string(),
-        "up" => "{up}".to_string(),
-        "down" => "{down}".to_string(),
-        "left" => "{left}".to_string(),
-        "right" => "{right}".to_string(),
-        "home" => "{home}".to_string(),
-        "end" => "{end}".to_string(),
-        other => other.to_string(),
-    });
-    Ok(sequence)
+    Ok(held)
+}
+
+/// Virtual key for a named key, and whether it is an extended key.
+fn named_vk(named: Named) -> Option<(u16, bool)> {
+    Some(match named {
+        Named::Return => (0x0D, false),
+        Named::Tab => (0x09, false),
+        Named::Escape => (0x1B, false),
+        Named::Space => (0x20, false),
+        Named::Backspace => (0x08, false),
+        Named::Delete | Named::ForwardDelete => (0x2E, true),
+        Named::PageUp => (0x21, true),
+        Named::PageDown => (0x22, true),
+        Named::End => (0x23, true),
+        Named::Home => (0x24, true),
+        Named::Left => (0x25, true),
+        Named::Up => (0x26, true),
+        Named::Right => (0x27, true),
+        Named::Down => (0x28, true),
+        Named::Insert => (0x2D, true),
+        // VK_F1 is 0x70 and F1–F24 are contiguous.
+        Named::F(n) if (1..=24).contains(&n) => (0x70 + u16::from(n) - 1, false),
+        Named::F(_) => return None,
+        Named::Numpad(digit) if digit <= 9 => (0x60 + u16::from(digit), false),
+        Named::Numpad(_) => return None,
+        Named::NumpadMultiply => (0x6A, false),
+        Named::NumpadAdd => (0x6B, false),
+        Named::NumpadSubtract => (0x6D, false),
+        Named::NumpadDecimal => (0x6E, false),
+        Named::NumpadDivide => (0x6F, true),
+        // The keypad Enter is VK_RETURN flagged as extended.
+        Named::NumpadEnter => (0x0D, true),
+        // PC keypads have no equals key.
+        Named::NumpadEquals => return None,
+    })
+}
+
+/// Resolve a character through the active keyboard layout: its virtual key plus
+/// the shift/ctrl/alt state VkKeyScanW says produces it. `None` when the layout
+/// has no key for it.
+fn layout_vk(character: char) -> Option<(u16, Vec<u16>)> {
+    let mut units = [0u16; 2];
+    let encoded = character.encode_utf16(&mut units);
+    if encoded.len() != 1 {
+        return None;
+    }
+    let scan = unsafe { VkKeyScanW(encoded[0]) };
+    if scan == -1 {
+        return None;
+    }
+    let vk = (scan as u16) & 0xFF;
+    let state = ((scan as u16) >> 8) & 0xFF;
+    let mut extra = Vec::new();
+    if state & 0x01 != 0 {
+        extra.push(VK_SHIFT);
+    }
+    if state & 0x02 != 0 {
+        extra.push(VK_CONTROL);
+    }
+    if state & 0x04 != 0 {
+        extra.push(VK_MENU);
+    }
+    Some((vk, extra))
+}
+
+fn key_plan(
+    key: &str,
+    modifiers: &[String],
+    layout: impl Fn(char) -> Option<(u16, Vec<u16>)>,
+) -> Result<KeyPlan> {
+    let mut held = modifier_vks(modifiers)?;
+    let parsed = keys::parse(key).ok_or_else(|| {
+        DesktopError::new(format!(
+            "unsupported key '{key}' — use a single character or a named key (enter, pageup, f5, comma, numpad1, …)"
+        ))
+    })?;
+    let stroke = match parsed {
+        Key::Named(named) => {
+            let (vk, extended) = named_vk(named).ok_or_else(|| {
+                DesktopError::new(format!("'{key}' has no equivalent key on Windows"))
+            })?;
+            Stroke::Vk { vk, extended }
+        }
+        Key::Char(character) => {
+            // A chord names the key, not the character: ctrl+S means ctrl+s,
+            // matching macOS, rather than ctrl+shift+s.
+            let character = if held.is_empty() {
+                character
+            } else {
+                character.to_ascii_lowercase()
+            };
+            match layout(character) {
+                Some((vk, extra)) => {
+                    for modifier in extra {
+                        if !held.contains(&modifier) {
+                            held.push(modifier);
+                        }
+                    }
+                    Stroke::Vk { vk, extended: false }
+                }
+                None if held.is_empty() => Stroke::Unicode(character),
+                None => {
+                    return Err(DesktopError::new(format!(
+                        "'{key}' is not on the current keyboard layout, so it cannot be combined with modifiers"
+                    )));
+                }
+            }
+        }
+    };
+    Ok(KeyPlan { modifiers: held, stroke })
+}
+
+fn keyboard_input(vk: u16, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk),
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+fn vk_input(vk: u16, extended: bool, up: bool) -> INPUT {
+    let scan = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC) } as u16;
+    let mut flags = KEYBD_EVENT_FLAGS(0);
+    if extended || vk == VK_LWIN {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
+    if up {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    keyboard_input(vk, scan, flags)
+}
+
+/// Send a plan as one `SendInput` batch, so the user's own keystrokes cannot
+/// interleave with the chord and modifiers are always released.
+fn send_key_plan(plan: &KeyPlan) -> Result<()> {
+    let mut inputs = Vec::new();
+    for vk in &plan.modifiers {
+        inputs.push(vk_input(*vk, false, false));
+    }
+    match plan.stroke {
+        Stroke::Vk { vk, extended } => {
+            inputs.push(vk_input(vk, extended, false));
+            inputs.push(vk_input(vk, extended, true));
+        }
+        Stroke::Unicode(character) => {
+            let mut units = [0u16; 2];
+            for unit in character.encode_utf16(&mut units).iter() {
+                inputs.push(keyboard_input(0, *unit, KEYEVENTF_UNICODE));
+                inputs.push(keyboard_input(0, *unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
+            }
+        }
+    }
+    for vk in plan.modifiers.iter().rev() {
+        inputs.push(vk_input(*vk, false, true));
+    }
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if sent as usize != inputs.len() {
+        return Err(DesktopError::new(
+            "the system rejected the synthetic key press — a higher-integrity window (an elevated \
+             app or UAC prompt) may have focus",
+        ));
+    }
+    Ok(())
 }
 
 impl Desktop for WindowsDesktop {
@@ -604,10 +792,8 @@ impl Desktop for WindowsDesktop {
     }
 
     fn press_key(&mut self, key: &str, modifiers: &[String]) -> Result<String> {
-        let sequence = key_sequence(key, modifiers)?;
-        Keyboard::default()
-            .send_keys(&sequence)
-            .map_err(|error| DesktopError::new(format!("key press failed: {error}")))?;
+        let plan = key_plan(key, modifiers, layout_vk)?;
+        send_key_plan(&plan)?;
         Ok(if modifiers.is_empty() {
             format!("pressed {key}")
         } else {
@@ -689,39 +875,91 @@ impl Desktop for WindowsDesktop {
 
 #[cfg(test)]
 mod tests {
-    use super::{key_sequence, truncate};
+    use super::{KeyPlan, Stroke, key_plan, truncate};
+
+    /// A US layout stand-in so the tests do not depend on the machine's layout.
+    fn us(character: char) -> Option<(u16, Vec<u16>)> {
+        match character {
+            'a'..='z' => Some((character.to_ascii_uppercase() as u16, vec![])),
+            'A'..='Z' => Some((character as u16, vec![0x10])),
+            '{' => Some((0xDB, vec![0x10])),
+            '(' => Some((0x39, vec![0x10])),
+            '/' => Some((0xBF, vec![])),
+            ',' => Some((0xBC, vec![])),
+            _ => None,
+        }
+    }
+
+    fn plan(key: &str, modifiers: &[&str]) -> KeyPlan {
+        let modifiers: Vec<String> = modifiers.iter().map(|m| m.to_string()).collect();
+        key_plan(key, &modifiers, us).unwrap()
+    }
 
     #[test]
     fn cmd_is_translated_to_the_windows_key() {
         // Models trained on macOS send cmd constantly; refusing it would make
         // every save and copy fail on Windows.
-        assert_eq!(key_sequence("s", &["cmd".to_string()]).unwrap(), "{win}s");
-        assert_eq!(key_sequence("s", &["ctrl".to_string()]).unwrap(), "{ctrl}s");
+        assert_eq!(plan("s", &["cmd"]).modifiers, vec![0x5B]);
+        assert_eq!(plan("s", &["ctrl"]).modifiers, vec![0x11]);
+        assert_eq!(plan("s", &["ctrl"]).stroke, Stroke::Vk { vk: 'S' as u16, extended: false });
     }
 
     #[test]
-    fn named_keys_become_uiautomation_tokens() {
-        assert_eq!(key_sequence("return", &[]).unwrap(), "{enter}");
-        assert_eq!(key_sequence("Escape", &[]).unwrap(), "{esc}");
-        assert_eq!(
-            key_sequence("a", &["ctrl".to_string(), "shift".to_string()]).unwrap(),
-            "{ctrl}{shift}a"
-        );
+    fn navigation_keys_are_virtual_keys_not_text() {
+        assert_eq!(plan("pageup", &[]).stroke, Stroke::Vk { vk: 0x21, extended: true });
+        assert_eq!(plan("pagedown", &[]).stroke, Stroke::Vk { vk: 0x22, extended: true });
+        assert_eq!(plan("home", &[]).stroke, Stroke::Vk { vk: 0x24, extended: true });
+        assert_eq!(plan("end", &[]).stroke, Stroke::Vk { vk: 0x23, extended: true });
+        assert_eq!(plan("forwarddelete", &[]).stroke, Stroke::Vk { vk: 0x2E, extended: true });
+        assert_eq!(plan("return", &[]).stroke, Stroke::Vk { vk: 0x0D, extended: false });
+        assert_eq!(plan("Escape", &[]).stroke, Stroke::Vk { vk: 0x1B, extended: false });
+    }
+
+    #[test]
+    fn function_and_numpad_keys_map_to_their_virtual_keys() {
+        assert_eq!(plan("f1", &[]).stroke, Stroke::Vk { vk: 0x70, extended: false });
+        assert_eq!(plan("F12", &[]).stroke, Stroke::Vk { vk: 0x7B, extended: false });
+        assert_eq!(plan("f20", &[]).stroke, Stroke::Vk { vk: 0x83, extended: false });
+        assert_eq!(plan("numpad0", &[]).stroke, Stroke::Vk { vk: 0x60, extended: false });
+        assert_eq!(plan("numpadenter", &[]).stroke, Stroke::Vk { vk: 0x0D, extended: true });
+        assert!(key_plan("numpadequals", &[], us).is_err());
+    }
+
+    #[test]
+    fn key_syntax_characters_are_sent_as_keys() {
+        // `{` and `(` were markup in the old key-sequence syntax.
+        let brace = plan("{", &[]);
+        assert_eq!(brace.stroke, Stroke::Vk { vk: 0xDB, extended: false });
+        assert_eq!(brace.modifiers, vec![0x10]);
+        assert_eq!(plan("(", &["ctrl"]).modifiers, vec![0x11, 0x10]);
+        assert_eq!(plan("comma", &[]).stroke, Stroke::Vk { vk: 0xBC, extended: false });
+    }
+
+    #[test]
+    fn a_chord_uses_the_unshifted_letter() {
+        let chord = plan("S", &["ctrl"]);
+        assert_eq!(chord.modifiers, vec![0x11]);
+        // Without modifiers the capital is typed with shift.
+        assert_eq!(plan("S", &[]).modifiers, vec![0x10]);
+    }
+
+    #[test]
+    fn characters_off_the_layout_fall_back_to_unicode_only_without_modifiers() {
+        assert_eq!(plan("é", &[]).stroke, Stroke::Unicode('é'));
+        assert!(key_plan("é", &["ctrl".to_string()], us).is_err());
     }
 
     #[test]
     fn fn_modifier_is_dropped_rather_than_breaking_the_chord() {
-        assert_eq!(
-            key_sequence("c", &["fn".to_string(), "ctrl".to_string()]).unwrap(),
-            "{ctrl}c"
-        );
+        assert_eq!(plan("c", &["fn", "ctrl"]).modifiers, vec![0x11]);
     }
 
     #[test]
-    fn unrecognized_modifiers_are_rejected() {
-        let error = key_sequence("c", &["ctl".to_string()]).unwrap_err();
-        assert!(error.contains("unsupported modifier"));
-        assert!(error.contains("ctl"));
+    fn unrecognized_modifiers_and_keys_are_rejected() {
+        let error = key_plan("c", &["ctl".to_string()], us).unwrap_err();
+        assert!(error.0.contains("unsupported modifier"));
+        assert!(error.0.contains("ctl"));
+        assert!(key_plan("pagedwn", &[], us).is_err());
     }
 
     #[test]
