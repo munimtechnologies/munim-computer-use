@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: cargo test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: windows-linux
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        # xcap pulls in PipeWire/libspa (through bindgen, hence libclang), DRM,
+        # GBM, EGL and Wayland for screen capture, plus XCB for X11. AT-SPI,
+        # D-Bus (zbus), XTEST (x11rb) and the clipboard are pure Rust.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang libclang-dev \
+            libpipewire-0.3-dev libspa-0.2-dev \
+            libdrm-dev libgbm-dev libegl-dev libwayland-dev \
+            libxcb1-dev libxcb-randr0-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: windows-linux
+      - run: cargo test --locked
+
+  swift:
+    name: swift build (macOS)
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: macos
+    steps:
+      - uses: actions/checkout@v7
+      - run: swift build -c release
+
+  node:
+    name: extension tests and tool parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: node --test chrome-extension/background.test.mjs
+      - run: node scripts/check-tool-parity.mjs
+      - run: node --check npm/bin/munim-computer-use.js
