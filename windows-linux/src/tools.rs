@@ -492,6 +492,47 @@ fn all_tool_defs() -> Value {
             }
         },
         {
+            "name": "clipboard_read",
+            "description": "Read the plain text on the system clipboard, for example after press_key cmd+c (ctrl+c off macOS) copied a selection, or when the user says they copied something for you. Prefer get_app_state, browser_snapshot or screenshot to read what is on screen; use this for text that was deliberately copied. Images and files on the clipboard are reported as no text. Read-only, but the clipboard can hold private data the user copied, such as passwords, so do not repeat it beyond what the task needs.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Maximum characters to return (default 20000, maximum 200000). Longer text is cut off with a note giving its full length."
+                    }
+                }
+            },
+            "annotations": {
+                "title": "Read clipboard",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "clipboard_write",
+            "description": "Replace the system clipboard with plain text, typically so a long or multi-line value can be pasted with press_key cmd+v (ctrl+v off macOS) where set_value is rejected and type_text would be slow. This tool does not paste anything itself. Side effect: whatever the user had on the clipboard is overwritten and not restored, so tell the user when you use it. Prefer set_value or type_text when they work.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Exact text to place on the clipboard, replacing its current contents"
+                    }
+                },
+                "required": ["text"]
+            },
+            "annotations": {
+                "title": "Write clipboard",
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
             "name": "browser_open_tab",
             "description": "Open a URL in a new background tab inside the agent's own labelled tab group in the user's signed-in Chrome, and return its tab_id for browser_snapshot, browser_click, browser_type and browser_navigate. The tab opens in the background, so the user's browsing is not interrupted. Use browser_use_tab instead when the user already has the page open and signed in. Requires the Computer Use Chrome extension; a limited fallback mode applies without it.",
             "inputSchema": {
@@ -773,7 +814,7 @@ fn all_tool_defs() -> Value {
 mod tests {
     use super::{all_tool_defs, tool_defs};
 
-    /// The macOS server advertises exactly these 28 tools. Drifting apart would
+    /// The macOS server advertises exactly these 30 tools. Drifting apart would
     /// silently give a model different capabilities per platform.
     #[test]
     fn advertises_the_macos_tool_surface() {
@@ -785,7 +826,7 @@ mod tests {
             .map(|tool| tool["name"].as_str().expect("tool has a name"))
             .collect();
 
-        assert_eq!(names.len(), 28, "tool count drifted from the macOS server");
+        assert_eq!(names.len(), 30, "tool count drifted from the macOS server");
         for expected in [
             "list_apps",
             "get_app_state",
@@ -803,6 +844,8 @@ mod tests {
             "hover",
             "wait",
             "select_text",
+            "clipboard_read",
+            "clipboard_write",
             "browser_open_tab",
             "browser_list_tabs",
             "browser_use_tab",

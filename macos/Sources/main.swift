@@ -3023,6 +3023,47 @@ let toolDefs: [[String: Any]] = [
         ],
     ],
     [
+        "name": "clipboard_read",
+        "description": "Read the plain text on the system clipboard, for example after press_key cmd+c (ctrl+c off macOS) copied a selection, or when the user says they copied something for you. Prefer get_app_state, browser_snapshot or screenshot to read what is on screen; use this for text that was deliberately copied. Images and files on the clipboard are reported as no text. Read-only, but the clipboard can hold private data the user copied, such as passwords, so do not repeat it beyond what the task needs.",
+        "inputSchema": [
+            "type": "object",
+            "properties": [
+                "max_chars": [
+                    "type": "integer",
+                    "description": "Maximum characters to return (default 20000, maximum 200000). Longer text is cut off with a note giving its full length.",
+                ],
+            ],
+        ],
+        "annotations": [
+            "title": "Read clipboard",
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false,
+        ],
+    ],
+    [
+        "name": "clipboard_write",
+        "description": "Replace the system clipboard with plain text, typically so a long or multi-line value can be pasted with press_key cmd+v (ctrl+v off macOS) where set_value is rejected and type_text would be slow. This tool does not paste anything itself. Side effect: whatever the user had on the clipboard is overwritten and not restored, so tell the user when you use it. Prefer set_value or type_text when they work.",
+        "inputSchema": [
+            "type": "object",
+            "properties": [
+                "text": [
+                    "type": "string",
+                    "description": "Exact text to place on the clipboard, replacing its current contents",
+                ],
+            ],
+            "required": ["text"],
+        ],
+        "annotations": [
+            "title": "Write clipboard",
+            "readOnlyHint": false,
+            "destructiveHint": true,
+            "idempotentHint": true,
+            "openWorldHint": false,
+        ],
+    ],
+    [
         "name": "browser_open_tab",
         "description": "Open a URL in a new background tab inside the agent's own labelled tab group in the user's signed-in Chrome, and return its tab_id for browser_snapshot, browser_click, browser_type and browser_navigate. The tab opens in the background, so the user's browsing is not interrupted. Use browser_use_tab instead when the user already has the page open and signed in. Requires the Computer Use Chrome extension; a limited fallback mode applies without it.",
         "inputSchema": [
@@ -3331,6 +3372,30 @@ func negotiatedProtocolVersion(_ params: [String: Any]) -> String {
 /// Returned in the `initialize` result; identical in the Rust server.
 let serverInstructions = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf."
 
+// MARK: - Clipboard
+
+func toolClipboardRead(_ args: [String: Any]) -> String {
+    let maxChars = min(max((args["max_chars"] as? Int) ?? 20_000, 1), 200_000)
+    // NSPasteboard is AppKit; keep it on the main thread like activate.
+    let text = DispatchQueue.main.sync { NSPasteboard.general.string(forType: .string) }
+    guard let text, !text.isEmpty else { return "(the clipboard holds no text)" }
+    let total = text.count
+    if total <= maxChars { return text }
+    return String(text.prefix(maxChars))
+        + "\n… truncated: showing \(maxChars) of \(total) characters; raise max_chars to read more"
+}
+
+func toolClipboardWrite(_ args: [String: Any]) -> String {
+    guard let text = args["text"] as? String else { return "error: missing required argument 'text'" }
+    let written = DispatchQueue.main.sync { () -> Bool in
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        return pasteboard.setString(text, forType: .string)
+    }
+    guard written else { return "error: could not write the clipboard" }
+    return "copied \(text.count) characters to the clipboard, replacing what was there"
+}
+
 func dispatch(_ name: String, _ args: [String: Any]) -> String {
     if name.hasPrefix("browser_"), !browserControlEnabled {
         return "error: browser control is disabled in Computer Use settings"
@@ -3350,6 +3415,8 @@ func dispatch(_ name: String, _ args: [String: Any]) -> String {
     case "select_text": return toolSelectText(args)
     case "hover": return toolHover(args)
     case "wait": return toolWait(args)
+    case "clipboard_read": return toolClipboardRead(args)
+    case "clipboard_write": return toolClipboardWrite(args)
     case "browser_open_tab": return toolBrowserOpenTab(args)
     case "browser_list_tabs": return toolBrowserListTabs(args)
     case "browser_use_tab": return toolBrowserUseTab(args)
@@ -3623,7 +3690,7 @@ while let line = readLine(strippingNewline: true) {
             // list_displays / browser_* do not need Accessibility — Screen
             // Recording / Chrome bridge only. Keep them ahead of the AX gate so
             // the Screen Recording-only flow can still recover (Bot finding).
-            if name == "list_displays" || name.hasPrefix("browser_") {
+            if name == "list_displays" || name.hasPrefix("browser_") || name.hasPrefix("clipboard_") {
                 let out = dispatch(name, args)
                 respond(id: id, result: textResult(out, isError: out.hasPrefix("error:")))
                 break
