@@ -23,12 +23,13 @@ jobs:
     name: linux-${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: x64
-            runner: ubuntu-22.04
+            runner: ubuntu-24.04
           - arch: arm64
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
     defaults:
       run:
         working-directory: windows-linux
@@ -56,6 +57,7 @@ jobs:
         run: tar -czf "munim-computer-use-linux-${{ matrix.arch }}.tar.gz" -C target/release munim-computer-use
       - uses: actions/upload-artifact@v5
         with:
+          retention-days: 1
           name: linux-${{ matrix.arch }}
           path: windows-linux/munim-computer-use-linux-${{ matrix.arch }}.tar.gz
 
@@ -72,6 +74,7 @@ jobs:
           (cd dist/chrome-extension && zip -qr ../../munim-computer-use-chrome-extension.zip .)
       - uses: actions/upload-artifact@v5
         with:
+          retention-days: 1
           name: chrome-extension
           path: munim-computer-use-chrome-extension.zip
 
