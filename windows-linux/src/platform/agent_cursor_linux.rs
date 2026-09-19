@@ -173,7 +173,7 @@ fn ensure_fade_watcher() {
 }
 
 fn task_fade_grace() -> Duration {
-    match std::env::var("COMPUTER_USE_AGENT_CURSOR_TASK_FADE_SECS") {
+    match crate::identity::env_var("AGENT_CURSOR_TASK_FADE_SECS").ok_or(()) {
         Ok(raw) => {
             if let Ok(secs) = raw.trim().parse::<f64>() {
                 // from_secs_f64 panics on inf/NaN/overflow — reject those.
@@ -229,7 +229,7 @@ fn travel_wait_micros(from: Option<(f64, f64)>, x: f64, y: f64) -> u64 {
 }
 
 fn agent_cursor_enabled() -> bool {
-    match std::env::var("COMPUTER_USE_AGENT_CURSOR") {
+    match crate::identity::env_var("AGENT_CURSOR").ok_or(()) {
         Ok(value) => {
             let v = value.trim();
             !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))

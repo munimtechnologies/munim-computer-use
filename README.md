@@ -66,6 +66,7 @@
 - [Tools](#tools-30)
 - [Repository layout](#repository-layout)
 - [Environment flags](#environment-flags)
+- [Embedding in an app](#embedding-in-an-app)
 - [Prompting your agent](#prompting-your-agent)
 - [Contributing](#contributing)
 - [Credits and license](#credits-and-license)
@@ -179,6 +180,7 @@ Linux notes: element actions work everywhere; coordinate clicks need an X11 or X
 
 1. `chrome://extensions` → Developer mode → **Load unpacked** → select `chrome-extension/`.
 2. Register the native messaging host: `sh chrome-extension/install.sh` (macOS/Linux) or `powershell -File chrome-extension/install.ps1` (Windows). Point `COMPUTER_USE_PATH` at the binary if it is not in the default build location.
+3. The binary can also register itself for its current identity: `munim-computer-use install-native-host` (see [Embedding](#embedding-in-an-app)).
 
 ## Environment flags
 
@@ -188,6 +190,38 @@ Linux notes: element actions work everywhere; coordinate clicks need an X11 or X
 | `COMPUTER_USE_AGENT_CURSOR=0`              | Do not draw the agent pointer                                   |
 | `COMPUTER_USE_AGENT_CURSOR_TASK_FADE_SECS` | How long the pointer stays after the last tool call (default 8) |
 | `COMPUTER_USE_ALLOW_SECURE_FIELD_INPUT=1`  | Allow typing into password fields (refused by default)          |
+
+## Embedding in an app
+
+An app can ship this binary inside its own bundle and run it under its own identity, so it never shares a browser bridge, agent-cursor app or native-messaging host with a standalone install on the same machine. [MT Code](https://github.com/munimtechnologies/mtcode) does exactly this. Pass a profile, either as a JSON object or a path to a JSON file, with `--profile <json|file>` (any position) or `COMPUTER_USE_PROFILE`:
+
+```json
+{
+  "name": "example-desktop",
+  "envPrefix": "EXAMPLE_DESKTOP_",
+  "agentCursorName": "ExampleAgentCursor",
+  "agentCursorBundleId": "com.example.agent-cursor",
+  "nativeHostNames": ["com.example.desktop"],
+  "extensionIds": ["abcdefghijklmnopabcdefghijklmnop"],
+  "nativeHostDescription": "Example desktop control bridge"
+}
+```
+
+| Key                                        | Default                                                            | Meaning                                                                                              |
+| ------------------------------------------ | ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| `name`                                     | none (standalone paths)                                            | Moves the support dir, bridge socket and Windows pipe under this name                                |
+| `supportDir`                               | `~/Library/Application Support/computer-use`, `$XDG_DATA_HOME/munim-computer-use`, `%LOCALAPPDATA%\munim-computer-use` | Native-host wrapper, profile copy; on macOS also the bridge socket and a bare build's overlay app |
+| `bridgeSocket`                             | `<supportDir>/bridge.sock` (macOS), `$XDG_RUNTIME_DIR/<name>/bridge.sock` (Linux), `<name>-bridge-<user>` pipe (Windows) | Where the MCP server and the Chrome relay meet                                     |
+| `envPrefix`                                | none                                                               | Tunables are read as `<prefix>BROWSER`, `<prefix>AGENT_CURSOR`, … before `COMPUTER_USE_*`           |
+| `agentCursorName` / `agentCursorBundleId`  | `MunimAgentCursor` / `com.munimtech.computer-use.agent-cursor`     | The pointer overlay's app, executable and window-class name, and its macOS bundle id                 |
+| `historyDir`                               | none                                                               | Default `--root` for `computer-history`                                                              |
+| `nativeHostNames` / `extensionIds`         | `com.munim.mtcode.desktop`, `com.munimtech.computer-use.desktop` / `kgdolgnijopbghhomnblabjkmjhnoage` | What `install-native-host` registers, and for which extension                   |
+
+Each of `supportDir`, `bridgeSocket`, `envPrefix`, `agentCursorName`, `agentCursorBundleId` and `historyDir` can also be overridden by `COMPUTER_USE_<SNAKE_CASE>` (for example `COMPUTER_USE_SUPPORT_DIR`), which wins over the profile. `munim-computer-use identity` prints the resolved values.
+
+- **Browser bridge.** Run `munim-computer-use install-native-host` with the same profile. It writes a wrapper that relays Chrome into this identity's bridge (replaying the profile), and a host manifest for each name in every Chrome/Chromium profile directory (the registry on Windows). It rewrites nothing that is already current, so an app can call it on every launch.
+- **Extension.** Use the stock extension, or build a variant with its own host names, tab-group title and key: `node scripts/build-extension.mjs --out <dir> --host com.example.desktop --group-title "Example" --key <base64>`. It prints the variant's extension id for `extensionIds`.
+- **macOS permissions.** The MCP server is a bare executable, so Accessibility and Screen Recording are granted to the app that spawns it. Only the agent-cursor overlay has a bundle of its own; ship `<agentCursorName>.app` (a copy of the binary plus an `LSUIElement` Info.plist) beside the binary, or it is materialised under `supportDir` on first use.
 
 ## Prompting your agent
 

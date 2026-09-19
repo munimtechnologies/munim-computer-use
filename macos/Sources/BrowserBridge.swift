@@ -17,24 +17,23 @@ import Darwin
 // later ones simply fall back to the accessibility path.
 
 let bridgeSocketPath: String = {
-    // Prefer Application Support; never fall back to world-writable /tmp (another
-    // local user could claim that path). NSTemporaryDirectory() is already per-user.
-    let shortFallback = URL(fileURLWithPath: NSTemporaryDirectory())
-        .appendingPathComponent("munim-computer-use-bridge.sock").path
-    let preferred = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-        ?? URL(fileURLWithPath: NSTemporaryDirectory())
-    let dir = preferred.appendingPathComponent("computer-use", isDirectory: true)
+    let identity = Identity.current
+    // An explicit socket path (embedders) is used as given.
+    if let explicit = identity.explicitBridgeSocket { return explicit }
+    // Prefer the support directory; never fall back to world-writable /tmp
+    // (another local user could claim that path).
+    let dir = identity.supportDirectory
     do {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     } catch {
         // Unusable Application Support — bind under the user-private temp dir.
-        return shortFallback
+        return identity.fallbackBridgeSocketPath
     }
     let candidate = dir.appendingPathComponent("bridge.sock").path
     // sockaddr_un.sun_path is ~104 bytes; fall back to a short private path when
     // Application Support is nested too deep for bind()/connect() to succeed.
     if candidate.utf8.count > 100 {
-        return shortFallback
+        return identity.fallbackBridgeSocketPath
     }
     return candidate
 }()

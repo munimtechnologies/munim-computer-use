@@ -25,8 +25,10 @@ extension String: @retroactive Error {}
 
 /// Host settings pass `COMPUTER_USE_AGENT_CURSOR=0` / `COMPUTER_USE_BROWSER=0` when
 /// the matching Computer Use toggle is off. Missing or empty means enabled.
+/// `name` is the tunable without its prefix (`BROWSER`); an embedder's
+/// `envPrefix` is read first (see Identity.swift).
 func envFlagDisabled(_ name: String) -> Bool {
-    guard let raw = ProcessInfo.processInfo.environment[name]?
+    guard let raw = Identity.current.tunable(name)?
         .trimmingCharacters(in: .whitespacesAndNewlines)
         .lowercased(),
         !raw.isEmpty
@@ -36,8 +38,8 @@ func envFlagDisabled(_ name: String) -> Bool {
     return raw == "0" || raw == "false" || raw == "off" || raw == "no"
 }
 
-var agentCursorEnabled: Bool { !envFlagDisabled("COMPUTER_USE_AGENT_CURSOR") }
-var browserControlEnabled: Bool { !envFlagDisabled("COMPUTER_USE_BROWSER") }
+var agentCursorEnabled: Bool { !envFlagDisabled("AGENT_CURSOR") }
+var browserControlEnabled: Bool { !envFlagDisabled("BROWSER") }
 
 func axCopy(_ el: AXUIElement, _ attr: String) -> AnyObject? {
     var value: AnyObject?
@@ -449,16 +451,17 @@ func windowTarget(under point: CGPoint) -> WindowTarget? {
         else { continue }
         let pid = pid_t(pidValue.int32Value)
         let number = numberValue.uint32Value
-        // Skip this process and the separate MunimAgentCursor overlay, which sits
+        // Skip this process and the separate agent-cursor overlay, which sits
         // above the click point by design and would steal hit-testing.
         if pid == getpid() { continue }
+        let overlayName = Identity.current.agentCursorName
         if let owner = window[kCGWindowOwnerName as String] as? String,
-           owner == "MunimAgentCursor" || owner.hasPrefix("MunimAgentCursor")
+           owner == overlayName || owner.hasPrefix(overlayName)
         {
             continue
         }
         if let app = NSRunningApplication(processIdentifier: pid),
-           app.bundleIdentifier == "com.munimtech.computer-use.agent-cursor"
+           app.bundleIdentifier == Identity.current.agentCursorBundleId
         {
             continue
         }
@@ -1720,7 +1723,7 @@ func toolDrag(_ args: [String: Any]) -> String {
 ///
 /// Set `COMPUTER_USE_ALLOW_SECURE_FIELD_INPUT=1` to opt out.
 func refuseSecureFieldInput(_ element: AXUIElement, _ id: String) -> String? {
-    if ProcessInfo.processInfo.environment["COMPUTER_USE_ALLOW_SECURE_FIELD_INPUT"] == "1" {
+    if Identity.current.tunable("ALLOW_SECURE_FIELD_INPUT") == "1" {
         return nil
     }
     guard axString(element, kAXRoleAttribute as String) == "AXSecureTextField" else { return nil }
@@ -3461,16 +3464,35 @@ func textResult(_ s: String, isError: Bool = false) -> [String: Any] {
     ["content": [["type": "text", "text": s]], "isError": isError]
 }
 
+// `--profile` may appear anywhere; it is consumed first so every mode below
+// (server, native host, history recorder, overlay) runs under one identity.
+let cliArguments = Identity.bootstrap(CommandLine.arguments)
+let cliMode = cliArguments.count > 1 ? cliArguments[1] : nil
+
 // Chrome launches this same binary as its native messaging host; in that mode
 // it is a relay, not an MCP server.
-if CommandLine.arguments.contains("native-host") { NativeHost.run() }
+if cliArguments.contains("native-host") { NativeHost.run() }
+// Register this binary with Chrome for the current identity.
+if cliMode == "install-native-host" { NativeHostInstaller.run(Array(cliArguments.dropFirst(2))) }
+// Print the resolved identity (paths, names) as JSON, for embedders to check.
+if cliMode == "identity" {
+    if let data = try? JSONSerialization.data(
+        withJSONObject: Identity.current.describe(),
+        options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]),
+        let text = String(data: data, encoding: .utf8)
+    {
+        print(text)
+    }
+    exit(0)
+}
 // Computer History background recorder (Skysight-style interaction events).
-if CommandLine.arguments.contains("computer-history") {
-    let args = CommandLine.arguments
+if cliArguments.contains("computer-history") {
+    let args = cliArguments
     if let flag = args.firstIndex(of: "--root"), args.index(after: flag) < args.endIndex {
         ComputerHistoryDaemon.run(root: args[args.index(after: flag)])
     }
-    fputs("munim-computer-use: computer-history requires --root <dir>\n", stderr)
+    if let root = Identity.current.historyDirectory { ComputerHistoryDaemon.run(root: root) }
+    fputs("munim-computer-use: computer-history requires --root <dir> (or a historyDir in the profile)\n", stderr)
     exit(2)
 }
 // Ask macOS for the permissions Computer Use needs, from inside the app bundle
@@ -3480,7 +3502,7 @@ if CommandLine.arguments.contains("computer-history") {
 // after a re-sign, System Settings still shows the app enabled while tccd logs
 // "Failed to match existing code requirement" and every AX call is refused.
 // Prompting re-creates the row against the signature running now.
-if CommandLine.arguments.contains("request-permissions") {
+if cliArguments.contains("request-permissions") {
     _ = NSApplication.shared
     NSApp.setActivationPolicy(.accessory)
     let prompted = AXIsProcessTrustedWithOptions(
@@ -3503,8 +3525,8 @@ if CommandLine.arguments.contains("request-permissions") {
 
 // The agent pointer is a separate LSUIElement .app (see AgentCursor.swift)
 // launched via NSWorkspace with `--socket <path>` for move/hide commands.
-if CommandLine.arguments.contains("cursor-overlay") {
-    let args = CommandLine.arguments
+if cliArguments.contains("cursor-overlay") {
+    let args = cliArguments
     if let flag = args.firstIndex(of: "--socket"), args.index(after: flag) < args.endIndex {
         AgentCursorOverlay.run(socketPath: args[args.index(after: flag)])
     }

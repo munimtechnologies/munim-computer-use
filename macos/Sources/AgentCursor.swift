@@ -29,9 +29,12 @@ import Foundation
 // arrow, spring follow with tilt/squash, idle breathe) — never a
 // system-style pointer. No click ring and no settle wobble.
 
-private let overlayAppName = "MunimAgentCursor.app"
-private let overlayExecutableName = "MunimAgentCursor"
-private let overlayBundleIdentifier = "com.munimtech.computer-use.agent-cursor"
+// Named by the identity (see Identity.swift) so an embedding app's overlay has
+// its own bundle id and does not share Launch Services state with a standalone
+// install. The defaults must not change: TCC keys on the bundle id.
+private var overlayAppName: String { Identity.current.agentCursorName + ".app" }
+private var overlayExecutableName: String { Identity.current.agentCursorName }
+private var overlayBundleIdentifier: String { Identity.current.agentCursorBundleId }
 
 /// Client side: owns the overlay process and speaks to it.
 final class AgentCursor {
@@ -135,7 +138,7 @@ final class AgentCursor {
     /// Brief grace so a follow-up tool in the same turn cancels before fade.
     /// Override with `COMPUTER_USE_AGENT_CURSOR_TASK_FADE_SECS`.
     private static func taskFadeGraceSeconds() -> TimeInterval {
-        if let raw = ProcessInfo.processInfo.environment["COMPUTER_USE_AGENT_CURSOR_TASK_FADE_SECS"],
+        if let raw = Identity.current.tunable("AGENT_CURSOR_TASK_FADE_SECS"),
            let value = Double(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
            value.isFinite, value >= 0, value < 3600
         {
@@ -440,12 +443,9 @@ private enum OverlayBundle {
             }
         }
 
-        // Dev / unsigned: materialise under Application Support so Launch Services
-        // sees a stable path across rebuilds.
-        guard
-            let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-        else { return nil }
-        let dir = support.appendingPathComponent("computer-use", isDirectory: true)
+        // Dev / unsigned: materialise under the support directory (Application
+        // Support) so Launch Services sees a stable path across rebuilds.
+        let dir = Identity.current.supportDirectory
         let appURL = dir.appendingPathComponent(overlayAppName, isDirectory: true)
         do {
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -519,6 +519,11 @@ private enum OverlayBundle {
         }
     }
 
+    private static var overlayDisplayName: String {
+        let name = Identity.current.agentCursorName
+        return name == Identity.defaultAgentCursorName ? "Munim Agent Cursor" : name
+    }
+
     private static func overlayInfoPlist() -> String {
         """
         <?xml version="1.0" encoding="UTF-8"?>
@@ -534,7 +539,7 @@ private enum OverlayBundle {
         	<key>CFBundleInfoDictionaryVersion</key>
         	<string>6.0</string>
         	<key>CFBundleName</key>
-        	<string>Munim Agent Cursor</string>
+        	<string>\(overlayDisplayName)</string>
         	<key>CFBundlePackageType</key>
         	<string>APPL</string>
         	<key>CFBundleShortVersionString</key>
