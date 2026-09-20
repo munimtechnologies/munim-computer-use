@@ -37,7 +37,7 @@ const FALLBACK_PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "mt-desktop";
 const SERVER_TITLE: &str = "Munim Computer Use";
 const SERVER_WEBSITE: &str = "https://munimtech.com/computer-use";
-const SERVER_VERSION: &str = "0.4.0";
+const SERVER_VERSION: &str = "0.4.1";
 
 /// Keeps the agent pointer up for the duration of a `tools/call`, then
 /// schedules a fade once Computer Use tools stop for the task.
@@ -551,6 +551,15 @@ fn run_desktop_tool(
             let direction = ScrollDirection::parse(arg_str(args, "direction").unwrap_or("down"))?;
             let amount = arg_i64(args, "amount").unwrap_or(5).clamp(1, 100) as i32;
             let element = arg_str(args, "element_id").map(element_id).transpose()?;
+            // The wheel acts wherever the pointer is. A remote viewer scrolling
+            // over a particular pane sends its coordinates, so put the pointer
+            // there first -- the same thing their own trackpad would do.
+            if identity::remote_control()
+                && element.is_none()
+                && let (Some(x), Some(y)) = (arg_f64(args, "x"), arg_f64(args, "y"))
+            {
+                desktop.hover(Point::Screen(x, y))?;
+            }
             desktop.scroll(direction, amount, element)?
         }
         "set_value" => {

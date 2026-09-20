@@ -32,6 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::agent_cursor::AgentCursor;
 use super::{Desktop, DesktopError, Point, Result, ScrollDirection, format_app_list};
 use crate::apps;
+use crate::identity;
 use crate::keys::{self, Key, Named};
 
 /// One wheel notch, as Windows defines it.
@@ -787,7 +788,10 @@ impl Desktop for WindowsDesktop {
     fn click(&mut self, target: Point, click_count: u32) -> Result<String> {
         // An element press goes through the control's own Invoke handler, which
         // is far more reliable than a synthetic click landing on the right pixel.
+        // Remote control skips it: the viewer is aiming at a pixel they can see,
+        // and an Invoke would fire a different control than the one under them.
         if let Point::Element(id) = target
+            && !identity::remote_control()
             && click_count == 1
             && let Ok(element) = self.element(id)
             && let Ok(invoke) = element.get_pattern::<UIInvokePattern>()
@@ -803,8 +807,9 @@ impl Desktop for WindowsDesktop {
 
         let (x, y) = self.point_coordinates(target)?;
         AgentCursor::shared().press(x, y);
-        // Prefer window-message delivery so the user's cursor stays put.
-        if click_count <= 1 && Self::background_click(x, y, false) {
+        // Prefer window-message delivery so the user's cursor stays put --
+        // unless this is remote control, where moving the cursor is the point.
+        if !identity::remote_control() && click_count <= 1 && Self::background_click(x, y, false) {
             return Ok(format!("clicked at ({x:.0}, {y:.0}) in background"));
         }
 
@@ -830,7 +835,7 @@ impl Desktop for WindowsDesktop {
     fn right_click(&mut self, target: Point) -> Result<String> {
         let (x, y) = self.point_coordinates(target)?;
         AgentCursor::shared().press(x, y);
-        if Self::background_click(x, y, true) {
+        if !identity::remote_control() && Self::background_click(x, y, true) {
             return Ok(format!("right-clicked at ({x:.0}, {y:.0}) in background"));
         }
         Mouse::default()
@@ -844,7 +849,7 @@ impl Desktop for WindowsDesktop {
         AgentCursor::shared().show(x, y);
         // A posted WM_MOUSEMOVE lets hover-revealed controls (menus, toolbars,
         // tooltips) react without moving the user's cursor.
-        if Self::background_hover(x, y) {
+        if !identity::remote_control() && Self::background_hover(x, y) {
             return Ok(format!(
                 "hovering at ({x:.0}, {y:.0}) in background — call get_app_state or screenshot to see what appeared"
             ));
@@ -861,7 +866,7 @@ impl Desktop for WindowsDesktop {
         let (from_x, from_y) = self.point_coordinates(from)?;
         let (to_x, to_y) = self.point_coordinates(to)?;
         AgentCursor::shared().show(from_x, from_y);
-        if Self::background_drag((from_x, from_y), (to_x, to_y)) {
+        if !identity::remote_control() && Self::background_drag((from_x, from_y), (to_x, to_y)) {
             AgentCursor::shared().press(to_x, to_y);
             return Ok(format!(
                 "dragged ({from_x:.0}, {from_y:.0}) → ({to_x:.0}, {to_y:.0}) in background"
@@ -919,11 +924,13 @@ impl Desktop for WindowsDesktop {
             AgentCursor::shared().show(x, y);
             // Neither of these touches the user's cursor: the control's own
             // ScrollPattern first, then wheel messages posted to its window.
-            if self.uia_scroll(&target, horizontal, vertical) {
-                return Ok(format!("{label} in background (UI Automation)"));
-            }
-            if Self::post_wheel(x, y, horizontal, vertical) {
-                return Ok(format!("{label} in background"));
+            if !identity::remote_control() {
+                if self.uia_scroll(&target, horizontal, vertical) {
+                    return Ok(format!("{label} in background (UI Automation)"));
+                }
+                if Self::post_wheel(x, y, horizontal, vertical) {
+                    return Ok(format!("{label} in background"));
+                }
             }
             // Last resort: the wheel goes to whatever is under the real
             // pointer, so the pointer has to move there.

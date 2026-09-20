@@ -205,6 +205,26 @@ Linux notes: element actions work everywhere; coordinate clicks need an X11 or X
 | `COMPUTER_USE_AGENT_CURSOR=0`              | Do not draw the agent pointer                                   |
 | `COMPUTER_USE_AGENT_CURSOR_TASK_FADE_SECS` | How long the pointer stays after the last tool call (default 8) |
 | `COMPUTER_USE_ALLOW_SECURE_FIELD_INPUT=1`  | Allow typing into password fields (refused by default)          |
+| `COMPUTER_USE_REMOTE_CONTROL=1`            | Remote-desktop mode: input takes over the real pointer          |
+
+### Remote control
+
+Normally this server never touches the pointer: coordinate clicks are routed to
+a specific window, keystrokes are posted to a specific process, and an action
+that cannot be targeted is refused rather than taking over the machine. That is
+what lets an agent work while the user keeps using their computer.
+
+`COMPUTER_USE_REMOTE_CONTROL=1` inverts that contract for one process, for the
+case where a person is watching this machine's screen from another one and is
+steering it themselves. Then `click`, `right_click`, `drag`, `hover` and
+`scroll` move the real cursor and `type_text` and `press_key` go to whatever is
+focused, the way Chrome Remote Desktop or Screen Sharing behave. `scroll` also
+accepts `x`/`y` so the wheel acts over the point the viewer scrolled at, and the
+agent-cursor overlay stays hidden — there is only one pointer now.
+
+A host that runs both an agent and a viewer runs them as two processes, so
+turning this on for the viewer never takes the pointer away from the user on
+the agent's behalf.
 
 ## Embedding in an app
 

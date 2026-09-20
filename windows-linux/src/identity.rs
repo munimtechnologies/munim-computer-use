@@ -138,6 +138,26 @@ pub fn env_var(suffix: &str) -> Option<String> {
     lookup_tunable(get(), suffix, &|name| std::env::var(name).ok())
 }
 
+/// Remote-desktop mode: this process drives the machine for a person watching
+/// its screen from another one, so input takes over the real pointer and
+/// keyboard instead of being routed to a window in the background. Off unless
+/// `COMPUTER_USE_REMOTE_CONTROL=1` (or the embedder's prefixed equivalent).
+///
+/// A host that runs an agent as well keeps it in a separate process, which
+/// stays in background mode.
+pub fn remote_control() -> bool {
+    match env_var("REMOTE_CONTROL") {
+        Some(value) => {
+            let value = value.trim();
+            value == "1"
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("on")
+                || value.eq_ignore_ascii_case("yes")
+        }
+        None => false,
+    }
+}
+
 fn lookup_tunable(
     identity: &Identity,
     suffix: &str,

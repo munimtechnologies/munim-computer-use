@@ -229,6 +229,11 @@ fn travel_wait_micros(from: Option<(f64, f64)>, x: f64, y: f64) -> u64 {
 }
 
 fn agent_cursor_enabled() -> bool {
+    // Remote control steers the real pointer, so the overlay would be a second
+    // cursor chasing the first one.
+    if crate::identity::remote_control() {
+        return false;
+    }
     match crate::identity::env_var("AGENT_CURSOR").ok_or(()) {
         Ok(value) => {
             let v = value.trim();

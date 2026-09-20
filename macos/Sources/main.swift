@@ -38,7 +38,22 @@ func envFlagDisabled(_ name: String) -> Bool {
     return raw == "0" || raw == "false" || raw == "off" || raw == "no"
 }
 
-var agentCursorEnabled: Bool { !envFlagDisabled("AGENT_CURSOR") }
+/// The opt-in counterpart of `envFlagDisabled`, for tunables that are off
+/// unless the host asks for them.
+func envFlagEnabled(_ name: String) -> Bool {
+    guard let raw = Identity.current.tunable(name)?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased(),
+        !raw.isEmpty
+    else {
+        return false
+    }
+    return raw == "1" || raw == "true" || raw == "on" || raw == "yes"
+}
+
+/// Remote control drives the real pointer, so the agent's overlay cursor would
+/// be a second pointer chasing the first one.
+var agentCursorEnabled: Bool { !envFlagDisabled("AGENT_CURSOR") && !RemoteControl.isEnabled }
 var browserControlEnabled: Bool { !envFlagDisabled("BROWSER") }
 
 func axCopy(_ el: AXUIElement, _ attr: String) -> AnyObject? {
@@ -699,7 +714,10 @@ func postClick(at point: CGPoint, clickCount: Int = 1, pid: pid_t) {
     }
 }
 
-func typeText(_ text: String, pid: pid_t) {
+/// Build the keystrokes for `text` and hand each one to `deliver`, which
+/// decides where it goes: a single process (the agent) or the global HID tap
+/// (remote control).
+func synthesizeTypedText(_ text: String, deliver: (CGEvent?) -> Void) {
     let src = agentEventSource()
     // Send in small UTF-16 chunks: keyboardSetUnicodeString has a length cap,
     // and per-chunk events keep long strings from being dropped.
@@ -709,10 +727,14 @@ func typeText(_ text: String, pid: pid_t) {
               let up = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) else { continue }
         down.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
         up.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
-        post(down, to: pid)
-        post(up, to: pid)
+        deliver(down)
+        deliver(up)
         usleep(8_000)
     }
+}
+
+func typeText(_ text: String, pid: pid_t) {
+    synthesizeTypedText(text) { post($0, to: pid) }
 }
 
 extension Array {
@@ -861,7 +883,9 @@ func resolveKey(_ key: String) -> Result<(code: CGKeyCode, shift: Bool), String>
     }
 }
 
-func pressKey(_ key: String, modifiers: [String], pid: pid_t) -> String? {
+/// Key-press counterpart of `synthesizeTypedText`. Returns a message when the
+/// key or a modifier cannot be resolved, and nothing when it was sent.
+func synthesizeKeyPress(_ key: String, modifiers: [String], deliver: (CGEvent?) -> Void) -> String? {
     var flags: CGEventFlags = []
     for m in modifiers.map({ $0.lowercased() }) {
         switch m {
@@ -884,9 +908,13 @@ func pressKey(_ key: String, modifiers: [String], pid: pid_t) -> String? {
     let up = CGEvent(keyboardEventSource: src, virtualKey: resolved.code, keyDown: false)
     down?.flags = flags
     up?.flags = flags
-    down?.postToPid(pid)
-    up?.postToPid(pid)
+    deliver(down)
+    deliver(up)
     return nil
+}
+
+func pressKey(_ key: String, modifiers: [String], pid: pid_t) -> String? {
+    synthesizeKeyPress(key, modifiers: modifiers) { $0?.postToPid(pid) }
 }
 
 // MARK: - Tool implementations
@@ -1055,6 +1083,10 @@ func toolClick(_ args: [String: Any]) -> String {
             return "error: coordinates must be finite and representable as integers"
         }
         let point = CGPoint(x: x, y: y)
+        if RemoteControl.isEnabled {
+            RemoteControl.click(at: point, clickCount: clickCount)
+            return "clicked at (\(Int(x)), \(Int(y)))"
+        }
         AgentCursor.shared.press(at: point)
         // Prefer the window under the point. Only constrain to an app PID when the
         // caller passed `app` explicitly — Registry.targetPid from get_app_state
@@ -1092,6 +1124,12 @@ func toolClick(_ args: [String: Any]) -> String {
 
 func toolTypeText(_ args: [String: Any]) -> String {
     guard let text = args["text"] as? String else { return "error: missing required argument 'text'" }
+    // Remote control types into whatever the machine has focused, which is
+    // what the person watching its screen expects: they just clicked there.
+    if RemoteControl.isEnabled {
+        RemoteControl.typeText(text)
+        return "typed \(text.count) characters"
+    }
     var element: AXUIElement?
     if let id = args["element_id"] as? String {
         guard let el = Registry.get(id) else { return "error: unknown element_id \(id)" }
@@ -1124,6 +1162,10 @@ func toolTypeText(_ args: [String: Any]) -> String {
 func toolPressKey(_ args: [String: Any]) -> String {
     guard let key = args["key"] as? String else { return "error: missing required argument 'key'" }
     let mods = (args["modifiers"] as? [String]) ?? []
+    if RemoteControl.isEnabled {
+        if let err = RemoteControl.pressKey(key, modifiers: mods) { return "error: \(err)" }
+        return "pressed \(mods.isEmpty ? key : mods.joined(separator: "+") + "+" + key)"
+    }
     let pid: pid_t
     switch resolveTargetPid(args) {
     case .failure(let message):
@@ -1185,6 +1227,18 @@ func toolScroll(_ args: [String: Any]) -> String {
     default: return "error: direction must be up, down, left, or right"
     }
 
+    if RemoteControl.isEnabled {
+        // The wheel goes wherever the pointer is; `x`/`y` move it there first
+        // so a viewer scrolling over a pane scrolls that pane.
+        let point: CGPoint? =
+            if let x = args["x"] as? Double, let y = args["y"] as? Double {
+                CGPoint(x: x, y: y)
+            } else {
+                nil
+            }
+        RemoteControl.scroll(at: point, dx: dx, dy: dy, steps: amount)
+        return "scrolled \(direction) by \(amount)"
+    }
     if let elementID = args["element_id"] as? String, Registry.get(elementID) == nil {
         return "error: unknown element_id \(elementID) — call get_app_state again to refresh ids"
     }
@@ -1554,6 +1608,10 @@ func toolRightClick(_ args: [String: Any]) -> String {
     case .success(let resolved):
         point = resolved
     }
+    if RemoteControl.isEnabled {
+        RemoteControl.click(at: point, button: .right)
+        return "right-clicked at (\(Int(point.x)), \(Int(point.y)))"
+    }
     let element = (args["element_id"] as? String).flatMap { Registry.get($0) }
     let target: WindowTarget?
     if let element {
@@ -1610,6 +1668,10 @@ func toolHover(_ args: [String: Any]) -> String {
     case .success(let resolved):
         point = resolved
     }
+    if RemoteControl.isEnabled {
+        RemoteControl.move(to: point)
+        return "moved the pointer to (\(Int(point.x)), \(Int(point.y)))"
+    }
     let element = (args["element_id"] as? String).flatMap { Registry.get($0) }
     let target: WindowTarget?
     if let element {
@@ -1662,6 +1724,10 @@ func toolDrag(_ args: [String: Any]) -> String {
         return message
     case .success(let resolved):
         end = resolved
+    }
+    if RemoteControl.isEnabled {
+        RemoteControl.drag(from: start, to: end)
+        return "dragged (\(Int(start.x)), \(Int(start.y))) → (\(Int(end.x)), \(Int(end.y)))"
     }
     let element = (args["from_element_id"] as? String).flatMap { Registry.get($0) }
     let underStart = windowTarget(under: start)
@@ -2732,6 +2798,14 @@ let toolDefs: [[String: Any]] = [
                     "type": "string",
                     "description": "Element to scroll, from get_app_state; the nearest scrollable area around it moves. Omit to scroll the last inspected app (macOS) or whatever is under the pointer (Windows, Linux).",
                 ],
+                "x": [
+                    "type": "number",
+                    "description": "Screen x to scroll over. Remote control only: the pointer moves there first. Ignored otherwise.",
+                ],
+                "y": [
+                    "type": "number",
+                    "description": "Screen y to scroll over. Remote control only: the pointer moves there first. Ignored otherwise.",
+                ],
             ],
         ],
         "annotations": [
@@ -3347,7 +3421,7 @@ func advertisedToolDefs() -> [[String: Any]] {
 
 // MARK: - Server identity
 
-let serverVersion = "0.4.0"
+let serverVersion = "0.4.1"
 /// Protocol revisions this server speaks. A client asking for one gets it
 /// echoed back; anything else gets the oldest, which every client understands.
 let supportedProtocolVersions: Set<String> = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]

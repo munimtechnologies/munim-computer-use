@@ -206,6 +206,14 @@ fn all_tool_defs() -> Value {
                     "element_id": {
                         "type": "string",
                         "description": "Element to scroll, from get_app_state; the nearest scrollable area around it moves. Omit to scroll the last inspected app (macOS) or whatever is under the pointer (Windows, Linux)."
+                    },
+                    "x": {
+                        "type": "number",
+                        "description": "Screen x to scroll over. Remote control only: the pointer moves there first. Ignored otherwise."
+                    },
+                    "y": {
+                        "type": "number",
+                        "description": "Screen y to scroll over. Remote control only: the pointer moves there first. Ignored otherwise."
                     }
                 }
             },
