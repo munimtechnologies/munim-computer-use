@@ -26,6 +26,8 @@ const removed = [];
 const executed = [];
 const storage = {};
 let nativeListener = null;
+let disconnectListener = null;
+let connects = 0;
 let sent = [];
 
 function makeTab({ url = "about:blank", title = "t", active = false, favIconUrl = "" }) {
@@ -36,9 +38,9 @@ function makeTab({ url = "about:blank", title = "t", active = false, favIconUrl 
 
 const chrome = {
   runtime: {
-    connectNative: () => ({
+    connectNative: () => (connects++, {
       onMessage: { addListener: (fn) => { nativeListener = fn; } },
-      onDisconnect: { addListener() {} },
+      onDisconnect: { addListener: (fn) => { disconnectListener = fn; } },
       postMessage: (message) => sent.push(message),
     }),
     onStartup: { addListener() {} },
@@ -128,6 +130,26 @@ async function call(command, params = {}) {
   if (!reply) throw new Error(`no reply to ${command}`);
   if (!reply.ok) throw new Error(reply.error);
   return reply.result;
+}
+
+/** Fire several commands in one tick, the way concurrent MCP calls arrive. */
+async function callAll(requests) {
+  const ids = requests.map(([command, params]) => {
+    const id = ++nextRequestId;
+    nativeListener({ id, command, params: { clientId: "agentA", ...params } });
+    return id;
+  });
+  const replies = [];
+  for (const id of ids) {
+    let reply;
+    for (let tick = 0; tick < 500 && !reply; tick++) {
+      await new Promise((resume) => setImmediate(resume));
+      reply = sent.find((message) => message.id === id);
+    }
+    if (!reply) throw new Error(`no reply to request ${id}`);
+    replies.push(reply);
+  }
+  return replies;
 }
 
 async function refuses(command, params) {
@@ -248,6 +270,99 @@ test("cleanup closes the agent's tabs and releases the user's", async () => {
 test("release_tab points agent-created tabs at close_tab", async () => {
   const own = await call("open_tab", { url: "https://example.org" });
   assert.match(await refuses("release_tab", { tabId: own.tabId }), /close it with close_tab/);
+});
+
+// ── concurrent tasks ────────────────────────────────────────────────────────
+
+test("two sessions in one MCP process get separate groups and tabs", async () => {
+  const one = await call("open_tab", { url: "https://one.example", sessionId: "thread-1" });
+  const two = await call("open_tab", { url: "https://two.example", sessionId: "thread-2" });
+  const groupOne = tabs.get(one.tabId).groupId;
+  const groupTwo = tabs.get(two.tabId).groupId;
+  assert.notEqual(groupOne, -1);
+  assert.notEqual(groupOne, groupTwo);
+  assert.equal(groups.get(groupOne).title, "MT Code · thread-1");
+  const listed = await call("list_tabs", { sessionId: "thread-1" });
+  assert.equal(listed.tabs.length, 1);
+  assert.equal(listed.tabs[0].tabId, one.tabId);
+  // Neither the other session nor the process's default session can drive it.
+  assert.match(await refuses("snapshot", { tabId: one.tabId, sessionId: "thread-2" }), /not one of this agent's tabs/);
+  assert.match(await refuses("snapshot", { tabId: one.tabId }), /not one of this agent's tabs/);
+  assert.match(await refuses("use_tab", { tabId: one.tabId, sessionId: "thread-2" }), /another agent/);
+  for (const sessionId of ["thread-1", "thread-2"]) await call("close_all_tabs", { sessionId });
+});
+
+test("close_all_tabs in one session leaves the other session's tabs", async () => {
+  const keep = await call("open_tab", { url: "https://keep.example", sessionId: "keep" });
+  const drop = await call("open_tab", { url: "https://drop.example", sessionId: "drop" });
+  const result = await call("close_all_tabs", { sessionId: "drop" });
+  assert.equal(result.closed, 1);
+  assert.ok(!tabs.has(drop.tabId));
+  assert.ok(tabs.has(keep.tabId));
+  await call("close_all_tabs", { sessionId: "keep" });
+  assert.ok(!tabs.has(keep.tabId));
+});
+
+test("process cleanup closes all of its sessions and none of a peer's", async () => {
+  const a1 = await call("open_tab", { url: "https://a1.example", clientId: "procA", sessionId: "s1" });
+  const a2 = await call("open_tab", { url: "https://a2.example", clientId: "procA" });
+  const b1 = await call("open_tab", { url: "https://b1.example", clientId: "procB", sessionId: "s1" });
+  const result = await call("close_client_tabs", { clientId: "procA" });
+  assert.equal(result.closed, 2);
+  assert.ok(!tabs.has(a1.tabId));
+  assert.ok(!tabs.has(a2.tabId));
+  assert.ok(tabs.has(b1.tabId), "same session id in another process is a different task");
+  await call("close_client_tabs", { clientId: "procB" });
+  assert.ok(!tabs.has(b1.tabId));
+});
+
+test("process cleanup also catches an open still waiting in its queue", async () => {
+  const before = new Set(tabs.keys());
+  const [opened, cleaned] = await callAll([
+    ["open_tab", { url: "https://late.example", clientId: "procC", sessionId: "late" }],
+    ["close_client_tabs", { clientId: "procC" }],
+  ]);
+  assert.ok(opened.ok);
+  assert.ok(cleaned.ok);
+  assert.ok(!tabs.has(opened.result.tabId));
+  assert.deepEqual([...tabs.keys()].filter((id) => !before.has(id)), []);
+});
+
+test("two agents racing for one user tab: exactly one wins", async () => {
+  const contested = makeTab({ url: "https://race.example" });
+  const replies = await callAll([
+    ["use_tab", { tabId: contested.id, clientId: "racer1" }],
+    ["use_tab", { tabId: contested.id, clientId: "racer2" }],
+  ]);
+  assert.equal(replies.filter((reply) => reply.ok).length, 1);
+  assert.match(replies.find((reply) => !reply.ok).error, /another agent/);
+  for (const clientId of ["racer1", "racer2"]) await call("close_all_tabs", { clientId });
+});
+
+test("concurrent opens in one session share a single group", async () => {
+  const replies = await callAll([1, 2, 3].map((n) =>
+    ["open_tab", { url: `https://burst${n}.example`, sessionId: "burst" }]));
+  const groupIds = new Set(replies.map((reply) => tabs.get(reply.result.tabId).groupId));
+  assert.equal(groupIds.size, 1);
+  await call("close_all_tabs", { sessionId: "burst" });
+});
+
+test("a bad session_id is refused", async () => {
+  assert.match(await refuses("list_tabs", { sessionId: "  " }), /session_id must be/);
+  assert.match(await refuses("list_tabs", { sessionId: "x".repeat(129) }), /session_id must be/);
+  assert.match(await refuses("list_tabs", { sessionId: 7 }), /session_id must be/);
+});
+
+test("losing the native host keeps every task's tabs and reconnects", async () => {
+  const survivor = await call("open_tab", { url: "https://survive.example", clientId: "procD", sessionId: "s" });
+  const before = connects;
+  disconnectListener();
+  await new Promise((resume) => setTimeout(resume, 1100));
+  assert.ok(tabs.has(survivor.tabId));
+  assert.equal(connects, before + 1);
+  // Ownership survived the reconnect, so the task can keep driving its tab.
+  await call("snapshot", { tabId: survivor.tabId, clientId: "procD", sessionId: "s" });
+  await call("close_client_tabs", { clientId: "procD" });
 });
 
 // ── runner ──────────────────────────────────────────────────────────────────

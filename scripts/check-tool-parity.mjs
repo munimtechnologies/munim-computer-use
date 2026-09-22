@@ -66,7 +66,7 @@ function tokenize(source) {
       }
       i++;
       tokens.push({ type: "string", value });
-    } else if (/[0-9-]/.test(ch) && /[0-9]/.test(source[i + 1] ?? ch)) {
+    } else if (/[0-9]/.test(ch) || (ch === "-" && /[0-9]/.test(source[i + 1] ?? ""))) {
       const match = /^-?[0-9]+(\.[0-9]+)?/.exec(source.slice(i));
       tokens.push({ type: "number", value: Number(match[0]) });
       i += match[0].length;
