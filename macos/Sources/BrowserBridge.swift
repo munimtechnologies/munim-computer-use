@@ -303,6 +303,23 @@ final class BrowserBridge {
         return addr
     }
 
+    /// True when this process neither owns the bridge nor has a live RPC link to
+    /// an owner — i.e. an earlier owner exited and nobody has taken over yet.
+    private var isOrphaned: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return listenFD < 0 && rpcClientFD < 0
+    }
+
+    /// Re-run the owner election when the previous owner has gone away. Without
+    /// this a secondary process stayed an orphan forever: its RPC link dropped
+    /// when the owner exited, nobody bound `bridge.sock` again, and Chrome's
+    /// native host could not connect — every browser tool reported the
+    /// extension as disconnected until the whole server was restarted.
+    func reconnectIfOrphaned() {
+        guard isOrphaned else { return }
+        start()
+    }
+
     /// Bind the Chrome bridge when this process is first, otherwise attach to
     /// the owner as an RPC client so Cursor and MT Code can share one extension.
     func start() {
@@ -433,6 +450,12 @@ final class BrowserBridge {
             resume(.failure("disconnected from the desktop browser bridge"))
         }
         close(fd)
+        // The owner went away. Give any other survivor a moment to bind, then
+        // take over ourselves if nobody did (the lock + probe in start() make
+        // the election safe to repeat).
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.reconnectIfOrphaned()
+        }
     }
 
     private func handleRpcResponse(_ line: Data) {
@@ -561,6 +584,7 @@ final class BrowserBridge {
         if params["clientId"] == nil {
             params["clientId"] = mcpBrowserClientId
         }
+        reconnectIfOrphaned()
         lock.lock()
         let rpcFd = rpcClientFD
         lock.unlock()
