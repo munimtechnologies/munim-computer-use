@@ -17,15 +17,16 @@
 //! ```
 //!
 //! This mirrors the macOS Swift bridge exactly, including the wire messages, so
-//! one extension build serves all three platforms. The server binds the socket,
-//! so the first live server claims the browser and later ones fall back to the
-//! accessibility tools.
+//! one extension build serves all three platforms. The first live server binds
+//! the socket and owns the extension; later servers share it through the
+//! owner's `.rpc` endpoint, each with its own client id and tabs.
 
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -132,13 +133,125 @@ fn bridge_pipe_name() -> String {
     crate::identity::get().bridge_pipe_name()
 }
 
-pub struct BrowserBridge {
-    /// Writer half of the accepted connection, once the extension shows up.
-    outgoing: Arc<Mutex<Option<SendHalf>>>,
-    replies: Receiver<Value>,
+type Waiter = SyncSender<Result<Value, String>>;
+
+/// State shared by the MCP thread and the bridge threads. A process is either
+/// the owner (it holds the native host connection and serves peers over RPC)
+/// or a peer (it forwards every call to the owner); it can switch from peer to
+/// owner when the previous owner exits.
+struct Hub {
+    /// Owner: writer to the native host, once the extension connects.
+    extension: Mutex<Option<SendHalf>>,
+    /// Owner: calls waiting for an extension reply, keyed by wire id. Peer
+    /// calls go through here too, re-numbered, so ids never collide.
+    pending: Mutex<HashMap<u64, Waiter>>,
+    /// Peer: writer to the owner's RPC endpoint.
+    rpc: Mutex<Option<SendHalf>>,
+    rpc_pending: Mutex<HashMap<u64, Waiter>>,
     next_id: AtomicU64,
-    /// Bumped on every accept so disconnect sentinels from a prior host are ignored.
-    connection_gen: Arc<AtomicU64>,
+}
+
+impl Hub {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            extension: Mutex::new(None),
+            pending: Mutex::new(HashMap::new()),
+            rpc: Mutex::new(None),
+            rpc_pending: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+        })
+    }
+
+    fn connected(&self) -> bool {
+        self.rpc.lock().is_ok_and(|guard| guard.is_some())
+            || self.extension.lock().is_ok_and(|guard| guard.is_some())
+    }
+
+    fn call(&self, command: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+        if self.rpc.lock().is_ok_and(|guard| guard.is_some()) {
+            // The owner applies its own timeout first; wait a little longer so
+            // its error, which says what actually went wrong, reaches us.
+            return self.send(&self.rpc, &self.rpc_pending, command, params, timeout + Duration::from_secs(5),
+                "disconnected from the desktop browser bridge");
+        }
+        self.direct_call(command, params, timeout)
+    }
+
+    fn direct_call(&self, command: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+        self.send(&self.extension, &self.pending, command, params, timeout, "the extension disconnected")
+    }
+
+    /// Write one request to `writer` and wait for the reply routed to its id.
+    /// Readers clear the writer before failing `pending`, so a request either
+    /// sees no writer or is failed by the drain; it is never stranded.
+    fn send(
+        &self,
+        writer: &Mutex<Option<SendHalf>>,
+        pending: &Mutex<HashMap<u64, Waiter>>,
+        command: &str,
+        params: Value,
+        timeout: Duration,
+        gone: &str,
+    ) -> Result<Value, String> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (waiter, reply) = sync_channel(1);
+        lock(pending).insert(id, waiter);
+        let request = json!({ "id": id, "command": command, "params": params });
+        let written = {
+            let mut guard = lock(writer);
+            match guard.as_mut() {
+                None => Err(gone.to_string()),
+                Some(stream) => writeln!(stream, "{request}")
+                    .and_then(|()| stream.flush())
+                    .map_err(|error| format!("could not reach the extension: {error}")),
+            }
+        };
+        if let Err(error) = written {
+            lock(pending).remove(&id);
+            return Err(error);
+        }
+        match reply.recv_timeout(timeout) {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                lock(pending).remove(&id);
+                Err(format!("browser_{command} timed out waiting for the extension"))
+            }
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Hand a reply line to the call waiting on its id.
+fn route(pending: &Mutex<HashMap<u64, Waiter>>, line: &str) {
+    let Ok(reply) = serde_json::from_str::<Value>(line) else { return };
+    let Some(id) = reply.get("id").and_then(Value::as_u64) else { return };
+    let Some(waiter) = lock(pending).remove(&id) else { return };
+    let outcome = if reply.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(reply.get("result").cloned().unwrap_or(json!({})))
+    } else {
+        Err(reply
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("the extension reported an error")
+            .to_string())
+    };
+    let _ = waiter.send(outcome);
+}
+
+/// Clear a dropped connection's writer, then fail everything still waiting on it.
+fn drop_connection(writer: &Mutex<Option<SendHalf>>, pending: &Mutex<HashMap<u64, Waiter>>, message: &str) {
+    *lock(writer) = None;
+    let stranded: Vec<Waiter> = lock(pending).drain().map(|(_, waiter)| waiter).collect();
+    for waiter in stranded {
+        let _ = waiter.send(Err(message.to_string()));
+    }
+}
+
+pub struct BrowserBridge {
+    hub: Arc<Hub>,
     /// Stable id for this MCP process — the Chrome extension keys tab ownership
     /// by client so one process's exit cleanup cannot close another's tabs.
     client_id: String,
@@ -146,32 +259,16 @@ pub struct BrowserBridge {
 
 impl BrowserBridge {
     pub fn new() -> Self {
-        let outgoing: Arc<Mutex<Option<SendHalf>>> = Arc::new(Mutex::new(None));
-        let connection_gen = Arc::new(AtomicU64::new(0));
-        let (sender, replies) = channel();
-        spawn_listener(Arc::clone(&outgoing), Arc::clone(&connection_gen), sender);
-        Self {
-            outgoing,
-            replies,
-            next_id: AtomicU64::new(1),
-            connection_gen,
-            client_id: new_browser_client_id(),
-        }
+        let hub = Hub::new();
+        let background = Arc::clone(&hub);
+        std::thread::spawn(move || run_bridge(&background));
+        Self { hub, client_id: new_browser_client_id() }
     }
 
     /// No listener — used when browser control is disabled so this process does
     /// not claim the single per-user bridge socket/pipe.
     pub fn inert() -> Self {
-        let outgoing: Arc<Mutex<Option<SendHalf>>> = Arc::new(Mutex::new(None));
-        let connection_gen = Arc::new(AtomicU64::new(0));
-        let (_sender, replies) = channel();
-        Self {
-            outgoing,
-            replies,
-            next_id: AtomicU64::new(1),
-            connection_gen,
-            client_id: new_browser_client_id(),
-        }
+        Self { hub: Hub::new(), client_id: new_browser_client_id() }
     }
 
     pub fn is_connected(&self) -> bool {
@@ -179,7 +276,7 @@ impl BrowserBridge {
     }
 
     fn connected(&self) -> bool {
-        self.outgoing.lock().is_ok_and(|guard| guard.is_some())
+        self.hub.connected()
     }
 
     /// Dispatch a `browser_*` call. `command` has the `browser_` prefix stripped.
@@ -246,64 +343,12 @@ impl BrowserBridge {
     }
 
     fn dispatch(&mut self, command: &str, params: Value) -> Result<Value, String> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut params = params;
         if let Some(map) = params.as_object_mut() {
             map.entry("clientId".to_string())
                 .or_insert_with(|| json!(self.client_id.clone()));
         }
-        let request = json!({ "id": id, "command": command, "params": params });
-
-        // Sample connection generation under the outgoing lock so a reconnect
-        // between load and write cannot pair a new SendHalf with an old gen.
-        let gen_at_send = {
-            let mut guard = self
-                .outgoing
-                .lock()
-                .map_err(|_| "the browser bridge is poisoned".to_string())?;
-            let stream = guard
-                .as_mut()
-                .ok_or_else(|| "the extension disconnected".to_string())?;
-            let generation = self.connection_gen.load(Ordering::SeqCst);
-            writeln!(stream, "{request}").map_err(|error| format!("could not reach the extension: {error}"))?;
-            stream
-                .flush()
-                .map_err(|error| format!("could not reach the extension: {error}"))?;
-            generation
-        };
-
-        // Replies carry the originating id, so a slow answer to an earlier call
-        // cannot be mistaken for this one's. Disconnect sentinels are scoped to
-        // connection_gen so a prior host drop cannot fail a call on the new socket.
-        let deadline = std::time::Instant::now() + CALL_TIMEOUT;
-        loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(format!("browser_{command} timed out waiting for the extension"));
-            }
-            let reply = self
-                .replies
-                .recv_timeout(remaining)
-                .map_err(|_| format!("browser_{command} timed out waiting for the extension"))?;
-            if reply.get("disconnected").and_then(Value::as_bool) == Some(true) {
-                let reply_gen = reply.get("connectionGen").and_then(Value::as_u64);
-                if reply_gen == Some(gen_at_send) {
-                    return Err("the extension disconnected".to_string());
-                }
-                continue;
-            }
-            if reply.get("id").and_then(Value::as_u64) != Some(id) {
-                continue;
-            }
-            if reply.get("ok").and_then(Value::as_bool) == Some(true) {
-                return Ok(reply.get("result").cloned().unwrap_or(json!({})));
-            }
-            return Err(reply
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("the extension reported an error")
-                .to_string());
-        }
+        self.hub.call(command, params, CALL_TIMEOUT)
     }
 }
 
@@ -350,6 +395,10 @@ fn unlink_stale_bridge_socket(path: &std::path::Path) {
 #[cfg(unix)]
 struct BridgeSocketCleanup(std::path::PathBuf);
 
+/// Named pipes vanish with their process; nothing to clean up.
+#[cfg(windows)]
+struct BridgeSocketCleanup;
+
 #[cfg(unix)]
 impl Drop for BridgeSocketCleanup {
     fn drop(&mut self) {
@@ -357,113 +406,201 @@ impl Drop for BridgeSocketCleanup {
     }
 }
 
-/// Accept the native host and pump its replies onto `sender`.
-fn spawn_listener(
-    outgoing: Arc<Mutex<Option<SendHalf>>>,
-    connection_gen: Arc<AtomicU64>,
-    sender: Sender<Value>,
-) {
-    std::thread::spawn(move || {
-        #[cfg(unix)]
-        let path = match bridge_socket_path() {
-            Some(path) => path,
-            None => return,
-        };
-        #[cfg(windows)]
-        let pipe = bridge_pipe_name();
+#[cfg(unix)]
+fn endpoint_name(path: &std::path::Path) -> std::io::Result<interprocess::local_socket::Name<'_>> {
+    path.as_os_str().to_fs_name::<GenericFilePath>()
+}
+
+/// Bind the bridge the native host connects to. Failing means another live
+/// server owns it (a stale Unix socket file is cleared and retried once).
+fn bind_bridge() -> Option<(interprocess::local_socket::Listener, Option<BridgeSocketCleanup>)> {
+    #[cfg(unix)]
+    {
+        let path = bridge_socket_path()?;
         // Create-first: never unlink based on a probe that can race another
         // server binding between `bridge_socket_is_live` and `remove_file`.
-        // When another server owns the bridge, keep retrying in the background
-        // so this process takes over once that owner exits; without the retry
-        // a secondary server stayed without a browser for its whole life.
-        let listener = loop {
-            #[cfg(unix)]
-            let Ok(name) = path.as_os_str().to_fs_name::<GenericFilePath>() else {
-                return;
-            };
-            #[cfg(windows)]
-            let Ok(name) = pipe.clone().to_ns_name::<GenericNamespaced>() else {
-                return;
-            };
-            if let Ok(listener) = ListenerOptions::new().name(name).create_sync() {
-                break listener;
-            }
-            #[cfg(unix)]
-            {
-                unlink_stale_bridge_socket(&path);
-                if let Ok(name) = path.as_os_str().to_fs_name::<GenericFilePath>() {
-                    if let Ok(listener) = ListenerOptions::new().name(name).create_sync() {
-                        break listener;
-                    }
-                }
-            }
-            // Another server owns the browser right now; accessibility tools
-            // still work, so this is not worth reporting. Try again shortly.
-            std::thread::sleep(std::time::Duration::from_secs(2));
-        };
-        #[cfg(unix)]
-        let _cleanup = BridgeSocketCleanup(path.clone());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(error) =
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            {
-                eprintln!("munim-computer-use: bridge socket chmod failed: {error}");
-                return;
-            }
+        let listener = ListenerOptions::new().name(endpoint_name(&path).ok()?).create_sync().ok().or_else(|| {
+            unlink_stale_bridge_socket(&path);
+            ListenerOptions::new().name(endpoint_name(&path).ok()?).create_sync().ok()
+        })?;
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+            eprintln!("munim-computer-use: bridge socket chmod failed: {error}");
+            return None;
         }
+        Some((listener, Some(BridgeSocketCleanup(path))))
+    }
+    #[cfg(windows)]
+    {
+        let name = bridge_pipe_name().to_ns_name::<GenericNamespaced>().ok()?;
+        ListenerOptions::new().name(name).create_sync().ok().map(|listener| (listener, None))
+    }
+}
 
-        let mut accept_failures: u32 = 0;
-        loop {
-            let stream = match listener.accept() {
-                Ok(stream) => {
-                    accept_failures = 0;
-                    stream
+/// The owner's endpoint for peer MCP processes: the bridge name plus `.rpc`.
+#[cfg(unix)]
+fn rpc_socket_path() -> Option<PathBuf> {
+    let path = bridge_socket_path()?;
+    let mut name = path.file_name()?.to_os_string();
+    name.push(".rpc");
+    Some(path.with_file_name(name))
+}
+
+fn bind_rpc() -> Option<(interprocess::local_socket::Listener, Option<BridgeSocketCleanup>)> {
+    #[cfg(unix)]
+    {
+        let path = rpc_socket_path()?;
+        // Only the bridge owner reaches this, so any file here is a dead owner's.
+        let _ = std::fs::remove_file(&path);
+        let listener = ListenerOptions::new().name(endpoint_name(&path).ok()?).create_sync().ok()?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).ok()?;
+        Some((listener, Some(BridgeSocketCleanup(path))))
+    }
+    #[cfg(windows)]
+    {
+        let name = format!("{}.rpc", bridge_pipe_name()).to_ns_name::<GenericNamespaced>().ok()?;
+        ListenerOptions::new().name(name).create_sync().ok().map(|listener| (listener, None))
+    }
+}
+
+fn connect_rpc() -> Option<Stream> {
+    #[cfg(unix)]
+    {
+        let path = rpc_socket_path()?;
+        Stream::connect(endpoint_name(&path).ok()?).ok()
+    }
+    #[cfg(windows)]
+    {
+        let name = format!("{}.rpc", bridge_pipe_name()).to_ns_name::<GenericNamespaced>().ok()?;
+        Stream::connect(name).ok()
+    }
+}
+
+/// Owner election, repeated for the life of the process. The first server to
+/// bind the bridge owns the extension and serves later servers over RPC, so
+/// every MCP process gets the browser, each with its own tabs. When the owner
+/// exits its peers lose the RPC link and run the election again.
+fn run_bridge(hub: &Arc<Hub>) {
+    loop {
+        if let Some((listener, _cleanup)) = bind_bridge() {
+            match bind_rpc() {
+                Some((rpc_listener, rpc_cleanup)) => {
+                    let peers = Arc::clone(hub);
+                    std::thread::spawn(move || {
+                        let _rpc_cleanup = rpc_cleanup;
+                        serve_peers(&peers, &rpc_listener);
+                    });
                 }
-                Err(_) => {
-                    accept_failures = accept_failures.saturating_add(1);
-                    if accept_failures >= 8 {
-                        // Persistent accept errors (listener torn down) — exit
-                        // instead of spinning a CPU core.
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(50 * u64::from(accept_failures)));
-                    continue;
-                }
-            };
-            let (recv, send) = stream.split();
-            // New generation: prior disconnect sentinels become stale and are
-            // ignored by dispatch (they carry the old connectionGen).
-            let generation = connection_gen.fetch_add(1, Ordering::SeqCst) + 1;
-            if let Ok(mut guard) = outgoing.lock() {
-                *guard = Some(send);
+                None => eprintln!("munim-computer-use: could not open the bridge for other MCP servers"),
             }
-
-            let reader = BufReader::new(recv);
-            for line in reader.lines() {
+            serve_extension(hub, &listener);
+            return;
+        }
+        if let Some(stream) = connect_rpc() {
+            let (recv, send) = stream.split();
+            *lock(&hub.rpc) = Some(send);
+            for line in BufReader::new(recv).lines() {
                 let Ok(line) = line else { break };
-                if let Ok(value) = serde_json::from_str::<Value>(&line)
-                    && sender.send(value).is_err()
-                {
+                route(&hub.rpc_pending, &line);
+            }
+            drop_connection(&hub.rpc, &hub.rpc_pending, "disconnected from the desktop browser bridge");
+            // The owner went away. Give another survivor a moment to bind,
+            // then take over ourselves if nobody did.
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+        // An owner is starting up, or one without the peer endpoint (an older
+        // build) holds the bridge; accessibility tools still work meanwhile.
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+fn accept_loop(listener: &interprocess::local_socket::Listener, mut on_stream: impl FnMut(Stream)) {
+    let mut accept_failures: u32 = 0;
+    loop {
+        match listener.accept() {
+            Ok(stream) => {
+                accept_failures = 0;
+                on_stream(stream);
+            }
+            Err(_) => {
+                accept_failures = accept_failures.saturating_add(1);
+                if accept_failures >= 8 {
+                    // Persistent accept errors (listener torn down) — exit
+                    // instead of spinning a CPU core.
                     return;
                 }
+                std::thread::sleep(Duration::from_millis(50 * u64::from(accept_failures)));
             }
-
-            // The host went away; drop the writer so `call` reports honestly,
-            // and wake any in-flight `dispatch` wait instead of letting it sit
-            // until CALL_TIMEOUT. Tag with this connection's generation.
-            if let Ok(mut guard) = outgoing.lock() {
-                *guard = None;
-            }
-            let _ = sender.send(json!({
-                "disconnected": true,
-                "connectionGen": generation,
-                "ok": false,
-                "error": "the extension disconnected",
-            }));
         }
+    }
+}
+
+/// Accept the native host and route its replies to the waiting calls.
+fn serve_extension(hub: &Arc<Hub>, listener: &interprocess::local_socket::Listener) {
+    accept_loop(listener, |stream| {
+        let (recv, send) = stream.split();
+        *lock(&hub.extension) = Some(send);
+        for line in BufReader::new(recv).lines() {
+            let Ok(line) = line else { break };
+            route(&hub.pending, &line);
+        }
+        // The host went away; clear the writer so `call` reports honestly, and
+        // wake any in-flight call instead of letting it sit until CALL_TIMEOUT.
+        drop_connection(&hub.extension, &hub.pending, "the extension disconnected");
     });
+}
+
+/// Serve each peer MCP process on its own thread: a peer stays connected for
+/// its whole life, so serving it inline would strand every later peer.
+fn serve_peers(hub: &Arc<Hub>, listener: &interprocess::local_socket::Listener) {
+    accept_loop(listener, |stream| {
+        let hub = Arc::clone(hub);
+        std::thread::spawn(move || serve_peer(&hub, stream));
+    });
+}
+
+fn serve_peer(hub: &Hub, stream: Stream) {
+    let (recv, mut send) = stream.split();
+    // Client ids seen on this peer, closed when it disconnects so only that
+    // MCP process's tabs go.
+    let mut client_ids: HashSet<String> = HashSet::new();
+    for line in BufReader::new(recv).lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let response = match serde_json::from_str::<Value>(&line) {
+            Ok(request) if request.get("command").and_then(Value::as_str).is_some() => {
+                let id = request.get("id").cloned().unwrap_or(json!(-1));
+                let command = request.get("command").and_then(Value::as_str).unwrap_or_default();
+                let mut params = request.get("params").cloned().filter(Value::is_object).unwrap_or(json!({}));
+                let client_id = match params.get("clientId").and_then(Value::as_str) {
+                    Some(client_id) if !client_id.is_empty() => client_id.to_string(),
+                    // A peer that sends no clientId still gets one stable id.
+                    _ => client_ids
+                        .iter()
+                        .find(|known| known.starts_with("rpc-"))
+                        .cloned()
+                        .unwrap_or_else(|| format!("rpc-{}", new_browser_client_id())),
+                };
+                params["clientId"] = json!(client_id);
+                client_ids.insert(client_id);
+                match hub.direct_call(command, params, CALL_TIMEOUT) {
+                    Ok(result) => json!({ "id": id, "ok": true, "result": result }),
+                    Err(error) => json!({ "id": id, "ok": false, "error": error }),
+                }
+            }
+            _ => json!({ "id": -1, "ok": false, "error": "invalid RPC request" }),
+        };
+        if writeln!(send, "{response}").and_then(|()| send.flush()).is_err() {
+            break;
+        }
+    }
+    for client_id in client_ids {
+        let _ = hub.direct_call("close_client_tabs", json!({ "clientId": client_id }), Duration::from_secs(2));
+    }
 }
 
 /// Translate tool arguments into the extension's parameter names.
@@ -748,7 +885,7 @@ mod tests {
 
     #[test]
     fn an_unconnected_bridge_points_at_the_working_alternative() {
-        let mut bridge = BrowserBridge::new();
+        let mut bridge = BrowserBridge::inert();
         let error = bridge.call("open_tab", &json!({})).unwrap_err();
 
         assert!(error.contains("browser_open_tab"), "names the tool: {error}");
