@@ -1,6 +1,6 @@
 {
   "name": "munim-computer-use",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Computer Use MCP server for any coding agent — accessibility-first desktop control on macOS, Windows and Linux, background input, agent pointer, zoom, your signed-in Chrome. Downloads the signed native binary from GitHub Releases on first run.",
   "keywords": [
     "accessibility",

@@ -364,41 +364,37 @@ fn spawn_listener(
             Some(path) => path,
             None => return,
         };
-        #[cfg(unix)]
-        let name = match path.as_os_str().to_fs_name::<GenericFilePath>() {
-            Ok(name) => name,
-            Err(_) => return,
-        };
         #[cfg(windows)]
         let pipe = bridge_pipe_name();
-        #[cfg(windows)]
-        let name = match pipe.to_ns_name::<GenericNamespaced>() {
-            Ok(name) => name,
-            Err(_) => return,
-        };
         // Create-first: never unlink based on a probe that can race another
         // server binding between `bridge_socket_is_live` and `remove_file`.
-        let listener = match ListenerOptions::new().name(name).create_sync() {
-            Ok(listener) => listener,
-            Err(_) => {
-                #[cfg(unix)]
-                {
-                    unlink_stale_bridge_socket(&path);
-                    let Ok(name) = path.as_os_str().to_fs_name::<GenericFilePath>() else {
-                        return;
-                    };
-                    let Ok(listener) = ListenerOptions::new().name(name).create_sync() else {
-                        return;
-                    };
-                    listener
-                }
-                #[cfg(not(unix))]
-                {
-                    // Another server already owns the browser; accessibility
-                    // tools still work, so this is not worth reporting.
-                    return;
+        // When another server owns the bridge, keep retrying in the background
+        // so this process takes over once that owner exits; without the retry
+        // a secondary server stayed without a browser for its whole life.
+        let listener = loop {
+            #[cfg(unix)]
+            let Ok(name) = path.as_os_str().to_fs_name::<GenericFilePath>() else {
+                return;
+            };
+            #[cfg(windows)]
+            let Ok(name) = pipe.to_ns_name::<GenericNamespaced>() else {
+                return;
+            };
+            if let Ok(listener) = ListenerOptions::new().name(name).create_sync() {
+                break listener;
+            }
+            #[cfg(unix)]
+            {
+                unlink_stale_bridge_socket(&path);
+                if let Ok(name) = path.as_os_str().to_fs_name::<GenericFilePath>() {
+                    if let Ok(listener) = ListenerOptions::new().name(name).create_sync() {
+                        break listener;
+                    }
                 }
             }
+            // Another server owns the browser right now; accessibility tools
+            // still work, so this is not worth reporting. Try again shortly.
+            std::thread::sleep(std::time::Duration::from_secs(2));
         };
         #[cfg(unix)]
         let _cleanup = BridgeSocketCleanup(path.clone());
