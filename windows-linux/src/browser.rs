@@ -377,7 +377,7 @@ fn spawn_listener(
                 return;
             };
             #[cfg(windows)]
-            let Ok(name) = pipe.to_ns_name::<GenericNamespaced>() else {
+            let Ok(name) = pipe.clone().to_ns_name::<GenericNamespaced>() else {
                 return;
             };
             if let Ok(listener) = ListenerOptions::new().name(name).create_sync() {
