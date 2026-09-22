@@ -13,8 +13,8 @@ import Darwin
 //                                              ▼
 //                                        MCP server (this process)
 //
-// The server binds the socket, so the first live server claims the browser;
-// later ones simply fall back to the accessibility path.
+// The first server owns the extension connection; later servers share it over
+// RPC, with independent client and task identities.
 
 let bridgeSocketPath: String = {
     let identity = Identity.current
@@ -402,7 +402,11 @@ final class BrowserBridge {
                     return
                 }
                 enableNoSigPipe(peer)
-                self?.serveRpc(peer)
+                // A peer stays connected for its entire MCP lifetime. Serving
+                // it on the accept loop strands every subsequent MCP process.
+                DispatchQueue.global(qos: .utility).async { [weak self] in
+                    self?.serveRpc(peer)
+                }
             }
         }
     }
@@ -493,7 +497,7 @@ final class BrowserBridge {
             }
         }
         for clientId in peerClientIds {
-            _ = performDirectCall("close_all_tabs", ["clientId": clientId], timeout: 2)
+            _ = performDirectCall("close_client_tabs", ["clientId": clientId], timeout: 2)
         }
         close(fd)
     }

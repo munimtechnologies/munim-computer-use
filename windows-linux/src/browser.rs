@@ -184,6 +184,11 @@ impl BrowserBridge {
 
     /// Dispatch a `browser_*` call. `command` has the `browser_` prefix stripped.
     pub fn call(&mut self, command: &str, args: &Value) -> Result<String, String> {
+        if let Some(session) = args.get("session_id") {
+            if !session.as_str().is_some_and(|id| !id.trim().is_empty() && id.encode_utf16().count() <= 128) {
+                return Err("session_id must be a nonblank string of at most 128 characters".into());
+            }
+        }
         if !self.connected() {
             return Err(format!(
                 "browser_{command} needs the MT Desktop MCP Chrome extension, which is not connected. \
@@ -209,7 +214,7 @@ impl BrowserBridge {
                 .is_none();
             if needs_tab {
                 if let Some(index) = args.get("index").and_then(Value::as_i64) {
-                    let tab_id = self.tab_id_for_index(index)?;
+                    let tab_id = self.tab_id_for_index(index, args)?;
                     if let Some(map) = params.as_object_mut() {
                         map.insert("tabId".into(), json!(tab_id));
                         map.remove("index");
@@ -220,11 +225,11 @@ impl BrowserBridge {
         Ok(params)
     }
 
-    fn tab_id_for_index(&mut self, index: i64) -> Result<i64, String> {
+    fn tab_id_for_index(&mut self, index: i64, args: &Value) -> Result<i64, String> {
         if index < 1 {
             return Err("index must be a 1-based tab position from browser_list_tabs".into());
         }
-        let listed = self.dispatch("list_tabs", json!({}))?;
+        let listed = self.dispatch("list_tabs", normalise("list_tabs", &json!({"session_id": args.get("session_id")})))?;
         let tabs = listed
             .get("tabs")
             .and_then(Value::as_array)
@@ -467,6 +472,9 @@ fn normalise(_command: &str, args: &Value) -> Value {
     let map = params.as_object_mut().expect("just built an object");
     if let Some(tab) = args.get("tab_id").and_then(Value::as_i64) {
         map.insert("tabId".into(), json!(tab));
+    }
+    if let Some(session) = args.get("session_id").filter(|v| !v.is_null()) {
+        map.insert("sessionId".into(), session.clone());
     }
     for key in ["url", "text", "key", "index", "x", "y", "all"] {
         if let Some(value) = args.get(key) {

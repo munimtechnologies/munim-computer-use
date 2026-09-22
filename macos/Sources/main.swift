@@ -2319,13 +2319,20 @@ enum Chrome {
     }
 }
 
+/// Explicit task scope allows multiple threads to share a single MCP process.
+func browserSessionCall(_ command: String, _ params: [String: Any] = [:], args: [String: Any]) -> BridgeOutcome {
+    var params = params
+    if let session = args["session_id"] { params["sessionId"] = session }
+    return BrowserBridge.shared.call(command, params)
+}
+
 func toolBrowserOpenTab(_ args: [String: Any]) -> String {
     let url = (args["url"] as? String) ?? "about:blank"
     // The extension is the good path: it opens an inactive tab in a labelled
     // group inside the user's own signed-in Chrome. Without it, fall back to a
     // separate window driven through the accessibility API.
     if BrowserBridge.shared.isConnected {
-        return bridgeText(BrowserBridge.shared.call("open_tab", ["url": url])) { payload in
+        return bridgeText(browserSessionCall("open_tab", ["url": url], args: args)) { payload in
             "opened \(url) in the agent tab group (tab_id=\(payload["tabId"] as? Int ?? -1))"
         }
     }
@@ -2358,7 +2365,7 @@ func toolBrowserOpenTab(_ args: [String: Any]) -> String {
 func toolBrowserListTabs(_ args: [String: Any]) -> String {
     let all = args["all"] as? Bool ?? false
     if BrowserBridge.shared.isConnected {
-        return bridgeText(BrowserBridge.shared.call("list_tabs", ["all": all]), describeTabs)
+        return bridgeText(browserSessionCall("list_tabs", ["all": all], args: args), describeTabs)
     }
     if all { return listEveryChromeTabViaAppleScript() }
     guard let id = Chrome.liveAgentWindowID() else {
@@ -2392,7 +2399,7 @@ func toolBrowserSelectTab(_ args: [String: Any]) -> String {
         guard let tabId = args["tab_id"] as? Int ?? args["index"] as? Int else {
             return "error: missing required argument 'tab_id'"
         }
-        return bridgeText(BrowserBridge.shared.call("select_tab", ["tabId": tabId])) { _ in
+        return bridgeText(browserSessionCall("select_tab", ["tabId": tabId], args: args)) { _ in
             "switched the agent group to tab \(tabId)"
         }
     }
@@ -2424,7 +2431,7 @@ func toolBrowserCloseTab(_ args: [String: Any]) -> String {
         guard let tabId = args["tab_id"] as? Int ?? args["index"] as? Int else {
             return "error: missing required argument 'tab_id'"
         }
-        return bridgeText(BrowserBridge.shared.call("close_tab", ["tabId": tabId])) { _ in
+        return bridgeText(browserSessionCall("close_tab", ["tabId": tabId], args: args)) { _ in
             "closed tab \(tabId)"
         }
     }
@@ -2462,7 +2469,7 @@ func bridgeText(_ result: BridgeOutcome, _ describe: ([String: Any]) -> String) 
 
 func toolBrowserSnapshot(_ args: [String: Any]) -> String {
     guard let tabId = args["tab_id"] as? Int else { return "error: missing required argument 'tab_id'" }
-    return bridgeText(BrowserBridge.shared.call("snapshot", ["tabId": tabId])) { payload in
+    return bridgeText(browserSessionCall("snapshot", ["tabId": tabId], args: args)) { payload in
         let elements = payload["elements"] as? [[String: Any]] ?? []
         var lines = ["\(payload["title"] as? String ?? "?")  [\(payload["url"] as? String ?? "")]"]
         for element in elements {
@@ -2490,7 +2497,7 @@ func toolBrowserClick(_ args: [String: Any]) -> String {
     // The Chrome extension paints the same agent pointer into the page. Keep
     // that as the source of truth for tab clicks — background tabs are not
     // composited, so a desktop overlay at guessed screen coords would lie.
-    return bridgeText(BrowserBridge.shared.call("click", params)) { payload in
+    return bridgeText(browserSessionCall("click", params, args: args)) { payload in
         var line = "clicked in tab \(tabId)"
         if let cursor = payload["cursor"] as? [String: Any] {
             if cursor["ok"] as? Bool == true {
@@ -2508,7 +2515,7 @@ func toolBrowserClick(_ args: [String: Any]) -> String {
 func toolBrowserType(_ args: [String: Any]) -> String {
     guard let tabId = args["tab_id"] as? Int else { return "error: missing required argument 'tab_id'" }
     guard let text = args["text"] as? String else { return "error: missing required argument 'text'" }
-    return bridgeText(BrowserBridge.shared.call("type", ["tabId": tabId, "text": text])) { _ in
+    return bridgeText(browserSessionCall("type", ["tabId": tabId, "text": text], args: args)) { _ in
         "typed \(text.count) characters into tab \(tabId)"
     }
 }
@@ -2516,7 +2523,7 @@ func toolBrowserType(_ args: [String: Any]) -> String {
 func toolBrowserPressKey(_ args: [String: Any]) -> String {
     guard let tabId = args["tab_id"] as? Int else { return "error: missing required argument 'tab_id'" }
     guard let key = args["key"] as? String else { return "error: missing required argument 'key'" }
-    return bridgeText(BrowserBridge.shared.call("press", ["tabId": tabId, "key": key])) { _ in
+    return bridgeText(browserSessionCall("press", ["tabId": tabId, "key": key], args: args)) { _ in
         "pressed \(key) in tab \(tabId)"
     }
 }
@@ -2525,7 +2532,7 @@ func toolBrowserCloseAllTabs(_ args: [String: Any]) -> String {
     guard BrowserBridge.shared.isConnected else {
         return "error: the MT Desktop MCP Chrome extension is not connected"
     }
-    return bridgeText(BrowserBridge.shared.call("close_all_tabs")) { payload in
+    return bridgeText(browserSessionCall("close_all_tabs", args: args)) { payload in
         let closed = payload["closed"] as? Int ?? 0
         let released = payload["released"] as? Int ?? 0
         var parts: [String] = []
@@ -2538,7 +2545,7 @@ func toolBrowserCloseAllTabs(_ args: [String: Any]) -> String {
 func toolBrowserNavigate(_ args: [String: Any]) -> String {
     guard let tabId = args["tab_id"] as? Int else { return "error: missing required argument 'tab_id'" }
     guard let url = args["url"] as? String else { return "error: missing required argument 'url'" }
-    return bridgeText(BrowserBridge.shared.call("navigate", ["tabId": tabId, "url": url])) { _ in
+    return bridgeText(browserSessionCall("navigate", ["tabId": tabId, "url": url], args: args)) { _ in
         "navigated tab \(tabId) to \(url)"
     }
 }
@@ -2581,7 +2588,7 @@ func toolBrowserUseTab(_ args: [String: Any]) -> String {
             + "which is not connected. Without it, use browser_open_tab, or drive Chrome with "
             + "get_app_state + click."
     }
-    return bridgeText(BrowserBridge.shared.call("use_tab", ["tabId": tabId])) { payload in
+    return bridgeText(browserSessionCall("use_tab", ["tabId": tabId], args: args)) { payload in
         let title = payload["title"] as? String ?? ""
         let url = payload["url"] as? String ?? ""
         let adopted = payload["adopted"] as? Bool ?? false
@@ -2598,7 +2605,7 @@ func toolBrowserReleaseTab(_ args: [String: Any]) -> String {
     guard BrowserBridge.shared.isConnected else {
         return "error: the MT Desktop MCP Chrome extension is not connected"
     }
-    return bridgeText(BrowserBridge.shared.call("release_tab", ["tabId": tabId])) { _ in
+    return bridgeText(browserSessionCall("release_tab", ["tabId": tabId], args: args)) { _ in
         "released tab \(tabId) back to the user"
     }
 }
@@ -3134,6 +3141,12 @@ let toolDefs: [[String: Any]] = [
         "inputSchema": [
             "type": "object",
             "properties": [
+                "session_id": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session.",
+                ],
                 "url": [
                     "type": "string",
                     "description": "Absolute URL to open (default about:blank)",
@@ -3154,6 +3167,12 @@ let toolDefs: [[String: Any]] = [
         "inputSchema": [
             "type": "object",
             "properties": [
+                "session_id": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session.",
+                ],
                 "all": [
                     "type": "boolean",
                     "description": "List every tab in the browser, not just the agent's (default false)",
@@ -3174,6 +3193,12 @@ let toolDefs: [[String: Any]] = [
         "inputSchema": [
             "type": "object",
             "properties": [
+                "session_id": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session.",
+                ],
                 "tab_id": [
                     "type": "integer",
                     "description": "tab_id of the user's tab, from browser_list_tabs all=true",
@@ -3195,6 +3220,12 @@ let toolDefs: [[String: Any]] = [
         "inputSchema": [
             "type": "object",
             "properties": [
+                "session_id": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session.",
+                ],
                 "tab_id": [
                     "type": "integer",
                     "description": "tab_id of a tab previously adopted with browser_use_tab",
@@ -3216,6 +3247,12 @@ let toolDefs: [[String: Any]] = [
         "inputSchema": [
             "type": "object",
             "properties": [
+                "session_id": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session.",
+                ],
                 "tab_id": [
                     "type": "integer",
                     "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs",
@@ -3240,6 +3277,12 @@ let toolDefs: [[String: Any]] = [
         "inputSchema": [
             "type": "object",
             "properties": [
+                "session_id": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session.",
+                ],
                 "tab_id": [
                     "type": "integer",
                     "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs",
@@ -3264,6 +3307,12 @@ let toolDefs: [[String: Any]] = [
         "inputSchema": [
             "type": "object",
             "properties": [
+                "session_id": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session.",
+                ],
                 "tab_id": [
                     "type": "integer",
                     "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs",
@@ -3285,6 +3334,12 @@ let toolDefs: [[String: Any]] = [
         "inputSchema": [
             "type": "object",
             "properties": [
+                "session_id": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session.",
+                ],
                 "tab_id": [
                     "type": "integer",
                     "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs",
@@ -3318,6 +3373,12 @@ let toolDefs: [[String: Any]] = [
         "inputSchema": [
             "type": "object",
             "properties": [
+                "session_id": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session.",
+                ],
                 "tab_id": [
                     "type": "integer",
                     "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs",
@@ -3343,6 +3404,12 @@ let toolDefs: [[String: Any]] = [
         "inputSchema": [
             "type": "object",
             "properties": [
+                "session_id": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session.",
+                ],
                 "tab_id": [
                     "type": "integer",
                     "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs",
@@ -3368,7 +3435,14 @@ let toolDefs: [[String: Any]] = [
         "description": "Close every tab the agent opened and remove its tab group. Tabs taken over with browser_use_tab are released back to the user, not closed. Call this when finished with the browser so no empty group is left in the user's tab strip. The MCP process also runs this automatically when the Computer Use session ends. Unsaved state in the agent's tabs is lost.",
         "inputSchema": [
             "type": "object",
-            "properties": [:] as [String: Any],
+            "properties": [
+                "session_id": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session.",
+                ],
+            ] as [String: Any],
         ],
         "annotations": [
             "title": "Close all agent tabs",
@@ -3384,6 +3458,12 @@ let toolDefs: [[String: Any]] = [
         "inputSchema": [
             "type": "object",
             "properties": [
+                "session_id": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session.",
+                ],
                 "tab_id": [
                     "type": "integer",
                     "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs",
@@ -3435,7 +3515,7 @@ func negotiatedProtocolVersion(_ params: [String: Any]) -> String {
 }
 
 /// Returned in the `initialize` result; identical in the Rust server.
-let serverInstructions = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf."
+let serverInstructions = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf."
 
 // MARK: - Clipboard
 
@@ -3464,6 +3544,20 @@ func toolClipboardWrite(_ args: [String: Any]) -> String {
 func dispatch(_ name: String, _ args: [String: Any]) -> String {
     if name.hasPrefix("browser_"), !browserControlEnabled {
         return "error: browser control is disabled in Computer Use settings"
+    }
+    if name.hasPrefix("browser_") {
+        BrowserBridge.shared.reconnectIfOrphaned()
+        if let value = args["session_id"] {
+            guard let session = value as? String, !session.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  session.utf16.count <= 128 else {
+                return "error: session_id must be a nonblank string of at most 128 characters"
+            }
+            // The accessibility fallback has one shared window, so it cannot
+            // honor task isolation. Never silently route scoped calls there.
+            guard BrowserBridge.shared.isConnected else {
+                return "error: isolated browser sessions require the connected Chrome extension"
+            }
+        }
     }
     switch name {
     case "list_apps": return toolListApps()
@@ -3615,7 +3709,7 @@ BrowserBridge.shared.start()
 /// "MT Code" / "MT Code" group in the user's tab strip.
 func cleanupAgentBrowserTabsOnExit() {
     guard browserControlEnabled, BrowserBridge.shared.isConnected else { return }
-    _ = BrowserBridge.shared.call("close_all_tabs", timeout: 2)
+    _ = BrowserBridge.shared.call("close_client_tabs", timeout: 2)
 }
 
 /// SIGTERM/SIGINT often arrive before stdin EOF when the host tears down the

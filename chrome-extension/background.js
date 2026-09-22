@@ -57,16 +57,10 @@ const tabOwner = new Map();
 /** Tabs we have attached the debugger to, so we detach exactly once. */
 const attached = new Set();
 let port = null;
-/** True after the native host has delivered at least one message this session. */
-let hadLiveSession = false;
-/** When the current native-host port was opened (ms). */
-let connectedAt = 0;
-/**
- * A host that stays connected this long is treated as a live desktop session,
- * even if it has not sent a command yet (idle reconnect while MCP is up).
- * Shorter disconnects are the usual "MCP not listening yet" race.
- */
-const LIVE_SESSION_DWELL_MS = 2000;
+let reconnectTimer = null;
+/** Quick retries since the last message; the minute alarm takes over after. */
+let quickRetries = 0;
+const QUICK_RETRY_LIMIT = 5;
 let stateReady = null;
 
 function requireClientId(params) {
@@ -101,6 +95,8 @@ async function persistOwnedState() {
         tabs: Array.from(state.tabs),
         adopted: Array.from(state.adopted),
         groupId: state.groupId,
+        processId: state.processId,
+        sessionId: state.sessionId,
       };
     }
     await chrome.storage.session.set({ [OWNED_STATE_KEY]: { clients: serialized } });
@@ -148,6 +144,8 @@ async function restoreOwnedState() {
     for (const [clientId, entry] of Object.entries(serialized)) {
       if (!entry || typeof entry !== "object") continue;
       const next = clientState(clientId);
+      next.processId = typeof entry.processId === "string" ? entry.processId : clientId;
+      next.sessionId = typeof entry.sessionId === "string" ? entry.sessionId : null;
       for (const tabId of Array.isArray(entry.tabs) ? entry.tabs : []) {
         if (typeof tabId !== "number") continue;
         try {
@@ -200,38 +198,26 @@ function connect() {
   }
   if (!port) return;
   const sessionPort = port;
-  connectedAt = Date.now();
-  hadLiveSession = false;
   sessionPort.onMessage.addListener((msg) => {
-    // A command proves the MCP bridge is up.
-    hadLiveSession = true;
+    quickRetries = 0;
     void handleCommand(msg, sessionPort);
   });
   sessionPort.onDisconnect.addListener(() => {
-    // Reading lastError here keeps "Native host has exited" out of the error
-    // list while the desktop app simply is not running yet.
     void chrome.runtime.lastError;
-    const livedMs = connectedAt ? Date.now() - connectedAt : 0;
-    // Tear down tabs when a real session ends: either we saw traffic, or the
-    // host stayed up long enough that this was not a connectNative race.
-    // Immediate disconnects (MCP pipe not bound yet) keep restored tabs.
-    // Native-host drop means every MCP client lost the bridge — close all.
-    const wasLive = hadLiveSession || livedMs >= LIVE_SESSION_DWELL_MS;
-    const snapshot = wasLive
-      ? Array.from(clients.entries()).map(([clientId, state]) => ({
-          clientId,
-          tabs: Array.from(state.tabs),
-          groupId: state.groupId,
-        }))
-      : [];
-    if (port === sessionPort) {
-      port = null;
-      hadLiveSession = false;
-      connectedAt = 0;
-    }
-    for (const entry of snapshot) {
-      for (const tabId of entry.tabs) void hideCursor(tabId);
-      void closeOwnedTabs(entry.clientId, entry.tabs, entry.groupId);
+    if (port !== sessionPort) return;
+    port = null;
+    // Losing the transport is not the end of every task. In particular, an
+    // owning MCP process can exit while peers elect a replacement. Keep their
+    // tabs and ownership; only explicit client/session cleanup may close them.
+    // Retry quickly so a re-elected owner is picked up within seconds, but back
+    // off: with no MCP server running every attempt spawns a native host.
+    if (reconnectTimer === null && quickRetries < QUICK_RETRY_LIMIT) {
+      const delay = 1000 * 2 ** quickRetries;
+      quickRetries += 1;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, delay);
     }
   });
 }
@@ -272,21 +258,20 @@ function replyError(portRef, id, message) {
 
 // ── tab + group management ──────────────────────────────────────────────────
 
-/** Serialize group mutation so concurrent open_tab calls share one group. */
-const groupQueue = (() => {
-  let chain = Promise.resolve();
-  return (task) => {
-    const run = chain.then(task, task);
-    chain = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    return run;
-  };
-})();
+// Commands for one task run in order. Different tasks never share this queue.
+// Register queues before starting work, so process cleanup also sees queued opens.
+const commandQueues = new Map();
+function enqueue(clientId, task) {
+  const run = (commandQueues.get(clientId) ?? Promise.resolve()).then(task);
+  const tail = run.catch(() => {});
+  commandQueues.set(clientId, tail);
+  void tail.then(() => {
+    if (commandQueues.get(clientId) === tail) commandQueues.delete(clientId);
+  });
+  return run;
+}
 
 async function ensureGroup(clientId, tabId) {
-  return groupQueue(async () => {
     const state = clientState(clientId);
     // Re-create the group if the user dismissed it or Chrome dropped it.
     if (state.groupId !== null) {
@@ -299,7 +284,7 @@ async function ensureGroup(clientId, tabId) {
     if (state.groupId === null) {
       state.groupId = await chrome.tabs.group({ tabIds: [tabId] });
       await chrome.tabGroups.update(state.groupId, {
-        title: GROUP_TITLE,
+        title: state.sessionId ? `${GROUP_TITLE} · ${state.sessionId}` : GROUP_TITLE,
         color: groupColorFor(clientId),
       });
     } else {
@@ -310,7 +295,6 @@ async function ensureGroup(clientId, tabId) {
     await markTab(tabId);
     await persistOwnedState();
     return state.groupId;
-  });
 }
 
 async function openTab(clientId, url) {
@@ -395,8 +379,10 @@ function forgetTab(clientId, tabId) {
     state.tabs.delete(tabId);
     state.adopted.delete(tabId);
   }
-  tabOwner.delete(tabId);
-  attached.delete(tabId);
+  if (tabOwner.get(tabId) === clientId) {
+    tabOwner.delete(tabId);
+    attached.delete(tabId);
+  }
 }
 
 /// Take over a tab the user already had open. The tab keeps its place in the
@@ -404,15 +390,15 @@ function forgetTab(clientId, tabId) {
 /// looking straight at it.
 async function adoptTab(clientId, tabId) {
   if (typeof tabId !== "number") throw new Error("tabId is required");
-  const owner = tabOwner.get(tabId);
-  if (owner !== undefined && owner !== clientId) {
-    throw new Error(`tab ${tabId} is already being used by another agent`);
-  }
   const tab = await chrome.tabs.get(tabId).catch(() => {
     throw new Error(`there is no open tab with id ${tabId} — call list_tabs with all:true`);
   });
   if (!isAttachable(tab.url)) {
     throw new Error(`Chrome does not allow automating ${tab.url || "that page"}`);
+  }
+  const owner = tabOwner.get(tabId);
+  if (owner !== undefined && owner !== clientId) {
+    throw new Error(`tab ${tabId} is already being used by another agent`);
   }
   const state = clientState(clientId);
   const alreadyOwned = state.tabs.has(tabId);
@@ -459,7 +445,9 @@ async function releaseTab(clientId, tabId) {
 async function closeOwnedTabs(clientId, ids, expectedGroupId) {
   const state = clients.get(clientId);
   let released = 0;
+  let closed = 0;
   for (const id of ids) {
+    if (tabOwner.get(id) !== clientId) continue;
     // An adopted tab is the user's. Cleanup hands it back; it is never closed,
     // which is the whole reason adoption is tracked separately from ownership.
     if (state?.adopted.has(id)) {
@@ -470,6 +458,7 @@ async function closeOwnedTabs(clientId, ids, expectedGroupId) {
       released += 1;
       continue;
     }
+    closed += 1;
     if (state) state.tabs.delete(id);
     tabOwner.delete(id);
     attached.delete(id);
@@ -502,7 +491,7 @@ async function closeOwnedTabs(clientId, ids, expectedGroupId) {
     clients.delete(clientId);
   }
   await persistOwnedState();
-  return { closed: ids.length - released, released, clientId };
+  return { closed, released, clientId };
 }
 
 async function closeAllTabs(clientId) {
@@ -1145,11 +1134,36 @@ const handlers = {
 
 async function handleCommand(msg, replyPort = port) {
   await ensureStateReady();
-  const { id, command, params } = msg || {};
-  const handler = handlers[command];
-  if (!handler) return replyError(replyPort, id, `unknown command: ${command}`);
+  const { id, command, params = {} } = msg || {};
   try {
-    reply(replyPort, id, await handler(params || {}));
+    const processId = requireClientId(params);
+    if (command === "close_client_tabs") {
+      // Snapshot queues too: an open may be waiting to create its client state.
+      const keys = new Set([...clients.keys(), ...commandQueues.keys()]);
+      const owned = [...keys].filter((key) => key === processId ||
+        clients.get(key)?.processId === processId);
+      const results = await Promise.all(owned.map((key) => enqueue(key, () => closeAllTabs(key))));
+      return reply(replyPort, id, { closed: results.reduce((n, r) => n + r.closed, 0),
+        released: results.reduce((n, r) => n + r.released, 0) });
+    }
+    const handler = handlers[command];
+    if (!handler) throw new Error(`unknown command: ${command}`);
+    const sessionId = params.sessionId;
+    if (sessionId !== undefined && (typeof sessionId !== "string" ||
+        !sessionId.trim() || sessionId.length > 128)) {
+      throw new Error("session_id must be a nonblank string of at most 128 characters");
+    }
+    // JSON tuple encoding prevents session ids from colliding across processes.
+    const clientId = sessionId === undefined ? processId : JSON.stringify([processId, sessionId]);
+    const state = clientState(clientId);
+    state.processId = processId;
+    state.sessionId = sessionId ?? null;
+    const result = await enqueue(clientId, () => {
+      // A preceding cleanup may have removed the state while this waited.
+      Object.assign(clientState(clientId), { processId, sessionId: sessionId ?? null });
+      return handler({ ...params, clientId });
+    });
+    reply(replyPort, id, result);
   } catch (e) {
     replyError(replyPort, id, e && e.message ? e.message : e);
   }

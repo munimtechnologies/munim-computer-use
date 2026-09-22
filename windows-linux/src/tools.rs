@@ -24,7 +24,7 @@ pub fn browser_control_enabled() -> bool {
 }
 
 /// Returned in the `initialize` result; identical in the Swift server.
-pub const SERVER_INSTRUCTIONS: &str = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf.";
+pub const SERVER_INSTRUCTIONS: &str = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf.";
 
 pub fn tool_defs() -> Value {
     let Value::Array(defs) = all_tool_defs() else {
@@ -548,6 +548,12 @@ fn all_tool_defs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session."
+                    },
                     "url": {
                         "type": "string",
                         "description": "Absolute URL to open (default about:blank)"
@@ -568,6 +574,12 @@ fn all_tool_defs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session."
+                    },
                     "all": {
                         "type": "boolean",
                         "description": "List every tab in the browser, not just the agent's (default false)"
@@ -588,6 +600,12 @@ fn all_tool_defs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session."
+                    },
                     "tab_id": {
                         "type": "integer",
                         "description": "tab_id of the user's tab, from browser_list_tabs all=true"
@@ -609,6 +627,12 @@ fn all_tool_defs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session."
+                    },
                     "tab_id": {
                         "type": "integer",
                         "description": "tab_id of a tab previously adopted with browser_use_tab"
@@ -630,6 +654,12 @@ fn all_tool_defs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session."
+                    },
                     "tab_id": {
                         "type": "integer",
                         "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs"
@@ -654,6 +684,12 @@ fn all_tool_defs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session."
+                    },
                     "tab_id": {
                         "type": "integer",
                         "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs"
@@ -678,6 +714,12 @@ fn all_tool_defs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session."
+                    },
                     "tab_id": {
                         "type": "integer",
                         "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs"
@@ -699,6 +741,12 @@ fn all_tool_defs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session."
+                    },
                     "tab_id": {
                         "type": "integer",
                         "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs"
@@ -732,6 +780,12 @@ fn all_tool_defs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session."
+                    },
                     "tab_id": {
                         "type": "integer",
                         "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs"
@@ -757,6 +811,12 @@ fn all_tool_defs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session."
+                    },
                     "tab_id": {
                         "type": "integer",
                         "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs"
@@ -782,7 +842,14 @@ fn all_tool_defs() -> Value {
             "description": "Close every tab the agent opened and remove its tab group. Tabs taken over with browser_use_tab are released back to the user, not closed. Call this when finished with the browser so no empty group is left in the user's tab strip. The MCP process also runs this automatically when the Computer Use session ends. Unsaved state in the agent's tabs is lost.",
             "inputSchema": {
                 "type": "object",
-                "properties": {}
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session."
+                    }
+                }
             },
             "annotations": {
                 "title": "Close all agent tabs",
@@ -798,6 +865,12 @@ fn all_tool_defs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session."
+                    },
                     "tab_id": {
                         "type": "integer",
                         "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs"
