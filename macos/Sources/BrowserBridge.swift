@@ -239,7 +239,7 @@ enum NativeHost {
         guard connected == 0 else { exit(1) }
 
         // Socket → Chrome. Server speaks newline-delimited JSON.
-        DispatchQueue.global().async {
+        spawnBlockingThread("native-host.socket-reader") {
             var buffer = Data()
             var chunk = [UInt8](repeating: 0, count: 65536)
             while true {
@@ -265,6 +265,22 @@ enum NativeHost {
 }
 
 // MARK: - Server side
+
+/// Pending connections the bridge sockets queue before accept(). Every MCP
+/// process on the machine connects to the owner at launch, so 8 overflowed
+/// when several agents started together and the rest were refused.
+let bridgeListenBacklog: Int32 = 64
+
+/// Run a loop that blocks in read()/accept() for its whole life on its own
+/// thread. On GCD's shared pool each idle peer pinned a worker thread, and
+/// once the pool's limit (about 64) was reached the owner stopped serving
+/// new peers — and could not even run its accept loop — until a peer left.
+func spawnBlockingThread(_ name: String, _ body: @escaping () -> Void) {
+    let thread = Thread(block: body)
+    thread.name = name
+    thread.stackSize = 512 * 1024
+    thread.start()
+}
 
 /// Request/response channel to the extension, owned by the MCP server.
 final class BrowserBridge {
@@ -357,7 +373,7 @@ final class BrowserBridge {
         let bound = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, size) }
         }
-        guard bound == 0, listen(fd, 8) == 0 else {
+        guard bound == 0, listen(fd, bridgeListenBacklog) == 0 else {
             close(fd)
             flock(lockFd, LOCK_UN)
             close(lockFd)
@@ -367,7 +383,7 @@ final class BrowserBridge {
         ownershipLockFD = lockFd
         startRpcListener()
 
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        spawnBlockingThread("bridge.accept") { [weak self] in
             while true {
                 let client = accept(fd, nil, nil)
                 if client < 0 {
@@ -375,7 +391,11 @@ final class BrowserBridge {
                     return
                 }
                 enableNoSigPipe(client)
-                self?.serve(client)
+                // One thread per native-host connection, so a reconnecting
+                // extension is accepted even while the old link drains.
+                spawnBlockingThread("bridge.extension") { [weak self] in
+                    self?.serve(client)
+                }
             }
         }
     }
@@ -389,12 +409,12 @@ final class BrowserBridge {
         let bound = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, size) }
         }
-        guard bound == 0, listen(fd, 8) == 0 else {
+        guard bound == 0, listen(fd, bridgeListenBacklog) == 0 else {
             close(fd)
             return
         }
         rpcListenFD = fd
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        spawnBlockingThread("bridge.rpc-accept") { [weak self] in
             while true {
                 let peer = accept(fd, nil, nil)
                 if peer < 0 {
@@ -404,7 +424,7 @@ final class BrowserBridge {
                 enableNoSigPipe(peer)
                 // A peer stays connected for its entire MCP lifetime. Serving
                 // it on the accept loop strands every subsequent MCP process.
-                DispatchQueue.global(qos: .utility).async { [weak self] in
+                spawnBlockingThread("bridge.rpc-peer") { [weak self] in
                     self?.serveRpc(peer)
                 }
             }
@@ -427,7 +447,7 @@ final class BrowserBridge {
         lock.lock()
         rpcClientFD = fd
         lock.unlock()
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        spawnBlockingThread("bridge.rpc-client") { [weak self] in
             self?.readRpcResponses(fd)
         }
     }

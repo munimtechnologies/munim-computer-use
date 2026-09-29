@@ -52,6 +52,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: swift build -c release
+      - name: bridge keeps serving new peers with many connected
+        working-directory: .
+        run: node scripts/bridge-peers.test.mjs macos/.build/release/munim-computer-use 120
 
   node:
     name: extension tests and tool parity

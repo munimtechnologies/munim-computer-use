@@ -3903,5 +3903,6 @@ while let line = readLine(strippingNewline: true) {
     exit(0)
 }
 
-DispatchQueue.global(qos: .userInitiated).async { runJSONRPCLoop() }
+// A dedicated thread: the loop blocks on stdin for the life of the process.
+spawnBlockingThread("mcp.stdin") { runJSONRPCLoop() }
 NSApp.run()
