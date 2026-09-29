@@ -32,6 +32,17 @@ const STANDALONE_HOST = "com.munimtech.computer_use.desktop";
 /** The live port for a host: the one a bridge would be talking to. */
 const portFor = (host) => ports.findLast((p) => p.host === host);
 let alarmListener = null;
+/** runtime.onMessage listeners, so tests can play the prompt page. */
+const messageListeners = [];
+/** Popup windows the extension opened, and the ones it closed. */
+const openedWindows = [];
+const closedWindows = [];
+let windowRemovedListener = null;
+/**
+ * What a page answers to Runtime.evaluate. Tests swap this to play a page;
+ * by default every expression returns an empty object.
+ */
+let pageEval = () => ({ result: { value: {} } });
 let connects = 0;
 let sent = [];
 
@@ -66,7 +77,7 @@ const chrome = {
     },
     onStartup: { addListener() {} },
     onInstalled: { addListener() {} },
-    onMessage: { addListener() {} },
+    onMessage: { addListener: (fn) => messageListeners.push(fn) },
     lastError: null,
     getURL: (file) => `chrome-extension://fake/${file}`,
   },
@@ -114,7 +125,22 @@ const chrome = {
     },
     update: async (id, props) => Object.assign(groups.get(id), props),
   },
-  debugger: { attach: async () => {}, detach: async () => {}, sendCommand: async () => ({ result: { value: {} } }) },
+  debugger: {
+    attach: async () => {},
+    detach: async () => {},
+    sendCommand: async (target, method, params) => pageEval(method, params ?? {}, target.tabId),
+  },
+  windows: {
+    create: async (options) => {
+      const win = { id: 900 + openedWindows.length, ...options };
+      openedWindows.push(win);
+      return win;
+    },
+    remove: async (id) => {
+      closedWindows.push(id);
+    },
+    onRemoved: { addListener: (fn) => { windowRemovedListener = fn; } },
+  },
   scripting: {
     executeScript: async ({ target, func, args }) =>
       executed.push({ tabId: target.tabId, fn: func.name, args }),
@@ -132,7 +158,8 @@ async function fetch(url) {
   };
 }
 
-vm.runInContext(source, vm.createContext({ ...globalThis, chrome, console, fetch }), {
+// URL is not an enumerable global, so the spread below would leave it out.
+vm.runInContext(source, vm.createContext({ ...globalThis, URL, chrome, console, fetch }), {
   filename: "background.js",
 });
 
@@ -450,6 +477,205 @@ test("a host that is not installed waits for the alarm instead of retrying", asy
   alarmListener({ name: "cu-reconnect" });
   assert.equal(connects, before + 1, "the minute alarm tries again");
   assert.ok(portFor(STANDALONE_HOST).onMessageListener);
+});
+
+// ── reading, return_state, site rules, credentials ─────────────────────────
+
+let pageTab;
+test("a fresh agent tab for the page tests", async () => {
+  pageTab = (await call("open_tab", { url: "https://shop.example/login" })).tabId;
+  assert.ok(pageTab);
+});
+
+/** Like call(), but for commands that wait on timers (settling, prompts). */
+async function callAndWait(command, params = {}, beforeReply = async () => {}) {
+  const id = ++nextRequestId;
+  nativeListener({ id, command, params: { clientId: "agentA", ...params } });
+  await beforeReply();
+  for (let waited = 0; waited < 5000; waited += 10) {
+    const reply = sent.find((message) => message.id === id);
+    if (reply) {
+      if (!reply.ok) throw new Error(reply.error);
+      return reply.result;
+    }
+    await new Promise((resume) => setTimeout(resume, 10));
+  }
+  throw new Error(`no reply to ${command}`);
+}
+
+/** Wait until the extension has opened another prompt window, and return its id. */
+async function nextPrompt(count) {
+  for (let waited = 0; waited < 3000 && openedWindows.length < count; waited += 5) {
+    await new Promise((resume) => setTimeout(resume, 5));
+  }
+  const win = openedWindows[count - 1];
+  if (!win) throw new Error("no prompt window opened");
+  assert.match(win.url, /^chrome-extension:\/\/fake\/prompt\.html#/);
+  return win.url.split("#")[1];
+}
+
+/** Talk to the extension the way prompt.html does. */
+function fromPrompt(message, url = "chrome-extension://fake/prompt.html#x") {
+  let response;
+  for (const listener of messageListeners) listener(message, { url }, (value) => { response = value; });
+  return response;
+}
+
+test("read returns the page text in chunks and says where to continue", async () => {
+  const text = "# Title\n" + "word ".repeat(100).trim();
+  pageEval = (method, params) =>
+    params.expression?.includes("readPageInPage")
+      ? { result: { value: { title: "Doc", url: "https://docs.example/a", text, links: [] } } }
+      : { result: { value: {} } };
+  const first = await call("read", { tabId: pageTab, maxChars: 50 });
+  assert.equal(first.text.length, 50);
+  assert.equal(first.end, 50);
+  assert.equal(first.total, text.length);
+  const rest = await call("read", { tabId: pageTab, offset: 50, maxChars: 100000 });
+  assert.equal(first.text + rest.text, text);
+  pageEval = () => ({ result: { value: {} } });
+});
+
+test("read with a query keeps matching lines, their neighbours and their heading", async () => {
+  const text = ["# Pricing", "intro", "", "Pro costs $20", "after", "", "# Other", "unrelated", "more"].join("\n");
+  pageEval = () => ({ result: { value: { title: "P", url: "https://p.example/", text } } });
+  const found = await call("read", { tabId: pageTab, query: "costs" });
+  assert.equal(found.matches, 1);
+  assert.match(found.text, /# Pricing/);
+  assert.match(found.text, /Pro costs \$20/);
+  assert.doesNotMatch(found.text, /unrelated/);
+  pageEval = () => ({ result: { value: {} } });
+});
+
+test("return_state attaches a fresh snapshot to an action", async () => {
+  pageEval = (method, params) => {
+    const expression = params.expression ?? "";
+    if (expression.includes("data-cu-idx=\"3\"")) return { result: { value: { ok: true, tag: "button", x: 5, y: 5 } } };
+    if (expression.includes("querySelectorAll(sel)")) {
+      return { result: { value: { title: "After", url: "https://shop.example/next", elements: [{ i: 0, tag: "a", label: "Next" }] } } };
+    }
+    return { result: { value: {} } };
+  };
+  const plain = await callAndWait("click", { tabId: pageTab, index: 3 });
+  assert.equal(plain.snapshot, undefined, "no snapshot unless asked");
+  const withState = await callAndWait("click", { tabId: pageTab, index: 3, returnState: true });
+  assert.equal(withState.snapshot.title, "After");
+  pageEval = () => ({ result: { value: {} } });
+});
+
+test("a blocked site is refused before the tab is opened", async () => {
+  const tabsBefore = tabs.size;
+  const error = await refuses("open_tab", {
+    url: "https://www.bank.example/login",
+    sites: [{ pattern: "bank.example", rule: "block" }],
+  });
+  assert.match(error, /blocked by the user's Computer Use policy/);
+  assert.equal(tabs.size, tabsBefore);
+});
+
+test("the most specific site rule wins", async () => {
+  const opened = await call("open_tab", {
+    url: "https://docs.bank.example/",
+    sites: [{ pattern: "*", rule: "block" }, { pattern: "bank.example", rule: "block" }, { pattern: "docs.bank.example", rule: "allow" }],
+  });
+  assert.ok(opened.tabId);
+  await call("close_tab", { tabId: opened.tabId });
+});
+
+test("an ask rule opens one approval prompt per origin and task", async () => {
+  const sites = [{ pattern: "mail.example", rule: "ask" }];
+  const before = openedWindows.length;
+  const pending = callAndWait("open_tab", { url: "https://mail.example/inbox", sites }, async () => {
+    const id = await nextPrompt(before + 1);
+    const spec = fromPrompt({ type: "cu-prompt-init", id });
+    assert.equal(spec.kind, "approve");
+    assert.equal(spec.origin, "https://mail.example");
+    fromPrompt({ type: "cu-prompt-answer", id, approved: true });
+  });
+  const opened = await pending;
+  assert.ok(opened.tabId);
+  const again = await call("navigate", { tabId: opened.tabId, url: "https://mail.example/sent", sites });
+  assert.ok(again);
+  assert.equal(openedWindows.length, before + 1, "approved once for this task");
+  await call("close_tab", { tabId: opened.tabId });
+});
+
+test("declining an ask prompt refuses the action", async () => {
+  const before = openedWindows.length;
+  let failure;
+  try {
+    await callAndWait("open_tab", { url: "https://chat.example/", sites: [{ pattern: "chat.example", rule: "ask" }] }, async () => {
+      const id = await nextPrompt(before + 1);
+      fromPrompt({ type: "cu-prompt-answer", id, approved: false });
+    });
+  } catch (error) {
+    failure = error.message;
+  }
+  assert.match(failure ?? "", /declined/);
+});
+
+test("credentials go from the prompt into the page and never back to the agent", async () => {
+  const secret = "hunter2-correct-horse";
+  let filledExpression = "";
+  pageEval = (method, params) => {
+    const expression = params.expression ?? "";
+    if (expression.includes("describeFieldsInPage")) {
+      return { result: { value: [
+        { index: 1, found: true, editable: true, type: "email", label: "Email" },
+        { index: 2, found: true, editable: true, type: "password", label: "Password" },
+      ] } };
+    }
+    if (expression.includes("fillFieldsInPage")) {
+      filledExpression = expression;
+      return { result: { value: { filled: [1, 2], missing: [] } } };
+    }
+    return { result: { value: {} } };
+  };
+  const before = openedWindows.length;
+  const result = await callAndWait(
+    "request_credentials",
+    { tabId: pageTab, fields: [{ index: 1 }, { index: 2 }], reason: "Sign in to finish checkout" },
+    async () => {
+      const id = await nextPrompt(before + 1);
+      // A web page's content script cannot read or answer the prompt.
+      assert.equal(fromPrompt({ type: "cu-prompt-init", id }, "https://evil.example/"), undefined);
+      fromPrompt({ type: "cu-prompt-answer", id, approved: true, values: { 1: "a@b.example", 2: "stolen" } }, "https://evil.example/");
+      const spec = fromPrompt({ type: "cu-prompt-init", id });
+      assert.equal(spec.kind, "credentials");
+      assert.deepEqual(spec.fields.map((field) => field.kind), ["email", "password"], "kinds inferred from the inputs");
+      fromPrompt({ type: "cu-prompt-answer", id, approved: true, values: { 1: "a@b.example", 2: secret } });
+    },
+  );
+  assert.deepEqual([...result.filled], [1, 2]);
+  assert.ok(filledExpression.includes(secret), "the value reached the page");
+  assert.ok(!JSON.stringify(result).includes(secret), "the value did not come back");
+  assert.ok(!JSON.stringify(sent).includes(secret), "nothing sent to the host carries it");
+  pageEval = () => ({ result: { value: {} } });
+});
+
+test("closing the sign-in window cancels without filling", async () => {
+  pageEval = (method, params) =>
+    (params.expression ?? "").includes("describeFieldsInPage")
+      ? { result: { value: [{ index: 2, found: true, editable: true, type: "password", label: "" }] } }
+      : { result: { value: {} } };
+  const before = openedWindows.length;
+  const result = await callAndWait("request_credentials", { tabId: pageTab, fields: [{ index: 2 }] }, async () => {
+    await nextPrompt(before + 1);
+    windowRemovedListener(openedWindows[before].id);
+  });
+  assert.equal(result.cancelled, true);
+  assert.equal(result.filled, undefined);
+  pageEval = () => ({ result: { value: {} } });
+});
+
+test("credentials refuse an index that is not a text field", async () => {
+  pageEval = (method, params) =>
+    (params.expression ?? "").includes("describeFieldsInPage")
+      ? { result: { value: [{ index: 4, found: true, editable: false, type: "a", label: "Help" }] } }
+      : { result: { value: {} } };
+  const error = await refuses("request_credentials", { tabId: pageTab, fields: [{ index: 4 }] });
+  assert.match(error, /not a text field/);
+  pageEval = () => ({ result: { value: {} } });
 });
 
 // ── runner ──────────────────────────────────────────────────────────────────

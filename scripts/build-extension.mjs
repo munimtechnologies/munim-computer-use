@@ -23,7 +23,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const source = path.resolve(here, "../chrome-extension");
 
 /** Files that belong in the shipped extension. Everything else stays behind. */
-const SHIPPED = ["manifest.json", "background.js", "wake.js", "icons"];
+const SHIPPED = ["manifest.json", "background.js", "wake.js", "prompt.html", "prompt.js", "icons"];
 
 const BEGIN = "// @embed-config-begin";
 const END = "// @embed-config-end";

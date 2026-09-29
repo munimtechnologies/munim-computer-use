@@ -557,13 +557,17 @@ const SNAPSHOT_JS = `(() => {
     if (r.width < 2 || r.height < 2) continue;
     const style = getComputedStyle(el);
     if (style.visibility === 'hidden' || style.display === 'none') continue;
-    const label = (el.getAttribute('aria-label') || el.innerText || el.value ||
+    // A password field's value is the secret itself: never let it reach the
+    // model as a label (browser_request_credentials fills these instead).
+    const secret = el.tagName === 'INPUT' && el.type === 'password';
+    const label = (el.getAttribute('aria-label') || el.innerText || (secret ? '' : el.value) ||
                    el.getAttribute('title') || el.getAttribute('placeholder') || '')
                   .replace(/\\s+/g, ' ').trim().slice(0, 90);
     el.setAttribute('data-cu-idx', String(i));
+    const kind = el.tagName === 'INPUT' && el.type && el.type !== 'text' ? '[' + el.type + ']' : '';
     out.push({
       i: i++,
-      tag: el.tagName.toLowerCase(),
+      tag: el.tagName.toLowerCase() + kind,
       label,
       x: Math.round(r.left + r.width / 2),
       y: Math.round(r.top + r.height / 2),
@@ -1083,13 +1087,403 @@ async function unmarkTab(tabId) {
   }
 }
 
+// ── reading, settling, credentials, site rules ──────────────────────────────
+
+const sleep = (ms) => new Promise((resume) => setTimeout(resume, ms));
+
+/**
+ * Wait for the page to react to an action before snapshotting it for
+ * `return_state`: a short pause for handlers to run, then — if the action
+ * started a navigation — until the tab finishes loading (bounded).
+ */
+async function settle(tabId, pauseMs = 350, loadBudgetMs = 8000) {
+  await sleep(pauseMs);
+  const deadline = Date.now() + loadBudgetMs;
+  while (Date.now() < deadline) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab || tab.status !== "loading") return;
+    await sleep(150);
+  }
+}
+
+/** Attach a fresh snapshot to an action's result when the caller asked for one. */
+async function withState(p, result) {
+  if (p.returnState !== true) return result;
+  await settle(p.tabId);
+  return { ...result, snapshot: await snapshot(p.tabId) };
+}
+
+/**
+ * The page's readable text, run inside the page. Headings are marked with `#`
+ * so the model can see the structure; everything else is innerText, which
+ * respects CSS visibility and includes content scrolled out of view.
+ */
+function readPageInPage(includeLinks) {
+  const root = document.body;
+  const out = { title: document.title, url: location.href, text: "", links: [] };
+  if (!root) return out;
+  const heads = new Map();
+  for (const h of root.querySelectorAll("h1,h2,h3,h4,h5,h6")) {
+    const t = (h.innerText || "").replace(/\s+/g, " ").trim();
+    if (t && !heads.has(t)) heads.set(t, Number(h.tagName[1]));
+  }
+  const lines = [];
+  for (const raw of (root.innerText || "").split("\n")) {
+    const line = raw.replace(/[ \t ]+/g, " ").trim();
+    if (!line) {
+      if (lines.length && lines[lines.length - 1] !== "") lines.push("");
+      continue;
+    }
+    const level = heads.get(line);
+    lines.push(level ? "#".repeat(level) + " " + line : line);
+  }
+  out.text = lines.join("\n").trim();
+  if (includeLinks) {
+    const seen = new Set();
+    for (const a of root.querySelectorAll("a[href]")) {
+      const href = a.href;
+      if (!/^https?:/.test(href) || seen.has(href)) continue;
+      const label = (a.innerText || a.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim().slice(0, 90);
+      if (!label) continue;
+      seen.add(href);
+      out.links.push({ text: label, href });
+      if (out.links.length >= 150) break;
+    }
+  }
+  return out;
+}
+
+/**
+ * Keep the lines that mention `query`, each with its neighbours and the
+ * nearest heading above it, so a match still says which section it is from.
+ */
+function focusText(text, query) {
+  const needle = query.trim().toLowerCase();
+  const lines = text.split("\n");
+  const keep = new Set();
+  let matches = 0;
+  lines.forEach((line, index) => {
+    if (!line.toLowerCase().includes(needle)) return;
+    matches++;
+    for (let j = index - 1; j <= index + 1; j++) if (j >= 0 && j < lines.length) keep.add(j);
+    for (let j = index - 1; j >= 0; j--) {
+      if (lines[j].startsWith("#")) {
+        keep.add(j);
+        break;
+      }
+    }
+  });
+  const out = [];
+  let last = -2;
+  for (const index of [...keep].sort((a, b) => a - b)) {
+    if (index !== last + 1 && out.length) out.push("…");
+    if (lines[index] !== "" || (out.length && out[out.length - 1] !== "…")) out.push(lines[index]);
+    last = index;
+  }
+  return { text: out.join("\n").trim(), matches };
+}
+
+const READ_DEFAULT_CHARS = 20000;
+const READ_MAX_CHARS = 200000;
+
+async function readPage(tabId, { query, maxChars, offset, includeLinks } = {}) {
+  const res = await send(tabId, "Runtime.evaluate", {
+    expression: `(${readPageInPage.toString()})(${includeLinks === true})`,
+    returnByValue: true,
+  });
+  if (res?.exceptionDetails) throw new Error(res.exceptionDetails.text || "could not read the page");
+  const page = res.result.value || {};
+  let text = page.text || "";
+  let matches;
+  if (typeof query === "string" && query.trim()) {
+    ({ text, matches } = focusText(text, query));
+  }
+  const limit = Math.min(Math.max(Number.isInteger(maxChars) ? maxChars : READ_DEFAULT_CHARS, 1), READ_MAX_CHARS);
+  const start = Math.min(Math.max(Number.isInteger(offset) ? offset : 0, 0), text.length);
+  const end = Math.min(start + limit, text.length);
+  return {
+    title: page.title,
+    url: page.url,
+    text: text.slice(start, end),
+    offset: start,
+    end,
+    total: text.length,
+    ...(matches === undefined ? {} : { matches }),
+    ...(includeLinks === true ? { links: page.links || [] } : {}),
+  };
+}
+
+// Site rules. The server reads the user's policy file and passes its `sites`
+// rules with every call; this side enforces them because only the extension
+// knows which page a tab is on at the moment of the action.
+
+/** Most specific matching rule for a URL: "allow", "ask" or "block". */
+function siteRule(rules, url) {
+  if (!Array.isArray(rules) || rules.length === 0) return "allow";
+  let host;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "allow";
+    host = parsed.hostname.toLowerCase();
+  } catch {
+    return "allow";
+  }
+  let best = null;
+  for (const entry of rules) {
+    if (!entry || typeof entry.pattern !== "string") continue;
+    const pattern = entry.pattern.trim().toLowerCase().replace(/^\*\./, "");
+    const matches = pattern === "*" || host === pattern || host.endsWith("." + pattern);
+    if (!matches) continue;
+    const specificity = pattern === "*" ? 0 : pattern.length;
+    if (!best || specificity > best.specificity) best = { rule: entry.rule, specificity };
+  }
+  return best && ["allow", "ask", "block"].includes(best.rule) ? best.rule : "allow";
+}
+
+function originOf(url) {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return String(url);
+  }
+}
+
+/** clientId → origins the user approved for that task, for "ask" rules. */
+const approvedOrigins = new Map();
+
+async function checkSite(clientId, url, rules, action) {
+  const rule = siteRule(rules, url);
+  if (rule === "allow") return;
+  const origin = originOf(url);
+  if (rule === "block") {
+    throw new Error(`${origin} is blocked by the user's Computer Use policy — do not try to reach it another way`);
+  }
+  if (approvedOrigins.get(clientId)?.has(origin)) return;
+  const answer = await askUser({ kind: "approve", origin, action });
+  if (answer.approved !== true) {
+    throw new Error(
+      answer.timedOut
+        ? `the user did not answer the request to use ${origin}; ask them in the conversation before retrying`
+        : `the user declined to let the agent use ${origin}`,
+    );
+  }
+  if (!approvedOrigins.has(clientId)) approvedOrigins.set(clientId, new Set());
+  approvedOrigins.get(clientId).add(origin);
+}
+
+/** Check the page a tab is showing right now, for commands that act on a tab. */
+async function checkTab(clientId, tabId, rules, action) {
+  if (!Array.isArray(rules) || rules.length === 0) return;
+  const tab = await chrome.tabs.get(tabId);
+  await checkSite(clientId, tab.pendingUrl || tab.url || "", rules, action);
+}
+
+// Prompts the user answers in a small extension window: approving a site under
+// an "ask" rule, and typing credentials the model must never see. The window
+// shows the origin Chrome reports for the tab, not anything the model wrote.
+
+const PROMPT_PAGE = "prompt.html";
+const PROMPT_TIMEOUT_MS = 120000;
+/** promptId → { spec, resolve, windowId, timer } */
+const prompts = new Map();
+let nextPromptId = 1;
+
+function finishPrompt(id, answer) {
+  const entry = prompts.get(id);
+  if (!entry) return;
+  prompts.delete(id);
+  clearTimeout(entry.timer);
+  if (entry.windowId !== null) chrome.windows?.remove(entry.windowId).catch(() => {});
+  entry.resolve(answer);
+}
+
+async function askUser(spec, timeoutMs = PROMPT_TIMEOUT_MS) {
+  const id = String(nextPromptId++);
+  const answer = new Promise((resolve) => {
+    prompts.set(id, { spec, resolve, windowId: null, timer: null });
+  });
+  const entry = prompts.get(id);
+  entry.timer = setTimeout(() => finishPrompt(id, { timedOut: true }), timeoutMs);
+  try {
+    // A first guess; the page grows its window to fit once it has rendered.
+    const height = spec.kind === "credentials" ? 330 + 64 * (spec.fields?.length ?? 1) : 300;
+    const win = await chrome.windows.create({
+      url: chrome.runtime.getURL(`${PROMPT_PAGE}#${id}`),
+      type: "popup",
+      width: 440,
+      height: Math.min(height, 720),
+      focused: true,
+    });
+    if (prompts.has(id)) entry.windowId = win?.id ?? null;
+    else if (win?.id !== undefined) chrome.windows.remove(win.id).catch(() => {});
+  } catch (error) {
+    finishPrompt(id, { failed: String(error?.message ?? error) });
+  }
+  return answer;
+}
+
+chrome.windows?.onRemoved?.addListener((windowId) => {
+  for (const [id, entry] of prompts) {
+    if (entry.windowId === windowId) finishPrompt(id, { cancelled: true });
+  }
+});
+
+// Only the extension's own prompt page may read or answer a prompt. A content
+// script runs inside a web page, and its sender.url is that page.
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || typeof msg.type !== "string" || !msg.type.startsWith("cu-prompt-")) return;
+  if (!String(sender?.url ?? "").startsWith(chrome.runtime.getURL(PROMPT_PAGE))) return;
+  const entry = prompts.get(String(msg.id));
+  if (msg.type === "cu-prompt-init") {
+    sendResponse(entry ? entry.spec : null);
+    return;
+  }
+  if (!entry) return;
+  if (msg.type === "cu-prompt-answer") {
+    if (entry.spec.kind === "credentials" && msg.approved === true) {
+      const values = {};
+      for (const field of entry.spec.fields) {
+        const value = msg.values?.[field.index];
+        if (typeof value === "string") values[field.index] = value;
+      }
+      finishPrompt(String(msg.id), { approved: true, values });
+    } else {
+      finishPrompt(String(msg.id), { approved: msg.approved === true, cancelled: msg.approved !== true });
+    }
+  }
+});
+
+/** Describe snapshot elements by index, inside the page, for the credential prompt. */
+function describeFieldsInPage(indices) {
+  return indices.map((index) => {
+    const el = document.querySelector(`[data-cu-idx="${index}"]`);
+    if (!el) return { index, found: false };
+    const byId = el.id ? document.querySelector(`label[for="${CSS.escape(el.id)}"]`) : null;
+    const label = (el.getAttribute("aria-label") || byId?.innerText || el.closest("label")?.innerText ||
+      el.getAttribute("placeholder") || el.getAttribute("name") || el.getAttribute("autocomplete") || "")
+      .replace(/\s+/g, " ").trim().slice(0, 60);
+    const editable = el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable;
+    return { index, found: true, editable, type: el.tagName === "INPUT" ? el.type : el.tagName.toLowerCase(), label };
+  });
+}
+
+/**
+ * Put values into snapshot elements the way typing would, so frameworks that
+ * listen for input events (React, Vue) see the change. Runs inside the page.
+ */
+function fillFieldsInPage(entries) {
+  const filled = [];
+  const missing = [];
+  for (const { index, value } of entries) {
+    const el = document.querySelector(`[data-cu-idx="${index}"]`);
+    if (!el) {
+      missing.push(index);
+      continue;
+    }
+    el.focus();
+    if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") {
+      const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), "value")?.set;
+      if (setter) setter.call(el, value);
+      else el.value = value;
+    } else if (el.isContentEditable) {
+      el.textContent = value;
+    } else {
+      missing.push(index);
+      continue;
+    }
+    el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    filled.push(index);
+  }
+  return { filled, missing };
+}
+
+const CREDENTIAL_KINDS = ["username", "email", "password", "code", "text"];
+const CREDENTIAL_TIMEOUT_MS = 180000;
+const CREDENTIAL_MAX_TIMEOUT_MS = 600000;
+
+async function requestCredentials(clientId, p) {
+  const fields = Array.isArray(p.fields) ? p.fields : [];
+  if (fields.length === 0 || fields.length > 6) {
+    throw new Error("fields must list 1 to 6 inputs by their browser_snapshot index");
+  }
+  const indices = fields.map((field) => field?.index);
+  if (!indices.every((index) => Number.isInteger(index) && index >= 0)) {
+    throw new Error("each field needs an index from browser_snapshot");
+  }
+  if (new Set(indices).size !== indices.length) throw new Error("each field index may appear once");
+  const tab = await chrome.tabs.get(p.tabId);
+  const url = tab.url || "";
+  const described = await send(p.tabId, "Runtime.evaluate", {
+    expression: `(${describeFieldsInPage.toString()})(${JSON.stringify(indices)})`,
+    returnByValue: true,
+  });
+  if (described?.exceptionDetails) throw new Error("could not inspect the page's fields");
+  const info = described.result.value || [];
+  const lost = info.filter((field) => !field.found).map((field) => field.index);
+  if (lost.length) throw new Error(`element ${lost.join(", ")} is no longer on the page — call browser_snapshot again`);
+  const readOnly = info.filter((field) => !field.editable).map((field) => field.index);
+  if (readOnly.length) throw new Error(`element ${readOnly.join(", ")} is not a text field`);
+  const spec = {
+    kind: "credentials",
+    origin: originOf(url),
+    secure: url.startsWith("https:") || /^http:\/\/(localhost|127\.0\.0\.1)(:|\/)/.test(url),
+    reason: typeof p.reason === "string" ? p.reason.slice(0, 300) : "",
+    fields: fields.map((field, position) => {
+      const page = info[position];
+      const kind = CREDENTIAL_KINDS.includes(field.kind)
+        ? field.kind
+        : page.type === "password" ? "password" : page.type === "email" ? "email" : "text";
+      return { index: field.index, kind, label: page.label, pageType: page.type };
+    }),
+  };
+  const timeout = Math.min(
+    Math.max(Number.isFinite(p.timeoutMs) ? p.timeoutMs : CREDENTIAL_TIMEOUT_MS, 10000),
+    CREDENTIAL_MAX_TIMEOUT_MS,
+  );
+  const answer = await askUser(spec, timeout);
+  if (answer.approved !== true) {
+    return {
+      origin: spec.origin,
+      cancelled: answer.cancelled === true,
+      timedOut: answer.timedOut === true,
+      failed: answer.failed,
+    };
+  }
+  // The page may have navigated while the user typed. Never fill a different site.
+  const now = await chrome.tabs.get(p.tabId);
+  if (originOf(now.url || "") !== spec.origin) {
+    throw new Error(`the tab left ${spec.origin} while the user was typing; nothing was filled`);
+  }
+  const entries = spec.fields
+    .filter((field) => typeof answer.values[field.index] === "string")
+    .map((field) => ({ index: field.index, value: answer.values[field.index] }));
+  const res = await send(p.tabId, "Runtime.evaluate", {
+    expression: `(${fillFieldsInPage.toString()})(${JSON.stringify(entries)})`,
+    returnByValue: true,
+    userGesture: true,
+  });
+  if (res?.exceptionDetails) throw new Error("could not fill the fields");
+  await markTab(p.tabId);
+  const outcome = res.result.value || { filled: [], missing: [] };
+  return { origin: spec.origin, filled: outcome.filled, missing: outcome.missing };
+}
+
 // ── dispatch ────────────────────────────────────────────────────────────────
 
 const handlers = {
   ping: async () => ({ pong: true }),
-  open_tab: async (p) => openTab(requireClientId(p), p.url),
+  open_tab: async (p) => {
+    const clientId = requireClientId(p);
+    if (p.url) await checkSite(clientId, p.url, p.sites, "open");
+    return openTab(clientId, p.url);
+  },
   list_tabs: async (p) => listTabs(requireClientId(p), p.all === true),
-  use_tab: async (p) => adoptTab(requireClientId(p), p.tabId),
+  use_tab: async (p) => {
+    const clientId = requireClientId(p);
+    await checkTab(clientId, p.tabId, p.sites, "take over");
+    return adoptTab(clientId, p.tabId);
+  },
   release_tab: async (p) => releaseTab(requireClientId(p), p.tabId),
   select_tab: async (p) => {
     const clientId = requireClientId(p);
@@ -1123,28 +1517,53 @@ const handlers = {
     return { closed: p.tabId };
   },
   navigate: async (p) => {
-    assertOwned(requireClientId(p), p.tabId);
-    return navigate(p.tabId, p.url);
+    const clientId = requireClientId(p);
+    assertOwned(clientId, p.tabId);
+    await checkSite(clientId, p.url, p.sites, "open");
+    return withState(p, await navigate(p.tabId, p.url));
   },
   snapshot: async (p) => {
-    assertOwned(requireClientId(p), p.tabId);
+    const clientId = requireClientId(p);
+    assertOwned(clientId, p.tabId);
+    await checkTab(clientId, p.tabId, p.sites, "read");
     return snapshot(p.tabId);
   },
+  read: async (p) => {
+    const clientId = requireClientId(p);
+    assertOwned(clientId, p.tabId);
+    await checkTab(clientId, p.tabId, p.sites, "read");
+    return readPage(p.tabId, { query: p.query, maxChars: p.maxChars, offset: p.offset, includeLinks: p.includeLinks });
+  },
   click: async (p) => {
-    assertOwned(requireClientId(p), p.tabId);
-    return p.index !== undefined ? clickElement(p.tabId, p.index) : clickAt(p.tabId, p.x, p.y);
+    const clientId = requireClientId(p);
+    assertOwned(clientId, p.tabId);
+    await checkTab(clientId, p.tabId, p.sites, "click in");
+    const result = p.index !== undefined ? await clickElement(p.tabId, p.index) : await clickAt(p.tabId, p.x, p.y);
+    return withState(p, result);
   },
   type: async (p) => {
-    assertOwned(requireClientId(p), p.tabId);
-    return typeText(p.tabId, p.text);
+    const clientId = requireClientId(p);
+    assertOwned(clientId, p.tabId);
+    await checkTab(clientId, p.tabId, p.sites, "type in");
+    return withState(p, await typeText(p.tabId, p.text));
   },
   press: async (p) => {
-    assertOwned(requireClientId(p), p.tabId);
-    return pressKey(p.tabId, p.key);
+    const clientId = requireClientId(p);
+    assertOwned(clientId, p.tabId);
+    await checkTab(clientId, p.tabId, p.sites, "press keys in");
+    return withState(p, await pressKey(p.tabId, p.key));
   },
   screenshot: async (p) => {
-    assertOwned(requireClientId(p), p.tabId);
+    const clientId = requireClientId(p);
+    assertOwned(clientId, p.tabId);
+    await checkTab(clientId, p.tabId, p.sites, "look at");
     return screenshot(p.tabId);
+  },
+  request_credentials: async (p) => {
+    const clientId = requireClientId(p);
+    assertOwned(clientId, p.tabId);
+    await checkTab(clientId, p.tabId, p.sites, "sign in to");
+    return requestCredentials(clientId, p);
   },
 };
 
