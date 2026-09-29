@@ -177,6 +177,10 @@ const chromeArgs = [
   "--no-default-browser-check",
   "--disable-features=DisableLoadExtensionCommandLineSwitch",
   argv.includes("--headed") ? "--window-position=40,40" : "--headless=new",
+  // Ubuntu 23.10+ blocks the unprivileged user namespaces Chrome's sandbox
+  // needs ("No usable sandbox"). This browser only ever loads the local test
+  // site, so running it unsandboxed is fine.
+  ...(os.platform() === "linux" ? ["--no-sandbox"] : []),
   "about:blank",
 ];
 const chrome = spawn(chromeBinary, chromeArgs, { stdio: ["ignore", "ignore", "pipe"] });
