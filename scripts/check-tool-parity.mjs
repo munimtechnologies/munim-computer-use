@@ -15,7 +15,7 @@
 //
 // Usage: node scripts/check-tool-parity.mjs   (exit 1 on any mismatch)
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -29,7 +29,7 @@ const ALLOWED_EXTRAS = {
 
 // ---------------------------------------------------------------- tokenizer
 
-function tokenize(source) {
+export function tokenize(source) {
   const tokens = [];
   let i = 0;
   while (i < source.length) {
@@ -84,7 +84,7 @@ function tokenize(source) {
 
 // ------------------------------------------------------------------- parser
 
-function parseLiteral(source) {
+export function parseLiteral(source) {
   const tokens = tokenize(source);
   let pos = 0;
   const peek = () => tokens[pos];
@@ -198,7 +198,7 @@ function balanced(source, open) {
   throw new Error("unbalanced literal");
 }
 
-function extract(source, marker, what) {
+export function extract(source, marker, what) {
   const at = source.indexOf(marker);
   if (at < 0) throw new Error(`could not find ${what} (${marker})`);
   return balanced(source, at + marker.length - 1);
@@ -250,11 +250,18 @@ function withoutExtras(tools, extras) {
   return copy;
 }
 
+export const SWIFT_MARKER = "let toolDefs: [[String: Any]] = [";
+export const RUST_MARKER = "json!([";
+export { swiftPath, rustPath };
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();
+
+function main() {
 const swiftSource = readFileSync(swiftPath, "utf8");
 const rustSource = readFileSync(rustPath, "utf8");
 
-const swiftTools = parseLiteral(extract(swiftSource, "let toolDefs: [[String: Any]] = [", "Swift toolDefs"));
-const rustTools = parseLiteral(extract(rustSource, "json!([", "Rust all_tool_defs"));
+const swiftTools = parseLiteral(extract(swiftSource, SWIFT_MARKER, "Swift toolDefs"));
+const rustTools = parseLiteral(extract(rustSource, RUST_MARKER, "Rust all_tool_defs"));
 
 const problems = [];
 const swiftNames = swiftTools.map((tool) => tool.name);
@@ -289,3 +296,4 @@ if (problems.length) {
   process.exit(1);
 }
 console.log(`Tool parity OK: ${swiftNames.length} tools, identical in order, text and schema (allowed extras: get_app_state.window on macOS, screenshot.format on Windows/Linux).`);
+}
