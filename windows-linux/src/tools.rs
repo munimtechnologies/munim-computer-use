@@ -24,7 +24,7 @@ pub fn browser_control_enabled() -> bool {
 }
 
 /// Returned in the `initialize` result; identical in the Swift server.
-pub const SERVER_INSTRUCTIONS: &str = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf.";
+pub const SERVER_INSTRUCTIONS: &str = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Pass return_state on an action to get the updated state back in the same call instead of reading again. Use browser_read to read a page's text. Never ask for, or type, a password or code yourself: browser_request_credentials lets the user enter it without you seeing it. The user's Computer Use policy can block apps and sites or require their approval; when a call says so, do not work around it. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf.";
 
 pub fn tool_defs() -> Value {
     let Value::Array(defs) = all_tool_defs() else {
@@ -78,7 +78,7 @@ fn all_tool_defs() -> Value {
                 "properties": {
                     "app": {
                         "type": "string",
-                        "description": "App name, bundle id, or pid exactly as reported by list_apps"
+                        "description": "App name, bundle id, or pid exactly as reported by list_apps, or \"frontmost\" for the app the user is looking at"
                     },
                     "max_depth": {
                         "type": "integer",
@@ -124,6 +124,14 @@ fn all_tool_defs() -> Value {
                     "click_count": {
                         "type": "integer",
                         "description": "1 for a single click (default), 2 for a double-click"
+                    },
+                    "return_state": {
+                        "type": "boolean",
+                        "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
+                    },
+                    "state_query": {
+                        "type": "string",
+                        "description": "With return_state, list only elements whose role, label or value contains this text, like get_app_state's query"
                     }
                 }
             },
@@ -148,6 +156,14 @@ fn all_tool_defs() -> Value {
                     "element_id": {
                         "type": "string",
                         "description": "Element to focus before typing, from get_app_state. Omit to type into whatever currently has focus."
+                    },
+                    "return_state": {
+                        "type": "boolean",
+                        "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
+                    },
+                    "state_query": {
+                        "type": "string",
+                        "description": "With return_state, list only elements whose role, label or value contains this text, like get_app_state's query"
                     }
                 },
                 "required": ["text"]
@@ -176,6 +192,14 @@ fn all_tool_defs() -> Value {
                             "type": "string"
                         },
                         "description": "Modifier keys to hold while pressing: any of cmd, shift, alt, ctrl, fn. cmd maps to the Windows/Super key off macOS."
+                    },
+                    "return_state": {
+                        "type": "boolean",
+                        "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
+                    },
+                    "state_query": {
+                        "type": "string",
+                        "description": "With return_state, list only elements whose role, label or value contains this text, like get_app_state's query"
                     }
                 },
                 "required": ["key"]
@@ -214,6 +238,14 @@ fn all_tool_defs() -> Value {
                     "y": {
                         "type": "number",
                         "description": "Screen y to scroll over. Remote control only: the pointer moves there first. Ignored otherwise."
+                    },
+                    "return_state": {
+                        "type": "boolean",
+                        "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
+                    },
+                    "state_query": {
+                        "type": "string",
+                        "description": "With return_state, list only elements whose role, label or value contains this text, like get_app_state's query"
                     }
                 }
             },
@@ -254,7 +286,7 @@ fn all_tool_defs() -> Value {
                 "properties": {
                     "app": {
                         "type": "string",
-                        "description": "App name, bundle id, or pid exactly as reported by list_apps. Captures that app's largest window. Provide either app or display."
+                        "description": "App name, bundle id, or pid exactly as reported by list_apps. Captures that app's largest window. Provide either app or display, or \"frontmost\" for the app the user is looking at"
                     },
                     "display": {
                         "type": "integer",
@@ -311,6 +343,14 @@ fn all_tool_defs() -> Value {
                     "y": {
                         "type": "number",
                         "description": "Screen y coordinate in points, used together with x when no element_id is given"
+                    },
+                    "return_state": {
+                        "type": "boolean",
+                        "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
+                    },
+                    "state_query": {
+                        "type": "string",
+                        "description": "With return_state, list only elements whose role, label or value contains this text, like get_app_state's query"
                     }
                 }
             },
@@ -351,6 +391,14 @@ fn all_tool_defs() -> Value {
                     "to_y": {
                         "type": "number",
                         "description": "Screen y to release at, used with to_x when no to_element_id is given"
+                    },
+                    "return_state": {
+                        "type": "boolean",
+                        "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
+                    },
+                    "state_query": {
+                        "type": "string",
+                        "description": "With return_state, list only elements whose role, label or value contains this text, like get_app_state's query"
                     }
                 }
             },
@@ -375,6 +423,14 @@ fn all_tool_defs() -> Value {
                     "value": {
                         "type": "string",
                         "description": "New complete value for the field"
+                    },
+                    "return_state": {
+                        "type": "boolean",
+                        "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
+                    },
+                    "state_query": {
+                        "type": "string",
+                        "description": "With return_state, list only elements whose role, label or value contains this text, like get_app_state's query"
                     }
                 },
                 "required": ["element_id", "value"]
@@ -441,6 +497,14 @@ fn all_tool_defs() -> Value {
                     "y": {
                         "type": "number",
                         "description": "Screen y coordinate in points, used together with x when no element_id is given"
+                    },
+                    "return_state": {
+                        "type": "boolean",
+                        "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
+                    },
+                    "state_query": {
+                        "type": "string",
+                        "description": "With return_state, list only elements whose role, label or value contains this text, like get_app_state's query"
                     }
                 }
             },
@@ -489,6 +553,14 @@ fn all_tool_defs() -> Value {
                     "length": {
                         "type": "integer",
                         "description": "Number of characters to select (default: through the end of the value)"
+                    },
+                    "return_state": {
+                        "type": "boolean",
+                        "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
+                    },
+                    "state_query": {
+                        "type": "string",
+                        "description": "With return_state, list only elements whose role, label or value contains this text, like get_app_state's query"
                     }
                 },
                 "required": ["element_id"]
@@ -710,7 +782,7 @@ fn all_tool_defs() -> Value {
         },
         {
             "name": "browser_snapshot",
-            "description": "List the interactive elements (links, buttons, inputs) on the page in one of the agent's tabs, with the index each one has for browser_click, plus the page title and URL. Works on a background tab, so the user can be looking at something else. Use it before every browser_click, because indices change when the page changes. Read-only.",
+            "description": "List the interactive elements (links, buttons, inputs) on the page in one of the agent's tabs, with the index each one has for browser_click, plus the page title and URL. Inputs show their type, such as input[password]. Works on a background tab, so the user can be looking at something else. Use it before every browser_click, because indices change when the page changes; use browser_read for the page's text. Read-only.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -729,6 +801,49 @@ fn all_tool_defs() -> Value {
             },
             "annotations": {
                 "title": "Snapshot page elements",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true
+            }
+        },
+        {
+            "name": "browser_read",
+            "description": "Read the text of the page in one of the agent's tabs: headings marked with #, then paragraphs, lists and table text in reading order, including content scrolled out of view. Use it to read an article, results or documentation; use browser_snapshot to find something to click. Works on a background tab. Long pages come back in chunks: the result says where it stopped, and offset continues from there. Read-only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session."
+                    },
+                    "tab_id": {
+                        "type": "integer",
+                        "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs"
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Only return lines containing this text (case-insensitive), each with its neighbouring lines and the heading above it"
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Characters to return (default 20000, at most 200000)"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Character offset to start from, to continue a page that was cut off (default 0)"
+                    },
+                    "include_links": {
+                        "type": "boolean",
+                        "description": "Also list the page's links as text and URL (up to 150)"
+                    }
+                },
+                "required": ["tab_id"]
+            },
+            "annotations": {
+                "title": "Read page text",
                 "readOnlyHint": true,
                 "destructiveHint": false,
                 "idempotentHint": true,
@@ -762,6 +877,10 @@ fn all_tool_defs() -> Value {
                     "y": {
                         "type": "number",
                         "description": "Page y coordinate in CSS pixels, used together with x when no index is given"
+                    },
+                    "return_state": {
+                        "type": "boolean",
+                        "description": "After acting, wait for the page to settle (and finish loading, if the action navigated) and append a fresh browser_snapshot of this tab, so you can pick the next index in the same call. Its indices replace earlier ones."
                     }
                 },
                 "required": ["tab_id"]
@@ -793,6 +912,10 @@ fn all_tool_defs() -> Value {
                     "text": {
                         "type": "string",
                         "description": "Exact text to type into the focused field"
+                    },
+                    "return_state": {
+                        "type": "boolean",
+                        "description": "After acting, wait for the page to settle (and finish loading, if the action navigated) and append a fresh browser_snapshot of this tab, so you can pick the next index in the same call. Its indices replace earlier ones."
                     }
                 },
                 "required": ["tab_id", "text"]
@@ -803,6 +926,60 @@ fn all_tool_defs() -> Value {
                 "destructiveHint": true,
                 "idempotentHint": false,
                 "openWorldHint": false
+            }
+        },
+        {
+            "name": "browser_request_credentials",
+            "description": "Ask the user to sign in on the page in one of the agent's tabs without the values passing through you. Chrome shows the user a small window naming the site's real origin, with one field per input you list; what they type goes straight into those inputs and is never returned to you. Use it for passwords, verification codes and any secret instead of browser_type, and never ask the user to paste a secret into the conversation. Take the input indices from browser_snapshot (password inputs show as input[password]), then click the page's sign-in button yourself. Waits until the user answers, cancels, or the time runs out.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session."
+                    },
+                    "tab_id": {
+                        "type": "integer",
+                        "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs"
+                    },
+                    "fields": {
+                        "type": "array",
+                        "description": "The inputs to fill, in the order the user should see them (1 to 6)",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "index": {
+                                    "type": "integer",
+                                    "description": "Input index from the latest browser_snapshot of this tab"
+                                },
+                                "kind": {
+                                    "type": "string",
+                                    "enum": ["username", "email", "password", "code", "text"],
+                                    "description": "What the user is asked for; inferred from the input's type when omitted"
+                                }
+                            },
+                            "required": ["index"]
+                        }
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "One sentence the user sees explaining why you need to sign in"
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "How long to wait for the user (default 180, at most 600)"
+                    }
+                },
+                "required": ["tab_id", "fields"]
+            },
+            "annotations": {
+                "title": "Ask the user to sign in",
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": true
             }
         },
         {
@@ -825,6 +1002,10 @@ fn all_tool_defs() -> Value {
                         "type": "string",
                         "enum": ["Enter", "Tab", "Escape", "Backspace"],
                         "description": "Key to press"
+                    },
+                    "return_state": {
+                        "type": "boolean",
+                        "description": "After acting, wait for the page to settle (and finish loading, if the action navigated) and append a fresh browser_snapshot of this tab, so you can pick the next index in the same call. Its indices replace earlier ones."
                     }
                 },
                 "required": ["tab_id", "key"]
@@ -878,6 +1059,10 @@ fn all_tool_defs() -> Value {
                     "url": {
                         "type": "string",
                         "description": "Absolute URL to load in the tab"
+                    },
+                    "return_state": {
+                        "type": "boolean",
+                        "description": "After acting, wait for the page to settle (and finish loading, if the action navigated) and append a fresh browser_snapshot of this tab, so you can pick the next index in the same call. Its indices replace earlier ones."
                     }
                 },
                 "required": ["tab_id", "url"]
@@ -897,7 +1082,7 @@ fn all_tool_defs() -> Value {
 mod tests {
     use super::{all_tool_defs, tool_defs};
 
-    /// The macOS server advertises exactly these 30 tools. Drifting apart would
+    /// The macOS server advertises exactly these 32 tools. Drifting apart would
     /// silently give a model different capabilities per platform.
     #[test]
     fn advertises_the_macos_tool_surface() {
@@ -909,7 +1094,7 @@ mod tests {
             .map(|tool| tool["name"].as_str().expect("tool has a name"))
             .collect();
 
-        assert_eq!(names.len(), 30, "tool count drifted from the macOS server");
+        assert_eq!(names.len(), 32, "tool count drifted from the macOS server");
         for expected in [
             "list_apps",
             "get_app_state",
@@ -936,8 +1121,10 @@ mod tests {
             "browser_select_tab",
             "browser_close_tab",
             "browser_snapshot",
+            "browser_read",
             "browser_click",
             "browser_type",
+            "browser_request_credentials",
             "browser_press_key",
             "browser_close_all_tabs",
             "browser_navigate",

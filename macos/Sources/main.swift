@@ -152,6 +152,11 @@ func resolveApp(_ query: String) -> ResolvedApp? {
     guard !trimmed.isEmpty else { return nil }
     let running = NSWorkspace.shared.runningApplications
     let lowered = trimmed.lowercased()
+    // "frontmost" is the app the user is looking at.
+    if lowered == "frontmost" {
+        guard let front = NSWorkspace.shared.frontmostApplication else { return nil }
+        return ResolvedApp(app: front, note: "frontmost app: \(front.localizedName ?? "?")")
+    }
 
     var matches: [NSRunningApplication]
     if let pid = Int32(trimmed), running.contains(where: { $0.processIdentifier == pid }) {
@@ -941,9 +946,24 @@ func clampedMaxWidth(_ args: [String: Any]) -> Int {
     min(max((args["max_width"] as? Int) ?? 1400, 0), 8000)
 }
 
+/// The arguments of the latest successful get_app_state, which `return_state`
+/// repeats after an action: element ids only ever come from that snapshot, so
+/// it is the app the action was aimed at. Pinned to the pid it resolved to.
+var lastAppStateArgs: [String: Any]?
+
+/// Tools that act on an app and accept `return_state`.
+let statefulActions: Set<String> = [
+    "click", "type_text", "press_key", "scroll", "right_click", "drag", "set_value", "hover", "select_text",
+]
+
 func toolGetAppState(_ args: [String: Any]) -> String {
     guard let query = args["app"] as? String else { return "error: missing required argument 'app'" }
     guard let resolved = resolveApp(query) else { return "error: no running app matching \(query)" }
+    if let refusal = PolicyStore.checkApp(resolved.app) { return refusal }
+    var remembered = args
+    remembered["app"] = String(resolved.app.processIdentifier)
+    remembered["query"] = nil
+    lastAppStateArgs = remembered
 
     let app = resolved.app
     // Same bounds as the Rust server: a huge depth or budget can walk an
@@ -1286,6 +1306,7 @@ func toolScroll(_ args: [String: Any]) -> String {
 func toolActivateApp(_ args: [String: Any]) -> String {
     guard let query = args["app"] as? String else { return "error: missing required argument 'app'" }
     guard let resolved = resolveApp(query) else { return "error: no running app matching \(query)" }
+    if let refusal = PolicyStore.checkApp(resolved.app) { return refusal }
     // Requests are handled off the main thread; NSRunningApplication.activate is
     // AppKit and belongs on main.
     DispatchQueue.main.sync { resolved.app.activate(options: []) }
@@ -2323,7 +2344,45 @@ enum Chrome {
 func browserSessionCall(_ command: String, _ params: [String: Any] = [:], args: [String: Any]) -> BridgeOutcome {
     var params = params
     if let session = args["session_id"] { params["sessionId"] = session }
-    return BrowserBridge.shared.call(command, params)
+    // The extension enforces the user's site rules, because only it knows
+    // which page a tab is on at the moment of the action.
+    let policy = PolicyStore.current()
+    if let error = policy.error { return .failure("\(error) — fix it before using the browser") }
+    if policy.hasSiteRules { params["sites"] = policy.sitesPayload }
+    return BrowserBridge.shared.call(command, params, timeout: browserCallTimeout(command, args, sitesAsk: policy.sitesAsk))
+}
+
+/// Default wait for a user answering browser_request_credentials, and the cap.
+let credentialWaitSeconds = 180
+let credentialMaxWaitSeconds = 600
+/// Headroom over the extension's own waits, so it answers before we give up.
+let promptGrace: TimeInterval = 15
+
+/// How long to wait for the extension. Anything that can put a prompt in front
+/// of the user, or wait for a page to load, needs longer than a plain command.
+func browserCallTimeout(_ command: String, _ args: [String: Any], sitesAsk: Bool) -> TimeInterval {
+    var timeout: TimeInterval = 20
+    if command == "request_credentials" {
+        timeout = TimeInterval(min(max((args["timeout_seconds"] as? Int) ?? credentialWaitSeconds, 10), credentialMaxWaitSeconds)) + promptGrace
+    }
+    // The extension's site approval prompt waits up to two minutes.
+    if sitesAsk { timeout = max(timeout, 120 + promptGrace) }
+    if args["return_state"] as? Bool == true { timeout += 10 }
+    return timeout
+}
+
+/// `return_state` for browser actions: ask the extension for a fresh snapshot.
+func withReturnState(_ params: [String: Any], _ args: [String: Any]) -> [String: Any] {
+    var params = params
+    if args["return_state"] as? Bool == true { params["returnState"] = true }
+    return params
+}
+
+/// The line for an action, plus the page as it stands after it when the
+/// extension sent one back (return_state).
+func withPageAfter(_ line: String, _ payload: [String: Any]) -> String {
+    guard let snapshot = payload["snapshot"] as? [String: Any] else { return line }
+    return line + "\n\npage after the action (earlier indices are no longer valid):\n" + describeSnapshot(snapshot)
 }
 
 func toolBrowserOpenTab(_ args: [String: Any]) -> String {
@@ -2335,6 +2394,13 @@ func toolBrowserOpenTab(_ args: [String: Any]) -> String {
         return bridgeText(browserSessionCall("open_tab", ["url": url], args: args)) { payload in
             "opened \(url) in the agent tab group (tab_id=\(payload["tabId"] as? Int ?? -1))"
         }
+    }
+    // Site rules are enforced by the extension; the accessibility fallback
+    // cannot tell which page a window ends up on, so it must not run under them.
+    let policy = PolicyStore.current()
+    if let error = policy.error { return "error: \(error) — fix it before using the browser" }
+    if policy.hasSiteRules {
+        return "error: the user's Computer Use policy has site rules, which need the Chrome extension — ask the user to install it (see chrome-extension in the README)"
     }
     return Chrome.preservingFocus {
         switch Chrome.ensureAgentWindow() {
@@ -2467,19 +2533,91 @@ func bridgeText(_ result: BridgeOutcome, _ describe: ([String: Any]) -> String) 
     }
 }
 
+func describeSnapshot(_ payload: [String: Any]) -> String {
+    let elements = payload["elements"] as? [[String: Any]] ?? []
+    var lines = ["\(payload["title"] as? String ?? "?")  [\(payload["url"] as? String ?? "")]"]
+    for element in elements {
+        let index = element["i"] as? Int ?? -1
+        let tag = element["tag"] as? String ?? "?"
+        let label = element["label"] as? String ?? ""
+        let offscreen = (element["inView"] as? Bool == false) ? "  (scrolled out of view)" : ""
+        lines.append("  [\(index)] \(tag)\(label.isEmpty ? "" : " \"\(label)\"")\(offscreen)")
+    }
+    return lines.joined(separator: "\n")
+}
+
 func toolBrowserSnapshot(_ args: [String: Any]) -> String {
     guard let tabId = args["tab_id"] as? Int else { return "error: missing required argument 'tab_id'" }
-    return bridgeText(browserSessionCall("snapshot", ["tabId": tabId], args: args)) { payload in
-        let elements = payload["elements"] as? [[String: Any]] ?? []
-        var lines = ["\(payload["title"] as? String ?? "?")  [\(payload["url"] as? String ?? "")]"]
-        for element in elements {
-            let index = element["i"] as? Int ?? -1
-            let tag = element["tag"] as? String ?? "?"
-            let label = element["label"] as? String ?? ""
-            let offscreen = (element["inView"] as? Bool == false) ? "  (scrolled out of view)" : ""
-            lines.append("  [\(index)] \(tag)\(label.isEmpty ? "" : " \"\(label)\"")\(offscreen)")
+    return bridgeText(browserSessionCall("snapshot", ["tabId": tabId], args: args), describeSnapshot)
+}
+
+/// browser_read: the page text, and where to continue if it was cut off.
+func describeRead(_ payload: [String: Any]) -> String {
+    let text = payload["text"] as? String ?? ""
+    let total = payload["total"] as? Int ?? 0
+    let offset = payload["offset"] as? Int ?? 0
+    let end = payload["end"] as? Int ?? total
+    var out = "\(payload["title"] as? String ?? "?")  [\(payload["url"] as? String ?? "")]"
+    if let matches = payload["matches"] as? Int {
+        out += "\n\(matches) matching line\(matches == 1 ? "" : "s")"
+    }
+    out += "\n\n" + (text.isEmpty && total == 0 ? "(no readable text on this page)" : text)
+    if offset > 0 || end < total {
+        out += "\n\n… showing characters \(offset)–\(end) of \(total)"
+        if end < total { out += "; call browser_read again with offset=\(end) for more" }
+    }
+    if let links = payload["links"] as? [[String: Any]] {
+        out += "\n\nlinks (\(links.count)):"
+        for link in links {
+            out += "\n  \(link["text"] as? String ?? "")  [\(link["href"] as? String ?? "")]"
         }
-        return lines.joined(separator: "\n")
+    }
+    return out
+}
+
+func toolBrowserRead(_ args: [String: Any]) -> String {
+    guard let tabId = args["tab_id"] as? Int else { return "error: missing required argument 'tab_id'" }
+    var params: [String: Any] = ["tabId": tabId]
+    if let query = args["query"] as? String { params["query"] = query }
+    if let maxChars = args["max_chars"] as? Int { params["maxChars"] = maxChars }
+    if let offset = args["offset"] as? Int { params["offset"] = offset }
+    if let links = args["include_links"] as? Bool { params["includeLinks"] = links }
+    return bridgeText(browserSessionCall("read", params, args: args), describeRead)
+}
+
+/// browser_request_credentials: what happened, never what was typed.
+func describeCredentials(_ payload: [String: Any], tabId: Int) -> String {
+    let origin = payload["origin"] as? String ?? "the site"
+    if payload["timedOut"] as? Bool == true {
+        return "the user did not answer the sign-in prompt for \(origin) in time; nothing was filled"
+    }
+    if payload["cancelled"] as? Bool == true {
+        return "the user cancelled the sign-in prompt for \(origin); nothing was filled"
+    }
+    if let reason = payload["failed"] as? String { return "error: could not show the sign-in prompt: \(reason)" }
+    let filled = (payload["filled"] as? [Int] ?? []).map(String.init)
+    let missing = (payload["missing"] as? [Int] ?? []).map(String.init)
+    var line = "the user filled \(filled.count) field\(filled.count == 1 ? "" : "s") on \(origin) in tab \(tabId) "
+        + "(index \(filled.joined(separator: ", "))); the values are not shown to you. "
+        + "Submit the form yourself, for example by clicking its sign-in button."
+    if !missing.isEmpty {
+        line += " Index \(missing.joined(separator: ", ")) had left the page and was not filled."
+    }
+    return line
+}
+
+func toolBrowserRequestCredentials(_ args: [String: Any]) -> String {
+    guard let tabId = args["tab_id"] as? Int else { return "error: missing required argument 'tab_id'" }
+    guard let fields = args["fields"] as? [[String: Any]] else {
+        return "error: missing required argument 'fields' — list the inputs by browser_snapshot index"
+    }
+    var params: [String: Any] = ["tabId": tabId, "fields": fields]
+    if let reason = args["reason"] as? String { params["reason"] = reason }
+    if let seconds = args["timeout_seconds"] as? Int {
+        params["timeoutMs"] = min(max(seconds, 10), credentialMaxWaitSeconds) * 1000
+    }
+    return bridgeText(browserSessionCall("request_credentials", params, args: args)) { payload in
+        describeCredentials(payload, tabId: tabId)
     }
 }
 
@@ -2497,7 +2635,7 @@ func toolBrowserClick(_ args: [String: Any]) -> String {
     // The Chrome extension paints the same agent pointer into the page. Keep
     // that as the source of truth for tab clicks — background tabs are not
     // composited, so a desktop overlay at guessed screen coords would lie.
-    return bridgeText(browserSessionCall("click", params, args: args)) { payload in
+    return bridgeText(browserSessionCall("click", withReturnState(params, args), args: args)) { payload in
         var line = "clicked in tab \(tabId)"
         if let cursor = payload["cursor"] as? [String: Any] {
             if cursor["ok"] as? Bool == true {
@@ -2508,23 +2646,23 @@ func toolBrowserClick(_ args: [String: Any]) -> String {
                 line += " (pointer missing: \(reason))"
             }
         }
-        return line
+        return withPageAfter(line, payload)
     }
 }
 
 func toolBrowserType(_ args: [String: Any]) -> String {
     guard let tabId = args["tab_id"] as? Int else { return "error: missing required argument 'tab_id'" }
     guard let text = args["text"] as? String else { return "error: missing required argument 'text'" }
-    return bridgeText(browserSessionCall("type", ["tabId": tabId, "text": text], args: args)) { _ in
-        "typed \(text.count) characters into tab \(tabId)"
+    return bridgeText(browserSessionCall("type", withReturnState(["tabId": tabId, "text": text], args), args: args)) { payload in
+        withPageAfter("typed \(text.count) characters into tab \(tabId)", payload)
     }
 }
 
 func toolBrowserPressKey(_ args: [String: Any]) -> String {
     guard let tabId = args["tab_id"] as? Int else { return "error: missing required argument 'tab_id'" }
     guard let key = args["key"] as? String else { return "error: missing required argument 'key'" }
-    return bridgeText(browserSessionCall("press", ["tabId": tabId, "key": key], args: args)) { _ in
-        "pressed \(key) in tab \(tabId)"
+    return bridgeText(browserSessionCall("press", withReturnState(["tabId": tabId, "key": key], args), args: args)) { payload in
+        withPageAfter("pressed \(key) in tab \(tabId)", payload)
     }
 }
 
@@ -2545,8 +2683,8 @@ func toolBrowserCloseAllTabs(_ args: [String: Any]) -> String {
 func toolBrowserNavigate(_ args: [String: Any]) -> String {
     guard let tabId = args["tab_id"] as? Int else { return "error: missing required argument 'tab_id'" }
     guard let url = args["url"] as? String else { return "error: missing required argument 'url'" }
-    return bridgeText(browserSessionCall("navigate", ["tabId": tabId, "url": url], args: args)) { _ in
-        "navigated tab \(tabId) to \(url)"
+    return bridgeText(browserSessionCall("navigate", withReturnState(["tabId": tabId, "url": url], args), args: args)) { payload in
+        withPageAfter("navigated tab \(tabId) to \(url)", payload)
     }
 }
 
@@ -2672,7 +2810,7 @@ let toolDefs: [[String: Any]] = [
             "properties": [
                 "app": [
                     "type": "string",
-                    "description": "App name, bundle id, or pid exactly as reported by list_apps",
+                    "description": "App name, bundle id, or pid exactly as reported by list_apps, or \"frontmost\" for the app the user is looking at",
                 ],
                 "max_depth": [
                     "type": "integer",
@@ -2723,6 +2861,14 @@ let toolDefs: [[String: Any]] = [
                     "type": "integer",
                     "description": "1 for a single click (default), 2 for a double-click",
                 ],
+                "return_state": [
+                    "type": "boolean",
+                    "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
+                ],
+                "state_query": [
+                    "type": "string",
+                    "description": "With return_state, list only elements whose role, label or value contains this text, like get_app_state's query",
+                ],
             ],
         ],
         "annotations": [
@@ -2746,6 +2892,14 @@ let toolDefs: [[String: Any]] = [
                 "element_id": [
                     "type": "string",
                     "description": "Element to focus before typing, from get_app_state. Omit to type into whatever currently has focus.",
+                ],
+                "return_state": [
+                    "type": "boolean",
+                    "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
+                ],
+                "state_query": [
+                    "type": "string",
+                    "description": "With return_state, list only elements whose role, label or value contains this text, like get_app_state's query",
                 ],
             ],
             "required": ["text"],
@@ -2774,6 +2928,14 @@ let toolDefs: [[String: Any]] = [
                         "type": "string",
                     ],
                     "description": "Modifier keys to hold while pressing: any of cmd, shift, alt, ctrl, fn. cmd maps to the Windows/Super key off macOS.",
+                ],
+                "return_state": [
+                    "type": "boolean",
+                    "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
+                ],
+                "state_query": [
+                    "type": "string",
+                    "description": "With return_state, list only elements whose role, label or value contains this text, like get_app_state's query",
                 ],
             ],
             "required": ["key"],
@@ -2812,6 +2974,14 @@ let toolDefs: [[String: Any]] = [
                 "y": [
                     "type": "number",
                     "description": "Screen y to scroll over. Remote control only: the pointer moves there first. Ignored otherwise.",
+                ],
+                "return_state": [
+                    "type": "boolean",
+                    "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
+                ],
+                "state_query": [
+                    "type": "string",
+                    "description": "With return_state, list only elements whose role, label or value contains this text, like get_app_state's query",
                 ],
             ],
         ],
@@ -2852,7 +3022,7 @@ let toolDefs: [[String: Any]] = [
             "properties": [
                 "app": [
                     "type": "string",
-                    "description": "App name, bundle id, or pid exactly as reported by list_apps. Captures that app's largest window. Provide either app or display.",
+                    "description": "App name, bundle id, or pid exactly as reported by list_apps. Captures that app's largest window. Provide either app or display, or \"frontmost\" for the app the user is looking at",
                 ],
                 "display": [
                     "type": "integer",
@@ -2905,6 +3075,14 @@ let toolDefs: [[String: Any]] = [
                     "type": "number",
                     "description": "Screen y coordinate in points, used together with x when no element_id is given",
                 ],
+                "return_state": [
+                    "type": "boolean",
+                    "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
+                ],
+                "state_query": [
+                    "type": "string",
+                    "description": "With return_state, list only elements whose role, label or value contains this text, like get_app_state's query",
+                ],
             ],
         ],
         "annotations": [
@@ -2945,6 +3123,14 @@ let toolDefs: [[String: Any]] = [
                     "type": "number",
                     "description": "Screen y to release at, used with to_x when no to_element_id is given",
                 ],
+                "return_state": [
+                    "type": "boolean",
+                    "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
+                ],
+                "state_query": [
+                    "type": "string",
+                    "description": "With return_state, list only elements whose role, label or value contains this text, like get_app_state's query",
+                ],
             ],
         ],
         "annotations": [
@@ -2968,6 +3154,14 @@ let toolDefs: [[String: Any]] = [
                 "value": [
                     "type": "string",
                     "description": "New complete value for the field",
+                ],
+                "return_state": [
+                    "type": "boolean",
+                    "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
+                ],
+                "state_query": [
+                    "type": "string",
+                    "description": "With return_state, list only elements whose role, label or value contains this text, like get_app_state's query",
                 ],
             ],
             "required": ["element_id", "value"],
@@ -3035,6 +3229,14 @@ let toolDefs: [[String: Any]] = [
                     "type": "number",
                     "description": "Screen y coordinate in points, used together with x when no element_id is given",
                 ],
+                "return_state": [
+                    "type": "boolean",
+                    "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
+                ],
+                "state_query": [
+                    "type": "string",
+                    "description": "With return_state, list only elements whose role, label or value contains this text, like get_app_state's query",
+                ],
             ],
         ],
         "annotations": [
@@ -3082,6 +3284,14 @@ let toolDefs: [[String: Any]] = [
                 "length": [
                     "type": "integer",
                     "description": "Number of characters to select (default: through the end of the value)",
+                ],
+                "return_state": [
+                    "type": "boolean",
+                    "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
+                ],
+                "state_query": [
+                    "type": "string",
+                    "description": "With return_state, list only elements whose role, label or value contains this text, like get_app_state's query",
                 ],
             ],
             "required": ["element_id"],
@@ -3303,7 +3513,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "browser_snapshot",
-        "description": "List the interactive elements (links, buttons, inputs) on the page in one of the agent's tabs, with the index each one has for browser_click, plus the page title and URL. Works on a background tab, so the user can be looking at something else. Use it before every browser_click, because indices change when the page changes. Read-only.",
+        "description": "List the interactive elements (links, buttons, inputs) on the page in one of the agent's tabs, with the index each one has for browser_click, plus the page title and URL. Inputs show their type, such as input[password]. Works on a background tab, so the user can be looking at something else. Use it before every browser_click, because indices change when the page changes; use browser_read for the page's text. Read-only.",
         "inputSchema": [
             "type": "object",
             "properties": [
@@ -3322,6 +3532,49 @@ let toolDefs: [[String: Any]] = [
         ],
         "annotations": [
             "title": "Snapshot page elements",
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": true,
+        ],
+    ],
+    [
+        "name": "browser_read",
+        "description": "Read the text of the page in one of the agent's tabs: headings marked with #, then paragraphs, lists and table text in reading order, including content scrolled out of view. Use it to read an article, results or documentation; use browser_snapshot to find something to click. Works on a background tab. Long pages come back in chunks: the result says where it stopped, and offset continues from there. Read-only.",
+        "inputSchema": [
+            "type": "object",
+            "properties": [
+                "session_id": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session.",
+                ],
+                "tab_id": [
+                    "type": "integer",
+                    "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs",
+                ],
+                "query": [
+                    "type": "string",
+                    "description": "Only return lines containing this text (case-insensitive), each with its neighbouring lines and the heading above it",
+                ],
+                "max_chars": [
+                    "type": "integer",
+                    "description": "Characters to return (default 20000, at most 200000)",
+                ],
+                "offset": [
+                    "type": "integer",
+                    "description": "Character offset to start from, to continue a page that was cut off (default 0)",
+                ],
+                "include_links": [
+                    "type": "boolean",
+                    "description": "Also list the page's links as text and URL (up to 150)",
+                ],
+            ],
+            "required": ["tab_id"],
+        ],
+        "annotations": [
+            "title": "Read page text",
             "readOnlyHint": true,
             "destructiveHint": false,
             "idempotentHint": true,
@@ -3356,6 +3609,10 @@ let toolDefs: [[String: Any]] = [
                     "type": "number",
                     "description": "Page y coordinate in CSS pixels, used together with x when no index is given",
                 ],
+                "return_state": [
+                    "type": "boolean",
+                    "description": "After acting, wait for the page to settle (and finish loading, if the action navigated) and append a fresh browser_snapshot of this tab, so you can pick the next index in the same call. Its indices replace earlier ones.",
+                ],
             ],
             "required": ["tab_id"],
         ],
@@ -3387,6 +3644,10 @@ let toolDefs: [[String: Any]] = [
                     "type": "string",
                     "description": "Exact text to type into the focused field",
                 ],
+                "return_state": [
+                    "type": "boolean",
+                    "description": "After acting, wait for the page to settle (and finish loading, if the action navigated) and append a fresh browser_snapshot of this tab, so you can pick the next index in the same call. Its indices replace earlier ones.",
+                ],
             ],
             "required": ["tab_id", "text"],
         ],
@@ -3396,6 +3657,60 @@ let toolDefs: [[String: Any]] = [
             "destructiveHint": true,
             "idempotentHint": false,
             "openWorldHint": false,
+        ],
+    ],
+    [
+        "name": "browser_request_credentials",
+        "description": "Ask the user to sign in on the page in one of the agent's tabs without the values passing through you. Chrome shows the user a small window naming the site's real origin, with one field per input you list; what they type goes straight into those inputs and is never returned to you. Use it for passwords, verification codes and any secret instead of browser_type, and never ask the user to paste a secret into the conversation. Take the input indices from browser_snapshot (password inputs show as input[password]), then click the page's sign-in button yourself. Waits until the user answers, cancels, or the time runs out.",
+        "inputSchema": [
+            "type": "object",
+            "properties": [
+                "session_id": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session.",
+                ],
+                "tab_id": [
+                    "type": "integer",
+                    "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs",
+                ],
+                "fields": [
+                    "type": "array",
+                    "description": "The inputs to fill, in the order the user should see them (1 to 6)",
+                    "items": [
+                        "type": "object",
+                        "properties": [
+                            "index": [
+                                "type": "integer",
+                                "description": "Input index from the latest browser_snapshot of this tab",
+                            ],
+                            "kind": [
+                                "type": "string",
+                                "enum": ["username", "email", "password", "code", "text"],
+                                "description": "What the user is asked for; inferred from the input's type when omitted",
+                            ],
+                        ],
+                        "required": ["index"],
+                    ],
+                ],
+                "reason": [
+                    "type": "string",
+                    "description": "One sentence the user sees explaining why you need to sign in",
+                ],
+                "timeout_seconds": [
+                    "type": "integer",
+                    "description": "How long to wait for the user (default 180, at most 600)",
+                ],
+            ],
+            "required": ["tab_id", "fields"],
+        ],
+        "annotations": [
+            "title": "Ask the user to sign in",
+            "readOnlyHint": false,
+            "destructiveHint": false,
+            "idempotentHint": false,
+            "openWorldHint": true,
         ],
     ],
     [
@@ -3418,6 +3733,10 @@ let toolDefs: [[String: Any]] = [
                     "type": "string",
                     "enum": ["Enter", "Tab", "Escape", "Backspace"],
                     "description": "Key to press",
+                ],
+                "return_state": [
+                    "type": "boolean",
+                    "description": "After acting, wait for the page to settle (and finish loading, if the action navigated) and append a fresh browser_snapshot of this tab, so you can pick the next index in the same call. Its indices replace earlier ones.",
                 ],
             ],
             "required": ["tab_id", "key"],
@@ -3472,6 +3791,10 @@ let toolDefs: [[String: Any]] = [
                     "type": "string",
                     "description": "Absolute URL to load in the tab",
                 ],
+                "return_state": [
+                    "type": "boolean",
+                    "description": "After acting, wait for the page to settle (and finish loading, if the action navigated) and append a fresh browser_snapshot of this tab, so you can pick the next index in the same call. Its indices replace earlier ones.",
+                ],
             ],
             "required": ["tab_id", "url"],
         ],
@@ -3515,7 +3838,7 @@ func negotiatedProtocolVersion(_ params: [String: Any]) -> String {
 }
 
 /// Returned in the `initialize` result; identical in the Rust server.
-let serverInstructions = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf."
+let serverInstructions = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Pass return_state on an action to get the updated state back in the same call instead of reading again. Use browser_read to read a page's text. Never ask for, or type, a password or code yourself: browser_request_credentials lets the user enter it without you seeing it. The user's Computer Use policy can block apps and sites or require their approval; when a call says so, do not work around it. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf."
 
 // MARK: - Clipboard
 
@@ -3541,7 +3864,26 @@ func toolClipboardWrite(_ args: [String: Any]) -> String {
     return "copied \(text.count) characters to the clipboard, replacing what was there"
 }
 
+/// Pause between an action and the snapshot `return_state` takes, so the app
+/// has handled the input and redrawn before it is read.
+let returnStateSettle: useconds_t = 300_000
+
 func dispatch(_ name: String, _ args: [String: Any]) -> String {
+    let out = dispatchTool(name, args)
+    guard statefulActions.contains(name), args["return_state"] as? Bool == true, !out.hasPrefix("error:") else {
+        return out
+    }
+    guard var again = lastAppStateArgs else {
+        return out + "\n\n(return_state: no app has been read yet — call get_app_state first)"
+    }
+    usleep(returnStateSettle)
+    if let query = args["state_query"] as? String { again["query"] = query }
+    let state = toolGetAppState(again)
+    if state.hasPrefix("error:") { return out + "\n\n(return_state: could not read the app again: \(state))" }
+    return out + "\n\nstate after the action (earlier ids are no longer valid):\n" + state
+}
+
+func dispatchTool(_ name: String, _ args: [String: Any]) -> String {
     if name.hasPrefix("browser_"), !browserControlEnabled {
         return "error: browser control is disabled in Computer Use settings"
     }
@@ -3583,8 +3925,10 @@ func dispatch(_ name: String, _ args: [String: Any]) -> String {
     case "browser_select_tab": return toolBrowserSelectTab(args)
     case "browser_close_tab": return toolBrowserCloseTab(args)
     case "browser_snapshot": return toolBrowserSnapshot(args)
+    case "browser_read": return toolBrowserRead(args)
     case "browser_click": return toolBrowserClick(args)
     case "browser_type": return toolBrowserType(args)
+    case "browser_request_credentials": return toolBrowserRequestCredentials(args)
     case "browser_press_key": return toolBrowserPressKey(args)
     case "browser_navigate": return toolBrowserNavigate(args)
     case "browser_close_all_tabs": return toolBrowserCloseAllTabs(args)
@@ -3850,6 +4194,10 @@ while let line = readLine(strippingNewline: true) {
                     respond(id: id, result: textResult(
                         "error: no running app matching \(args["app"] as? String ?? "<missing app argument>")",
                         isError: true))
+                    break
+                }
+                if let refusal = PolicyStore.checkApp(resolved.app) {
+                    respond(id: id, result: textResult(refusal, isError: true))
                     break
                 }
                 let maxWidth = clampedMaxWidth(args)

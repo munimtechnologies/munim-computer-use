@@ -9,6 +9,9 @@
 //! stdio transport expects. stdout carries protocol only; anything diagnostic
 //! goes to stderr so it cannot corrupt a response.
 
+// The tool list is one `json!` literal (see tools.rs); it outgrew the default.
+#![recursion_limit = "512"]
+
 mod apps;
 mod browser;
 mod capture;
@@ -20,6 +23,7 @@ mod install;
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 mod keys;
 mod platform;
+mod policy;
 mod tools;
 
 use std::io::{self, BufRead, Write};
@@ -491,6 +495,93 @@ fn filter_app_state(outline: &str, query: &str) -> String {
     out
 }
 
+/// The app and limits of the latest `get_app_state`, which `return_state`
+/// reads again after an action: element ids only ever come from that snapshot,
+/// so it is the app the action was aimed at.
+struct LastRead {
+    app: String,
+    max_depth: usize,
+    max_elements: usize,
+}
+
+static LAST_READ: std::sync::Mutex<Option<LastRead>> = std::sync::Mutex::new(None);
+
+/// Tools that act on an app and accept `return_state`.
+const STATEFUL_ACTIONS: [&str; 9] = [
+    "click",
+    "type_text",
+    "press_key",
+    "scroll",
+    "right_click",
+    "drag",
+    "set_value",
+    "hover",
+    "select_text",
+];
+
+/// Pause between an action and the snapshot `return_state` takes, so the app
+/// has handled the input and redrawn before it is read.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// `frontmost` names the app the user is looking at; anything else passes through.
+fn resolve_app_query(app: &str) -> Result<String, DesktopError> {
+    if !app.trim().eq_ignore_ascii_case("frontmost") {
+        return Ok(app.to_string());
+    }
+    apps::list_apps()?
+        .into_iter()
+        .find(|info| info.frontmost)
+        .map(|info| info.pid.to_string())
+        .ok_or_else(|| DesktopError::new("no app is frontmost right now — call list_apps and pass one by name"))
+}
+
+/// Apply the user's app rules before reading, capturing or activating an app.
+/// Enumerates windows only when there are rules to apply.
+fn check_app_policy(desktop: &mut dyn Desktop, app: &str) -> Result<(), DesktopError> {
+    let current = policy::current();
+    if !current.has_app_rules() {
+        return Ok(());
+    }
+    let pid = desktop.resolve_pid(app)?;
+    match apps::list_apps().ok().and_then(|list| list.into_iter().find(|info| info.pid == pid)) {
+        Some(info) => policy::check_app(&info.name, &info.id),
+        None => policy::check_app(app, app),
+    }
+}
+
+fn read_app_state(
+    desktop: &mut dyn Desktop,
+    app: &str,
+    max_depth: usize,
+    max_elements: usize,
+    query: Option<&str>,
+) -> Result<String, DesktopError> {
+    let outline = desktop.get_app_state(app, max_depth, max_elements)?;
+    *LAST_READ.lock().unwrap_or_else(|poison| poison.into_inner()) =
+        Some(LastRead { app: app.to_string(), max_depth, max_elements });
+    Ok(match query {
+        Some(query) if !query.trim().is_empty() => filter_app_state(&outline, query),
+        _ => outline,
+    })
+}
+
+/// The text `return_state` appends after an action.
+fn state_after_action(desktop: &mut dyn Desktop, args: &Value) -> String {
+    let last = LAST_READ
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .as_ref()
+        .map(|last| (last.app.clone(), last.max_depth, last.max_elements));
+    let Some((app, max_depth, max_elements)) = last else {
+        return "\n\n(return_state: no app has been read yet — call get_app_state first)".to_string();
+    };
+    std::thread::sleep(SETTLE);
+    match read_app_state(desktop, &app, max_depth, max_elements, arg_str(args, "state_query")) {
+        Ok(outline) => format!("\n\nstate after the action (earlier ids are no longer valid):\n{outline}"),
+        Err(error) => format!("\n\n(return_state: could not read {app} again: {error})"),
+    }
+}
+
 fn run_desktop_tool(
     name: &str,
     args: &Value,
@@ -501,19 +592,19 @@ fn run_desktop_tool(
         "get_app_state" => {
             let app = arg_str(args, "app")
                 .ok_or_else(|| DesktopError::new("missing required argument 'app'"))?;
+            let app = resolve_app_query(app)?;
+            check_app_policy(desktop, &app)?;
             let max_depth = arg_i64(args, "max_depth").unwrap_or(18).clamp(1, 60) as usize;
             let max_elements = arg_i64(args, "max_elements").unwrap_or(800).clamp(1, 5000) as usize;
-            let outline = desktop.get_app_state(app, max_depth, max_elements)?;
-            match arg_str(args, "query") {
-                Some(query) if !query.trim().is_empty() => filter_app_state(&outline, query),
-                _ => outline,
-            }
+            read_app_state(desktop, &app, max_depth, max_elements, arg_str(args, "query"))?
         }
         "hover" => desktop.hover(point_from(args, "element_id", "x", "y")?)?,
         "activate_app" => {
             let app = arg_str(args, "app")
                 .ok_or_else(|| DesktopError::new("missing required argument 'app'"))?;
-            desktop.activate_app(app)?
+            let app = resolve_app_query(app)?;
+            check_app_policy(desktop, &app)?;
+            desktop.activate_app(&app)?
         }
         "click" => {
             let count = arg_i64(args, "click_count").unwrap_or(1).clamp(1, 3) as u32;
@@ -601,7 +692,9 @@ fn run_desktop_tool(
             let app = arg_str(args, "app").ok_or_else(|| {
                 DesktopError::new("provide 'app' to capture a window, or 'display' for a whole screen")
             })?;
-            let pid = desktop.resolve_pid(app)?;
+            let app = resolve_app_query(app)?;
+            check_app_policy(desktop, &app)?;
+            let pid = desktop.resolve_pid(&app)?;
             let (capture, title) = capture::capture_app_window(pid, max_width, format)?;
             let text = capture::mapping_text(&capture, &format!("window of {app} \"{title}\""));
             return Ok(image_result(capture.bytes, format.mime_type(), text));
@@ -609,6 +702,11 @@ fn run_desktop_tool(
         other => {
             return Err(DesktopError::new(format!("unknown tool '{other}'")));
         }
+    };
+    let text = if STATEFUL_ACTIONS.contains(&name) && args.get("return_state").and_then(Value::as_bool) == Some(true) {
+        text + &state_after_action(desktop, args)
+    } else {
+        text
     };
     Ok(text_result(text, false))
 }
@@ -702,6 +800,68 @@ mod tests {
         assert_eq!(result["serverInfo"]["name"], json!("mt-desktop"));
         assert_eq!(result["serverInfo"]["title"], json!("Munim Computer Use"));
         assert!(result["instructions"].as_str().is_some_and(|text| text.contains("get_app_state")));
+    }
+
+    /// A backend that records calls and returns a fixed outline.
+    #[derive(Default)]
+    struct FakeDesktop {
+        reads: usize,
+    }
+
+    impl crate::platform::Desktop for FakeDesktop {
+        fn list_apps(&mut self) -> crate::platform::Result<String> {
+            Ok("Fake  [fake]  pid=1  windows=1  FRONTMOST".into())
+        }
+        fn get_app_state(&mut self, app: &str, _: usize, _: usize) -> crate::platform::Result<String> {
+            self.reads += 1;
+            Ok(format!("{app} [fake] pid=1\n\n── window 0: \"Main\"\n  [e1] Button \"Save\"\n  [e2] Button \"Cancel {}\"", self.reads))
+        }
+        fn activate_app(&mut self, _: &str) -> crate::platform::Result<String> { Ok("activated".into()) }
+        fn click(&mut self, _: Point, _: u32) -> crate::platform::Result<String> { Ok("clicked e1".into()) }
+        fn right_click(&mut self, _: Point) -> crate::platform::Result<String> { Ok("right-clicked".into()) }
+        fn hover(&mut self, _: Point) -> crate::platform::Result<String> { Ok("hovered".into()) }
+        fn drag(&mut self, _: Point, _: Point) -> crate::platform::Result<String> { Ok("dragged".into()) }
+        fn type_text(&mut self, _: &str, _: Option<u32>) -> crate::platform::Result<String> { Ok("typed".into()) }
+        fn press_key(&mut self, _: &str, _: &[String]) -> crate::platform::Result<String> { Ok("pressed".into()) }
+        fn scroll(&mut self, _: crate::platform::ScrollDirection, _: i32, _: Option<u32>) -> crate::platform::Result<String> {
+            Ok("scrolled".into())
+        }
+        fn set_value(&mut self, _: u32, _: &str) -> crate::platform::Result<String> { Ok("set".into()) }
+        fn select_text(&mut self, _: u32, _: usize, _: Option<usize>) -> crate::platform::Result<String> { Ok("selected".into()) }
+        fn resolve_pid(&mut self, _: &str) -> crate::platform::Result<u32> { Ok(1) }
+    }
+
+    fn text_of(value: &serde_json::Value) -> String {
+        value["content"][0]["text"].as_str().unwrap_or_default().to_string()
+    }
+
+    // One test, because return_state reads the process-wide "last app read".
+    #[test]
+    fn return_state_appends_a_fresh_read_of_the_last_app() {
+        let mut desktop = FakeDesktop::default();
+        *super::LAST_READ.lock().unwrap() = None;
+
+        let before = super::run_desktop_tool("click", &json!({ "element_id": "e1", "return_state": true }), &mut desktop).unwrap();
+        assert!(text_of(&before).contains("call get_app_state first"), "{}", text_of(&before));
+
+        super::run_desktop_tool("get_app_state", &json!({ "app": "Fake" }), &mut desktop).unwrap();
+        let plain = super::run_desktop_tool("click", &json!({ "element_id": "e1" }), &mut desktop).unwrap();
+        assert_eq!(text_of(&plain), "clicked e1", "no state unless asked");
+        assert_eq!(desktop.reads, 1);
+
+        let after = super::run_desktop_tool("type_text", &json!({ "text": "hi", "return_state": true }), &mut desktop).unwrap();
+        let text = text_of(&after);
+        assert!(text.starts_with("typed\n\nstate after the action"), "{text}");
+        assert!(text.contains("Cancel 2"), "a fresh read, not the old one: {text}");
+
+        let filtered = super::run_desktop_tool(
+            "click",
+            &json!({ "element_id": "e1", "return_state": true, "state_query": "save" }),
+            &mut desktop,
+        )
+        .unwrap();
+        let text = text_of(&filtered);
+        assert!(text.contains("[e1] Button \"Save\"") && !text.contains("Cancel"), "{text}");
     }
 
     #[test]

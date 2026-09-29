@@ -295,8 +295,20 @@ impl BrowserBridge {
         }
 
         let command = if command == "press_key" { "press" } else { command };
-        let params = self.params_for(command, args)?;
-        let result = self.dispatch(command, params)?;
+        let mut params = self.params_for(command, args)?;
+        // The extension enforces the user's site rules, because only it knows
+        // which page a tab is on at the moment of the action.
+        let policy = crate::policy::current();
+        if let Some(error) = policy.error() {
+            return Err(format!("{error} — fix it before using the browser"));
+        }
+        if policy.has_site_rules()
+            && let Some(map) = params.as_object_mut()
+        {
+            map.insert("sites".into(), policy.sites_json());
+        }
+        let timeout = call_timeout(command, args, policy.sites_ask());
+        let result = self.dispatch_with_timeout(command, params, timeout)?;
         Ok(describe(command, &result, args))
     }
 
@@ -343,12 +355,16 @@ impl BrowserBridge {
     }
 
     fn dispatch(&mut self, command: &str, params: Value) -> Result<Value, String> {
+        self.dispatch_with_timeout(command, params, CALL_TIMEOUT)
+    }
+
+    fn dispatch_with_timeout(&mut self, command: &str, params: Value, timeout: Duration) -> Result<Value, String> {
         let mut params = params;
         if let Some(map) = params.as_object_mut() {
             map.entry("clientId".to_string())
                 .or_insert_with(|| json!(self.client_id.clone()));
         }
-        self.hub.call(command, params, CALL_TIMEOUT)
+        self.hub.call(command, params, timeout)
     }
 }
 
@@ -603,6 +619,34 @@ fn serve_peer(hub: &Hub, stream: Stream) {
     }
 }
 
+/// Default wait for a user answering browser_request_credentials, and the cap.
+const CREDENTIAL_WAIT_SECS: u64 = 180;
+const CREDENTIAL_MAX_WAIT_SECS: u64 = 600;
+/// Headroom over the extension's own waits, so it answers before we give up.
+const PROMPT_GRACE: Duration = Duration::from_secs(15);
+
+/// How long to wait for the extension. Anything that can put a prompt in front
+/// of the user, or wait for a page to load, needs longer than a plain command.
+fn call_timeout(command: &str, args: &Value, sites_ask: bool) -> Duration {
+    let mut timeout = CALL_TIMEOUT;
+    if command == "request_credentials" {
+        let wait = args
+            .get("timeout_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(CREDENTIAL_WAIT_SECS)
+            .clamp(10, CREDENTIAL_MAX_WAIT_SECS);
+        timeout = Duration::from_secs(wait) + PROMPT_GRACE;
+    }
+    if sites_ask {
+        // The extension's site approval prompt waits up to two minutes.
+        timeout = timeout.max(Duration::from_secs(120) + PROMPT_GRACE);
+    }
+    if args.get("return_state").and_then(Value::as_bool) == Some(true) {
+        timeout += Duration::from_secs(10);
+    }
+    timeout
+}
+
 /// Translate tool arguments into the extension's parameter names.
 fn normalise(_command: &str, args: &Value) -> Value {
     let mut params = json!({});
@@ -613,10 +657,18 @@ fn normalise(_command: &str, args: &Value) -> Value {
     if let Some(session) = args.get("session_id").filter(|v| !v.is_null()) {
         map.insert("sessionId".into(), session.clone());
     }
-    for key in ["url", "text", "key", "index", "x", "y", "all"] {
+    for key in ["url", "text", "key", "index", "x", "y", "all", "query", "offset", "fields", "reason"] {
         if let Some(value) = args.get(key) {
             map.insert(key.into(), value.clone());
         }
+    }
+    for (from, to) in [("max_chars", "maxChars"), ("include_links", "includeLinks"), ("return_state", "returnState")] {
+        if let Some(value) = args.get(from) {
+            map.insert(to.into(), value.clone());
+        }
+    }
+    if let Some(seconds) = args.get("timeout_seconds").and_then(Value::as_u64) {
+        map.insert("timeoutMs".into(), json!(seconds.clamp(10, CREDENTIAL_MAX_WAIT_SECS) * 1000));
     }
     // Keep `index` in the wire params for commands that still accept it; select_tab
     // / close_tab resolve index → tabId in `BrowserBridge::params_for` before dispatch.
@@ -670,6 +722,8 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
             format!("released tab {tab} back to the user")
         }
         "snapshot" => describe_snapshot(result),
+        "read" => describe_read(result),
+        "request_credentials" => describe_credentials(result, args),
         "close_all_tabs" => {
             let closed = result.get("closed").and_then(Value::as_i64).unwrap_or(0);
             let released = result.get("released").and_then(Value::as_i64).unwrap_or(0);
@@ -708,7 +762,7 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
             .or_else(|| args.get("tab_id").and_then(Value::as_i64))
             .or_else(|| args.get("index").and_then(Value::as_i64))
             .unwrap_or(-1);
-            match other {
+            let line = match other {
                 "click" => format!("clicked in tab {tab}"),
                 "type" => format!(
                     "typed {} characters into tab {tab}",
@@ -729,9 +783,88 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
                 }
                 "close_tab" => format!("closed tab {tab}"),
                 _ => format!("{other} ok"),
+            };
+            // return_state: the page as it stands after the action.
+            match result.get("snapshot") {
+                Some(snapshot) => format!(
+                    "{line}\n\npage after the action (earlier indices are no longer valid):\n{}",
+                    describe_snapshot(snapshot)
+                ),
+                None => line,
             }
         }
     }
+}
+
+/// browser_read: the page text, and where to continue if it was cut off.
+fn describe_read(result: &Value) -> String {
+    let text = result.get("text").and_then(Value::as_str).unwrap_or("");
+    let total = result.get("total").and_then(Value::as_u64).unwrap_or(0);
+    let offset = result.get("offset").and_then(Value::as_u64).unwrap_or(0);
+    let end = result.get("end").and_then(Value::as_u64).unwrap_or(total);
+    let mut out = format!(
+        "{}  [{}]",
+        result.get("title").and_then(Value::as_str).unwrap_or("?"),
+        result.get("url").and_then(Value::as_str).unwrap_or("")
+    );
+    if let Some(matches) = result.get("matches").and_then(Value::as_u64) {
+        out.push_str(&format!(
+            "\n{matches} matching line{}",
+            if matches == 1 { "" } else { "s" }
+        ));
+    }
+    out.push_str("\n\n");
+    out.push_str(if text.is_empty() && total == 0 { "(no readable text on this page)" } else { text });
+    if offset > 0 || end < total {
+        out.push_str(&format!("\n\n… showing characters {offset}–{end} of {total}"));
+        if end < total {
+            out.push_str(&format!("; call browser_read again with offset={end} for more"));
+        }
+    }
+    if let Some(links) = result.get("links").and_then(Value::as_array) {
+        out.push_str(&format!("\n\nlinks ({}):", links.len()));
+        for link in links {
+            out.push_str(&format!(
+                "\n  {}  [{}]",
+                link.get("text").and_then(Value::as_str).unwrap_or(""),
+                link.get("href").and_then(Value::as_str).unwrap_or("")
+            ));
+        }
+    }
+    out
+}
+
+/// browser_request_credentials: what happened, never what was typed.
+fn describe_credentials(result: &Value, args: &Value) -> String {
+    let origin = result.get("origin").and_then(Value::as_str).unwrap_or("the site");
+    if result.get("timedOut").and_then(Value::as_bool) == Some(true) {
+        return format!("the user did not answer the sign-in prompt for {origin} in time; nothing was filled");
+    }
+    if result.get("cancelled").and_then(Value::as_bool) == Some(true) {
+        return format!("the user cancelled the sign-in prompt for {origin}; nothing was filled");
+    }
+    if let Some(reason) = result.get("failed").and_then(Value::as_str) {
+        return format!("error: could not show the sign-in prompt: {reason}");
+    }
+    let ids = |key: &str| -> Vec<String> {
+        result
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|list| list.iter().filter_map(Value::as_i64).map(|index| index.to_string()).collect())
+            .unwrap_or_default()
+    };
+    let (filled, missing) = (ids("filled"), ids("missing"));
+    let tab = args.get("tab_id").and_then(Value::as_i64).unwrap_or(-1);
+    let mut line = format!(
+        "the user filled {} field{} on {origin} in tab {tab} (index {}); the values are not shown to you. Submit the form yourself, for example by clicking its sign-in button.",
+        filled.len(),
+        if filled.len() == 1 { "" } else { "s" },
+        filled.join(", ")
+    );
+    if !missing.is_empty() {
+        line.push_str(&format!(" Index {} had left the page and was not filled.", missing.join(", ")));
+    }
+    line
 }
 
 fn describe_tabs(result: &Value) -> String {
@@ -880,8 +1013,78 @@ pub fn run_native_host() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BrowserBridge, describe, describe_snapshot, describe_tabs, normalise};
+    use super::{BrowserBridge, call_timeout, describe, describe_snapshot, describe_tabs, normalise};
     use serde_json::json;
+    use std::time::Duration;
+
+    #[test]
+    fn read_shows_the_text_and_where_to_continue() {
+        let text = describe(
+            "read",
+            &json!({ "title": "Docs", "url": "https://d.example/", "text": "# Intro\nHello", "offset": 0, "end": 13, "total": 40 }),
+            &json!({ "tab_id": 3 }),
+        );
+        assert!(text.starts_with("Docs  [https://d.example/]"), "{text}");
+        assert!(text.contains("# Intro\nHello"), "{text}");
+        assert!(text.contains("offset=13"), "{text}");
+    }
+
+    #[test]
+    fn a_complete_read_does_not_offer_more() {
+        let text = describe(
+            "read",
+            &json!({ "title": "T", "url": "u", "text": "all", "offset": 0, "end": 3, "total": 3, "matches": 1, "links": [{ "text": "Home", "href": "https://h.example/" }] }),
+            &json!({}),
+        );
+        assert!(!text.contains("offset="), "{text}");
+        assert!(text.contains("1 matching line\n"), "{text}");
+        assert!(text.contains("Home  [https://h.example/]"), "{text}");
+    }
+
+    #[test]
+    fn credentials_report_what_happened_but_never_values() {
+        let args = json!({ "tab_id": 7, "fields": [{ "index": 2 }, { "index": 4 }] });
+        let filled = describe("request_credentials", &json!({ "origin": "https://a.example", "filled": [2, 4], "missing": [] }), &args);
+        assert!(filled.contains("filled 2 fields on https://a.example in tab 7"), "{filled}");
+        assert!(filled.contains("not shown to you"), "{filled}");
+        let cancelled = describe("request_credentials", &json!({ "origin": "https://a.example", "cancelled": true }), &args);
+        assert!(cancelled.contains("cancelled"), "{cancelled}");
+        let timed_out = describe("request_credentials", &json!({ "origin": "https://a.example", "timedOut": true }), &args);
+        assert!(timed_out.contains("did not answer"), "{timed_out}");
+    }
+
+    #[test]
+    fn an_action_with_return_state_carries_the_new_page() {
+        let text = describe(
+            "click",
+            &json!({ "snapshot": { "title": "Next", "url": "https://n.example/", "elements": [{ "i": 0, "tag": "button", "label": "Go", "inView": true }] } }),
+            &json!({ "tab_id": 5 }),
+        );
+        assert!(text.starts_with("clicked in tab 5"), "{text}");
+        assert!(text.contains("page after the action"), "{text}");
+        assert!(text.contains("[0] button \"Go\""), "{text}");
+    }
+
+    #[test]
+    fn new_arguments_reach_the_extension_under_its_names() {
+        let params = normalise(
+            "read",
+            &json!({ "tab_id": 1, "query": "price", "max_chars": 500, "offset": 20, "include_links": true, "return_state": true, "timeout_seconds": 99999 }),
+        );
+        assert_eq!(params["maxChars"], json!(500));
+        assert_eq!(params["includeLinks"], json!(true));
+        assert_eq!(params["returnState"], json!(true));
+        assert_eq!(params["query"], json!("price"));
+        assert_eq!(params["timeoutMs"], json!(600_000), "the wait is capped");
+    }
+
+    #[test]
+    fn prompts_get_more_time_than_plain_commands() {
+        assert_eq!(call_timeout("click", &json!({}), false), Duration::from_secs(20));
+        assert!(call_timeout("request_credentials", &json!({ "timeout_seconds": 300 }), false) > Duration::from_secs(300));
+        assert!(call_timeout("click", &json!({}), true) > Duration::from_secs(120));
+        assert!(call_timeout("navigate", &json!({ "return_state": true }), false) > Duration::from_secs(20));
+    }
 
     #[test]
     fn an_unconnected_bridge_points_at_the_working_alternative() {
