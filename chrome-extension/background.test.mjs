@@ -25,10 +25,19 @@ const groups = new Map();
 const removed = [];
 const executed = [];
 const storage = {};
-let nativeListener = null;
-let disconnectListener = null;
+/** Every native port the extension opened, newest last. */
+const ports = [];
+const MT_HOST = "com.munim.mtcode.desktop";
+const STANDALONE_HOST = "com.munimtech.computer_use.desktop";
+/** The live port for a host: the one a bridge would be talking to. */
+const portFor = (host) => ports.findLast((p) => p.host === host);
+let alarmListener = null;
 let connects = 0;
 let sent = [];
+
+// Most tests drive the MT Code host's port; the multi-host tests pick one.
+const nativeListener = (msg) => portFor(MT_HOST).onMessageListener(msg);
+const disconnectListener = () => portFor(MT_HOST).onDisconnectListener();
 
 function makeTab({ url = "about:blank", title = "t", active = false, favIconUrl = "" }) {
   const id = nextTabId++;
@@ -38,18 +47,30 @@ function makeTab({ url = "about:blank", title = "t", active = false, favIconUrl 
 
 const chrome = {
   runtime: {
-    connectNative: () => (connects++, {
-      onMessage: { addListener: (fn) => { nativeListener = fn; } },
-      onDisconnect: { addListener: (fn) => { disconnectListener = fn; } },
-      postMessage: (message) => sent.push(message),
-    }),
+    connectNative: (host) => {
+      connects++;
+      const nativePort = {
+        host,
+        sent: [],
+        onMessageListener: null,
+        onDisconnectListener: null,
+        onMessage: { addListener: (fn) => { nativePort.onMessageListener = fn; } },
+        onDisconnect: { addListener: (fn) => { nativePort.onDisconnectListener = fn; } },
+        postMessage: (message) => {
+          nativePort.sent.push(message);
+          sent.push(message);
+        },
+      };
+      ports.push(nativePort);
+      return nativePort;
+    },
     onStartup: { addListener() {} },
     onInstalled: { addListener() {} },
     onMessage: { addListener() {} },
     lastError: null,
     getURL: (file) => `chrome-extension://fake/${file}`,
   },
-  alarms: { create() {}, onAlarm: { addListener() {} } },
+  alarms: { create() {}, onAlarm: { addListener: (fn) => { alarmListener = fn; } } },
   storage: {
     session: {
       get: async (key) => (key in storage ? { [key]: storage[key] } : {}),
@@ -363,6 +384,72 @@ test("losing the native host keeps every task's tabs and reconnects", async () =
   // Ownership survived the reconnect, so the task can keep driving its tab.
   await call("snapshot", { tabId: survivor.tabId, clientId: "procD", sessionId: "s" });
   await call("close_client_tabs", { clientId: "procD" });
+});
+
+// ── several bridges ─────────────────────────────────────────────────────────
+
+/** Send a command down one host's port and wait for the reply on that port. */
+async function callVia(host, command, params) {
+  const id = ++nextRequestId;
+  const nativePort = portFor(host);
+  nativePort.onMessageListener({ id, command, params });
+  let reply;
+  for (let tick = 0; tick < 500 && !reply; tick++) {
+    await new Promise((resume) => setImmediate(resume));
+    reply = nativePort.sent.find((message) => message.id === id);
+  }
+  if (!reply) throw new Error(`no reply to ${command} on ${host}`);
+  return reply;
+}
+
+test("every configured host is connected, not just the first that answers", async () => {
+  // MT Code's bundled server and a standalone server are separate bridges;
+  // connecting to one only left the other without a browser.
+  assert.ok(portFor(MT_HOST));
+  assert.ok(portFor(STANDALONE_HOST));
+});
+
+test("each bridge is answered on its own port and keeps its own tabs", async () => {
+  const mine = await callVia(STANDALONE_HOST, "open_tab", { url: "https://standalone.example", clientId: "standalone-proc" });
+  assert.ok(mine.ok);
+  assert.ok(!portFor(MT_HOST).sent.some((message) => message.id === mine.id), "reply stayed on its port");
+  const theirs = await callVia(MT_HOST, "open_tab", { url: "https://mtcode.example", clientId: "mtcode-proc" });
+  assert.ok(theirs.ok);
+  assert.notEqual(tabs.get(mine.result.tabId).groupId, tabs.get(theirs.result.tabId).groupId);
+  // Neither bridge's agent can drive, adopt or clean up the other's tab.
+  const drive = await callVia(MT_HOST, "snapshot", { tabId: mine.result.tabId, clientId: "mtcode-proc" });
+  assert.match(drive.error, /not one of this agent's tabs/);
+  const adopt = await callVia(MT_HOST, "use_tab", { tabId: mine.result.tabId, clientId: "mtcode-proc" });
+  assert.match(adopt.error, /another agent/);
+  const cleanup = await callVia(MT_HOST, "close_client_tabs", { clientId: "mtcode-proc" });
+  assert.equal(cleanup.result.closed, 1);
+  assert.ok(tabs.has(mine.result.tabId));
+  assert.ok(!tabs.has(theirs.result.tabId));
+  await callVia(STANDALONE_HOST, "close_client_tabs", { clientId: "standalone-proc" });
+  assert.ok(!tabs.has(mine.result.tabId));
+});
+
+test("one bridge dropping leaves the other connected", async () => {
+  const standalone = portFor(STANDALONE_HOST);
+  const before = connects;
+  disconnectListener();
+  assert.equal(portFor(STANDALONE_HOST), standalone);
+  const still = await callVia(STANDALONE_HOST, "list_tabs", { clientId: "standalone-proc" });
+  assert.ok(still.ok);
+  await new Promise((resume) => setTimeout(resume, 1100));
+  assert.equal(connects, before + 1, "only the dropped host reconnected");
+});
+
+test("a host that is not installed waits for the alarm instead of retrying", async () => {
+  const before = connects;
+  chrome.runtime.lastError = { message: "Specified native messaging host not found." };
+  portFor(STANDALONE_HOST).onDisconnectListener();
+  chrome.runtime.lastError = null;
+  await new Promise((resume) => setTimeout(resume, 1100));
+  assert.equal(connects, before, "no quick retry");
+  alarmListener({ name: "cu-reconnect" });
+  assert.equal(connects, before + 1, "the minute alarm tries again");
+  assert.ok(portFor(STANDALONE_HOST).onMessageListener);
 });
 
 // ── runner ──────────────────────────────────────────────────────────────────

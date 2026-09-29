@@ -195,8 +195,9 @@ Linux notes: element actions work everywhere; coordinate clicks need an X11 or X
 ### Chrome extension (optional)
 
 1. `chrome://extensions` → Developer mode → **Load unpacked** → select `chrome-extension/`.
-2. Register the native messaging host: `sh chrome-extension/install.sh` (macOS/Linux) or `powershell -File chrome-extension/install.ps1` (Windows). Point `COMPUTER_USE_PATH` at the binary if it is not in the default build location.
-3. The binary can also register itself for its current identity: `munim-computer-use install-native-host` (see [Embedding](#embedding-in-an-app)).
+2. Register the native messaging host: `munim-computer-use install-native-host` (for example `npx -y munim-computer-use install-native-host`), or from a checkout `sh chrome-extension/install.sh` (macOS/Linux) / `powershell -File chrome-extension/install.ps1` (Windows), which find the build and run the same command. Point `COMPUTER_USE_PATH` at the binary if it is not in the default build location.
+
+The standalone server's host is `com.munimtech.computer_use.desktop`; MT Code, which bundles this server, registers `com.munim.mtcode.desktop`. The extension connects to every host it knows at once and answers each on its own connection, so MT Code and a standalone server (npx, Claude Code, Cursor, a checkout) can both drive Chrome at the same time, each in its own tab groups.
 
 ## Environment flags
 
@@ -251,12 +252,12 @@ An app can ship this binary inside its own bundle and run it under its own ident
 | `envPrefix`                                | none                                                               | Tunables are read as `<prefix>BROWSER`, `<prefix>AGENT_CURSOR`, … before `COMPUTER_USE_*`           |
 | `agentCursorName` / `agentCursorBundleId`  | `MunimAgentCursor` / `com.munimtech.computer-use.agent-cursor`     | The pointer overlay's app, executable and window-class name, and its macOS bundle id                 |
 | `historyDir`                               | none                                                               | Default `--root` for `computer-history`                                                              |
-| `nativeHostNames` / `extensionIds`         | `com.munim.mtcode.desktop`, `com.munimtech.computer-use.desktop` / `kgdolgnijopbghhomnblabjkmjhnoage` | What `install-native-host` registers, and for which extension                   |
+| `nativeHostNames` / `extensionIds`         | `com.munimtech.computer_use.desktop`, `com.munim.mtcode.desktop` / `kgdolgnijopbghhomnblabjkmjhnoage` | What `install-native-host` registers, and for which extension. The first name is this identity's own; later ones are aliases, written only if no other installed app owns them |
 
 Each of `supportDir`, `bridgeSocket`, `envPrefix`, `agentCursorName`, `agentCursorBundleId` and `historyDir` can also be overridden by `COMPUTER_USE_<SNAKE_CASE>` (for example `COMPUTER_USE_SUPPORT_DIR`), which wins over the profile. `munim-computer-use identity` prints the resolved values.
 
 - **Browser bridge.** Run `munim-computer-use install-native-host` with the same profile. It writes a wrapper that relays Chrome into this identity's bridge (replaying the profile), and a host manifest for each name in every Chrome/Chromium profile directory (the registry on Windows). It rewrites nothing that is already current, so an app can call it on every launch.
-- **Extension.** Use the stock extension, or build a variant with its own host names, tab-group title and key: `node scripts/build-extension.mjs --out <dir> --host com.example.desktop --group-title "Example" --key <base64>`. It prints the variant's extension id for `extensionIds`.
+- **Extension.** Use the stock extension (it connects to `com.munim.mtcode.desktop` and `com.munimtech.computer_use.desktop`), or build a variant with its own host names, tab-group title and key: `node scripts/build-extension.mjs --out <dir> --host com.example.desktop --group-title "Example" --key <base64>`. It prints the variant's extension id for `extensionIds`.
 - **macOS permissions.** The MCP server is a bare executable, so Accessibility and Screen Recording are granted to the app that spawns it. Only the agent-cursor overlay has a bundle of its own; ship `<agentCursorName>.app` (a copy of the binary plus an `LSUIElement` Info.plist) beside the binary, or it is materialised under `supportDir` on first use.
 
 ## Prompting your agent

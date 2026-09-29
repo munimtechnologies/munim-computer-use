@@ -1,25 +1,28 @@
 #!/bin/sh
 # Register the native messaging host so Chrome can reach the desktop server.
 #
-# Chrome runs the host itself and passes no arguments, so it points at a small
-# wrapper that re-execs the server binary in host mode. The extension id is
-# pinned by the "key" in manifest.json, which is why this can be registered
-# before the extension is ever loaded.
+# The server registers itself (`munim-computer-use install-native-host`): it
+# writes a small wrapper that Chrome runs in host mode, and a host manifest for
+# each of its identity's host names in every Chrome/Chromium profile directory.
+# This script only finds a checkout's build. The extension id is pinned by the
+# "key" in manifest.json, which is why this can run before the extension is
+# ever loaded.
+#
+# The standalone server's own host is com.munimtech.computer_use.desktop. It
+# also registers com.munim.mtcode.desktop for extensions from before 0.4.4, but
+# only when no other app (MT Code) already owns that name.
 set -eu
 
 EXTENSION_ID="kgdolgnijopbghhomnblabjkmjhnoage"
-HOST_NAME="com.munim.mtcode.desktop"
-# Extensions that have not reloaded since the rename still ask for the old id,
-# and Chrome refuses a host it has no manifest for. Both names are registered
-# so neither side has to be updated first.
-LEGACY_HOST_NAME="com.munimtech.computer-use.desktop"
 
 here=$(cd "$(dirname "$0")" && pwd)
 # macOS builds the Swift package; Linux builds the Rust crate that also covers
 # Windows. Either way the binary is called munim-computer-use.
+default_binary=""
 case "$(uname -s)" in
   Darwin)
     for candidate in \
+      "$here/../macos/.build/out/Products/Release/munim-computer-use" \
       "$here/../macos/.build/apple/Products/Release/munim-computer-use" \
       "$here/../macos/.build/release/munim-computer-use"; do
       if [ -x "$candidate" ]; then
@@ -31,67 +34,14 @@ case "$(uname -s)" in
   *)      default_binary="$here/../windows-linux/target/release/munim-computer-use" ;;
 esac
 binary="${COMPUTER_USE_PATH:-$default_binary}"
-if [ ! -x "$binary" ]; then
-  echo "desktop server binary not found at: $binary" >&2
-  echo "build it first:  pnpm build:desktop-mcp" >&2
+if [ -z "$binary" ] || [ ! -x "$binary" ]; then
+  echo "desktop server binary not found at: ${binary:-macos/.build}" >&2
+  echo "build it first (see README), or point COMPUTER_USE_PATH at it" >&2
   exit 1
 fi
+binary=$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")
 
-case "$(uname -s)" in
-  Darwin) support="$HOME/Library/Application Support/munim-computer-use" ;;
-  *)      support="${XDG_DATA_HOME:-$HOME/.local/share}/munim-computer-use" ;;
-esac
-mkdir -p "$support"
-wrapper="$support/native-host"
-cat > "$wrapper" <<EOF
-#!/bin/sh
-exec "$binary" native-host
-EOF
-chmod +x "$wrapper"
-
-# Chrome, Chrome Beta/Canary and Chromium each read their own directory.
-case "$(uname -s)" in
-  Darwin)
-    set -- \
-      "$HOME/Library/Application Support/Google/Chrome" \
-      "$HOME/Library/Application Support/Google/Chrome Beta" \
-      "$HOME/Library/Application Support/Google/Chrome Canary" \
-      "$HOME/Library/Application Support/Chromium"
-    ;;
-  *)
-    config="${XDG_CONFIG_HOME:-$HOME/.config}"
-    set -- \
-      "$config/google-chrome" \
-      "$config/google-chrome-beta" \
-      "$config/google-chrome-unstable" \
-      "$config/chromium"
-    ;;
-esac
-
-installed=0
-for profile in "$@"; do
-  [ -d "$profile" ] || continue
-  dir="$profile/NativeMessagingHosts"
-  mkdir -p "$dir"
-  for host_name in "$HOST_NAME" "$LEGACY_HOST_NAME"; do
-    cat > "$dir/$host_name.json" <<EOF
-{
-  "name": "$host_name",
-  "description": "MT Code desktop control bridge",
-  "path": "$wrapper",
-  "type": "stdio",
-  "allowed_origins": ["chrome-extension://$EXTENSION_ID/"]
-}
-EOF
-  done
-  echo "registered host in: $profile"
-  installed=$((installed + 1))
-done
-
-if [ "$installed" -eq 0 ]; then
-  echo "no Chrome profile directory found" >&2
-  exit 1
-fi
+"$binary" install-native-host --binary "$binary"
 
 echo
 echo "Next, load the extension once:"

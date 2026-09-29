@@ -6,7 +6,13 @@
 //! `native-host` mode — with `--profile` when the identity is customised, so
 //! the relay Chrome starts connects to the same bridge the MCP server binds.
 //! An embedding app calls this with its profile instead of shipping installer
-//! scripts; `chrome-extension/install.sh` / `install.ps1` stay for checkouts.
+//! scripts; `chrome-extension/install.sh` / `install.ps1` call it for checkouts.
+//!
+//! The identity's first host name is its own and is always written. Later names
+//! are compatibility aliases, possibly shared with another app (the standalone
+//! default lists MT Code's host for old extensions): one is written only when no
+//! manifest exists yet or it already points at this wrapper, so a standalone
+//! install never hijacks an embedding app's bridge.
 
 use std::path::{Path, PathBuf};
 
@@ -85,13 +91,36 @@ fn install(identity: &Identity, binary: &Path) -> Result<Value, String> {
         )
     };
 
-    let registered = register(identity, &support, &manifest_for)?;
+    let mut skipped: Vec<String> = Vec::new();
+    let registered = register(identity, &support, &wrapper, &manifest_for, &mut skipped)?;
     Ok(json!({
         "wrapper": wrapper.to_string_lossy(),
         "profile": profile.map(|p| p.to_string_lossy().into_owned()),
         "hostNames": identity.native_host_names,
         "registered": registered,
+        "skipped": skipped,
     }))
+}
+
+/// Whether an existing host manifest belongs to another installed app: it
+/// points somewhere other than `wrapper`, and that program still exists. A
+/// missing or unreadable manifest, or one left by an uninstalled app, is free
+/// to take.
+fn claimed_by_another_host(existing: Option<&str>, wrapper: &Path) -> bool {
+    let Some(path) = existing
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .and_then(|manifest| manifest.get("path").and_then(Value::as_str).map(PathBuf::from))
+        .filter(|path| !path.as_os_str().is_empty())
+    else {
+        return false;
+    };
+    path != wrapper && path.exists()
+}
+
+fn note_skipped(skipped: &mut Vec<String>, name: &str) {
+    if !skipped.iter().any(|seen| seen == name) {
+        skipped.push(name.to_string());
+    }
 }
 
 /// Rewriting an identical file would bump its mtime for nothing, and an app
@@ -137,7 +166,9 @@ fn write_wrapper(support: &Path, binary: &Path, profile: Option<&Path>) -> Resul
 fn register(
     identity: &Identity,
     _support: &Path,
+    wrapper: &Path,
     manifest_for: &dyn Fn(&str) -> String,
+    skipped: &mut Vec<String>,
 ) -> Result<Vec<String>, String> {
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -152,8 +183,14 @@ fn register(
         let dir = root.join("NativeMessagingHosts");
         std::fs::create_dir_all(&dir)
             .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
-        for name in &identity.native_host_names {
-            write_if_changed(&dir.join(format!("{name}.json")), &manifest_for(name))?;
+        for (index, name) in identity.native_host_names.iter().enumerate() {
+            let target = dir.join(format!("{name}.json"));
+            let existing = std::fs::read_to_string(&target).ok();
+            if index > 0 && claimed_by_another_host(existing.as_deref(), wrapper) {
+                note_skipped(skipped, name);
+                continue;
+            }
+            write_if_changed(&target, &manifest_for(name))?;
         }
         registered.push(root.to_string_lossy().into_owned());
     }
@@ -166,7 +203,9 @@ fn register(
 fn register(
     identity: &Identity,
     support: &Path,
+    wrapper: &Path,
     manifest_for: &dyn Fn(&str) -> String,
+    skipped: &mut Vec<String>,
 ) -> Result<Vec<String>, String> {
     let mut manifests = Vec::new();
     for name in &identity.native_host_names {
@@ -177,8 +216,18 @@ fn register(
     let mut registered = Vec::new();
     for vendor in [r"Google\Chrome", r"Google\Chrome Beta", "Chromium"] {
         let mut ok = true;
-        for (name, path) in &manifests {
+        for (index, (name, path)) in manifests.iter().enumerate() {
             let key = format!(r"HKCU\Software\{vendor}\NativeMessagingHosts\{name}");
+            if index > 0 {
+                // The registry names the manifest file; another app's lives elsewhere.
+                let existing = registered_manifest(&key)
+                    .filter(|current| current.as_path() != path.as_path())
+                    .and_then(|current| std::fs::read_to_string(current).ok());
+                if claimed_by_another_host(existing.as_deref(), wrapper) {
+                    note_skipped(skipped, name);
+                    continue;
+                }
+            }
             let status = std::process::Command::new("reg")
                 .args(["add", &key, "/ve", "/t", "REG_SZ", "/d"])
                 .arg(path)
@@ -195,9 +244,43 @@ fn register(
     Ok(registered)
 }
 
+/// The manifest path a host key's default value points at, if any.
+#[cfg(windows)]
+fn registered_manifest(key: &str) -> Option<PathBuf> {
+    let output = std::process::Command::new("reg")
+        .args(["query", key, "/ve"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .find_map(|line| line.split_once("REG_SZ").map(|(_, value)| value.trim().to_string()))
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_compat_host_owned_by_another_app_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("cu-install-claim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ours = dir.join("ours");
+        let theirs = dir.join("theirs");
+        std::fs::write(&theirs, "#!/bin/sh\n").unwrap();
+        let manifest = |path: &Path| json!({ "name": "x", "path": path.to_string_lossy() }).to_string();
+        // Another app's live wrapper: hands off.
+        assert!(claimed_by_another_host(Some(&manifest(&theirs)), &ours));
+        // Already ours, never registered, unreadable, or left by an uninstalled app: take it.
+        assert!(!claimed_by_another_host(Some(&manifest(&ours)), &ours));
+        assert!(!claimed_by_another_host(None, &ours));
+        assert!(!claimed_by_another_host(Some("not json"), &ours));
+        assert!(!claimed_by_another_host(Some(&manifest(&dir.join("gone"))), &ours));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn wrapper_replays_a_custom_profile_and_quotes_paths() {

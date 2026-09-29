@@ -22,12 +22,15 @@
 // its own identity (its own native-messaging host name, its own group title).
 // @embed-config-begin
 /**
- * Native-messaging hosts to try, in order; the first one Chrome can start wins.
- * `com.munimtech.computer-use.desktop` is the pre-rename id: installs that
- * still carry only that manifest keep working until they run the installer
- * again, rather than being unable to reach the desktop at all.
+ * Native-messaging hosts to connect to — every one of them, at the same time.
+ * Each host is a separate desktop bridge: `com.munim.mtcode.desktop` is the one
+ * MT Code registers for the server it bundles, and
+ * `com.munimtech.computer_use.desktop` is the standalone server's (npx, a
+ * checkout, another MCP client). Connecting to only the first that answered
+ * left whichever server did not own that host without a browser. A host with no
+ * manifest on this machine simply stays disconnected.
  */
-const NATIVE_HOSTS = ["com.munim.mtcode.desktop", "com.munimtech.computer-use.desktop"];
+const NATIVE_HOSTS = ["com.munim.mtcode.desktop", "com.munimtech.computer_use.desktop"];
 /** Title of the agent's tab group. */
 const GROUP_TITLE = "MT Code";
 // @embed-config-end
@@ -56,10 +59,17 @@ const clients = new Map();
 const tabOwner = new Map();
 /** Tabs we have attached the debugger to, so we detach exactly once. */
 const attached = new Set();
-let port = null;
-let reconnectTimer = null;
+/**
+ * One native-messaging connection per host in NATIVE_HOSTS. Commands are
+ * answered on the port they arrived on, so two bridges never see each other's
+ * replies. Tab ownership is keyed by the MCP process's client id, not by the
+ * port, so a bridge that reconnects (or re-elects its owner) keeps its tabs.
+ *
+ * @typedef {{ port: any, reconnectTimer: any, quickRetries: number }} HostLink
+ * @type {Map<string, HostLink>}
+ */
+const hostLinks = new Map(NATIVE_HOSTS.map((host) => [host, { port: null, reconnectTimer: null, quickRetries: 0 }]));
 /** Quick retries since the last message; the minute alarm takes over after. */
-let quickRetries = 0;
 const QUICK_RETRY_LIMIT = 5;
 let stateReady = null;
 
@@ -184,39 +194,45 @@ function ensureStateReady() {
 
 // ── native messaging ────────────────────────────────────────────────────────
 
+/** Connect every configured host that is not connected already. */
 function connect() {
-  if (port) return;
-  // Chrome throws for a host id it has no manifest for, so try each configured
-  // name in order (see NATIVE_HOSTS).
-  for (const host of NATIVE_HOSTS) {
-    try {
-      port = chrome.runtime.connectNative(host);
-      break;
-    } catch {
-      port = null;
-    }
+  for (const host of NATIVE_HOSTS) connectHost(host);
+}
+
+function connectHost(host) {
+  const link = hostLinks.get(host);
+  if (!link || link.port) return;
+  let sessionPort;
+  try {
+    sessionPort = chrome.runtime.connectNative(host);
+  } catch {
+    // Chrome throws for a malformed host name; nothing to retry.
+    return;
   }
-  if (!port) return;
-  const sessionPort = port;
+  link.port = sessionPort;
   sessionPort.onMessage.addListener((msg) => {
-    quickRetries = 0;
+    link.quickRetries = 0;
     void handleCommand(msg, sessionPort);
   });
   sessionPort.onDisconnect.addListener(() => {
-    void chrome.runtime.lastError;
-    if (port !== sessionPort) return;
-    port = null;
+    const error = chrome.runtime.lastError;
+    if (link.port !== sessionPort) return;
+    link.port = null;
+    // No manifest for this host (that server is not installed here) or it is
+    // not allowed for this extension: retrying in seconds cannot help, so
+    // leave it to the minute alarm, which also notices a later install.
+    if (/not found|forbidden|invalid/i.test(String(error?.message ?? ""))) return;
     // Losing the transport is not the end of every task. In particular, an
     // owning MCP process can exit while peers elect a replacement. Keep their
     // tabs and ownership; only explicit client/session cleanup may close them.
     // Retry quickly so a re-elected owner is picked up within seconds, but back
     // off: with no MCP server running every attempt spawns a native host.
-    if (reconnectTimer === null && quickRetries < QUICK_RETRY_LIMIT) {
-      const delay = 1000 * 2 ** quickRetries;
-      quickRetries += 1;
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
-        connect();
+    if (link.reconnectTimer === null && link.quickRetries < QUICK_RETRY_LIMIT) {
+      const delay = 1000 * 2 ** link.quickRetries;
+      link.quickRetries += 1;
+      link.reconnectTimer = setTimeout(() => {
+        link.reconnectTimer = null;
+        connectHost(host);
       }, delay);
     }
   });
@@ -1132,7 +1148,7 @@ const handlers = {
   },
 };
 
-async function handleCommand(msg, replyPort = port) {
+async function handleCommand(msg, replyPort) {
   await ensureStateReady();
   const { id, command, params = {} } = msg || {};
   try {

@@ -29,8 +29,14 @@ use serde_json::{Map, Value, json};
 pub const DEFAULT_NAME: &str = "munim-computer-use";
 pub const DEFAULT_AGENT_CURSOR_NAME: &str = "MunimAgentCursor";
 pub const DEFAULT_AGENT_CURSOR_BUNDLE_ID: &str = "com.munimtech.computer-use.agent-cursor";
+/// The standalone server's own host comes first and is always registered.
+/// `com.munim.mtcode.desktop` follows for extensions from before 0.4.4, which
+/// only knew that name; it is MT Code's host too, so the installer only takes it
+/// when no other installed app's manifest already does. The pre-rename
+/// `com.munimtech.computer-use.desktop` is gone: Chrome rejects host names with
+/// a '-', so no extension could ever reach it.
 pub const DEFAULT_NATIVE_HOST_NAMES: [&str; 2] =
-    ["com.munim.mtcode.desktop", "com.munimtech.computer-use.desktop"];
+    ["com.munimtech.computer_use.desktop", "com.munim.mtcode.desktop"];
 /// Pinned by the `key` in chrome-extension/manifest.json.
 pub const DEFAULT_EXTENSION_IDS: [&str; 1] = ["kgdolgnijopbghhomnblabjkmjhnoage"];
 pub const DEFAULT_NATIVE_HOST_DESCRIPTION: &str = "Munim Computer Use browser bridge";
@@ -421,8 +427,10 @@ mod tests {
         assert_eq!(identity.agent_cursor_bundle_id, "com.munimtech.computer-use.agent-cursor");
         assert_eq!(
             identity.native_host_names,
-            vec!["com.munim.mtcode.desktop", "com.munimtech.computer-use.desktop"]
+            vec!["com.munimtech.computer_use.desktop", "com.munim.mtcode.desktop"]
         );
+        // Chrome refuses a host name it considers malformed, so every default must pass.
+        assert!(identity.native_host_names.iter().all(|name| valid_host_name(name)));
         #[cfg(windows)]
         assert!(identity.bridge_pipe_name().starts_with("munim-computer-use-bridge-"));
     }

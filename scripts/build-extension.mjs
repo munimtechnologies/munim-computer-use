@@ -2,7 +2,7 @@
 // Build the Chrome extension, optionally as a variant for an embedding app.
 //
 //   node scripts/build-extension.mjs --out <dir>
-//       [--host <native-messaging host name>]...   (repeatable, tried in order)
+//       [--host <native-messaging host name>]...   (repeatable; each is connected)
 //       [--group-title <tab group title>]
 //       [--name <extension name>] [--description <text>]
 //       [--key <base64 public key>] [--version <x.y.z>]

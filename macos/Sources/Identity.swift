@@ -27,7 +27,14 @@ struct Identity {
     static let defaultAgentCursorName = "MunimAgentCursor"
     /// TCC and Launch Services key on this; renaming it would revoke grants.
     static let defaultAgentCursorBundleId = "com.munimtech.computer-use.agent-cursor"
-    static let defaultNativeHostNames = ["com.munim.mtcode.desktop", "com.munimtech.computer-use.desktop"]
+    /// The standalone server's own host comes first and is always registered.
+    /// `com.munim.mtcode.desktop` follows for extensions from before 0.4.4,
+    /// which only knew that name; it is MT Code's host too, so the installer
+    /// only takes it when no other installed app's manifest already does (see
+    /// `NativeHostInstaller.claimedByAnotherHost`). The pre-rename
+    /// `com.munimtech.computer-use.desktop` is gone: Chrome rejects host names
+    /// with a '-', so no extension could ever reach it.
+    static let defaultNativeHostNames = ["com.munimtech.computer_use.desktop", "com.munim.mtcode.desktop"]
     /// Pinned by the `key` in chrome-extension/manifest.json.
     static let defaultExtensionIds = ["kgdolgnijopbghhomnblabjkmjhnoage"]
     static let defaultNativeHostDescription = "Munim Computer Use browser bridge"
@@ -285,6 +292,12 @@ struct IdentityError: Error, CustomStringConvertible {
 /// manifest points at a small wrapper that re-execs this binary in
 /// `native-host` mode — with `--profile` when the identity is customised, so
 /// the relay Chrome starts connects to the same bridge the MCP server binds.
+///
+/// The identity's first host name is its own and is always written. Later
+/// names are compatibility aliases, possibly shared with another app (the
+/// standalone default lists MT Code's host for old extensions): one is written
+/// only when no manifest exists yet or it already points at this wrapper, so a
+/// standalone install never hijacks an embedding app's bridge.
 enum NativeHostInstaller {
     static func run(_ arguments: [String]) -> Never {
         var binary = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().path
@@ -339,13 +352,19 @@ enum NativeHostInstaller {
         let origins = identity.extensionIds.map { "chrome-extension://\($0)/" }
         let home = fm.homeDirectoryForCurrentUser
         var registered: [String] = []
+        var skipped: [String] = []
         for browser in ["Google/Chrome", "Google/Chrome Beta", "Google/Chrome Canary", "Chromium"] {
             let root = home.appendingPathComponent("Library/Application Support/\(browser)", isDirectory: true)
             var isDirectory: ObjCBool = false
             guard fm.fileExists(atPath: root.path, isDirectory: &isDirectory), isDirectory.boolValue else { continue }
             let dir = root.appendingPathComponent("NativeMessagingHosts", isDirectory: true)
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-            for name in identity.nativeHostNames {
+            for (index, name) in identity.nativeHostNames.enumerated() {
+                let target = dir.appendingPathComponent("\(name).json")
+                if index > 0, claimedByAnotherHost(fm.contents(atPath: target.path), wrapper: wrapper.path) {
+                    if !skipped.contains(name) { skipped.append(name) }
+                    continue
+                }
                 let manifest: [String: Any] = [
                     "name": name,
                     "description": identity.nativeHostDescription,
@@ -355,7 +374,7 @@ enum NativeHostInstaller {
                 ]
                 let data = try JSONSerialization.data(
                     withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
-                try writeIfChanged(dir.appendingPathComponent("\(name).json"), data + Data("\n".utf8))
+                try writeIfChanged(target, data + Data("\n".utf8))
             }
             registered.append(root.path)
         }
@@ -363,9 +382,25 @@ enum NativeHostInstaller {
             "wrapper": wrapper.path,
             "hostNames": identity.nativeHostNames,
             "registered": registered,
+            "skipped": skipped,
         ]
         report["profile"] = profilePath ?? NSNull()
         return report
+    }
+
+    /// Whether an existing host manifest belongs to another installed app: it
+    /// points somewhere other than `wrapper`, and that program still exists.
+    /// A missing or unreadable manifest, or one left by an uninstalled app, is
+    /// free to take.
+    static func claimedByAnotherHost(_ existing: Data?, wrapper: String) -> Bool {
+        guard let existing,
+              let object = try? JSONSerialization.jsonObject(with: existing) as? [String: Any],
+              let path = object["path"] as? String, !path.isEmpty
+        else { return false }
+        if URL(fileURLWithPath: path).standardizedFileURL.path == URL(fileURLWithPath: wrapper).standardizedFileURL.path {
+            return false
+        }
+        return FileManager.default.fileExists(atPath: path)
     }
 
     static func wrapperScript(binary: String, profile: String?) -> String {

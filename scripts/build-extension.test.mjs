@@ -15,7 +15,7 @@ test("the stock build keeps the shipped id and hosts and leaves tests behind", (
   // Pinned by the "key" in manifest.json; install.sh and embedders rely on it.
   assert.equal(result.extensionId, "kgdolgnijopbghhomnblabjkmjhnoage");
   const background = fs.readFileSync(path.join(result.out, "background.js"), "utf8");
-  assert.match(background, /const NATIVE_HOSTS = \["com\.munim\.mtcode\.desktop", "com\.munimtech\.computer-use\.desktop"\];/);
+  assert.match(background, /const NATIVE_HOSTS = \["com\.munim\.mtcode\.desktop", "com\.munimtech\.computer_use\.desktop"\];/);
   assert.ok(fs.existsSync(path.join(result.out, "icons/cursor-224.png")));
   assert.ok(!fs.existsSync(path.join(result.out, "background.test.mjs")));
   assert.ok(!fs.existsSync(path.join(result.out, "install.sh")));
