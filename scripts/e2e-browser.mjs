@@ -229,22 +229,45 @@ async function evaluateIn(match, expression, method = "Runtime.evaluate") {
  * to), and only the live one has run its script, so the first match is not
  * necessarily the page on screen.
  */
+/**
+ * One Runtime.evaluate in one target, or null if it errors, closes, or stays
+ * silent for two seconds: a target that has already gone away can accept the
+ * socket and then never answer, and waiting on it hung the whole run.
+ */
+function evaluateTarget(webSocketUrl, expression) {
+  return new Promise((resolve) => {
+    const socket = new WebSocket(webSocketUrl);
+    const done = (value) => {
+      clearTimeout(timer);
+      try {
+        socket.close();
+      } catch {}
+      resolve(value);
+    };
+    const timer = setTimeout(() => done(null), 2000);
+    socket.addEventListener("error", () => done(null), { once: true });
+    socket.addEventListener("close", () => done(null), { once: true });
+    socket.addEventListener("message", (event) => {
+      const message = JSON.parse(event.data);
+      if (message.id === 1) done(message.result?.result?.value ?? null);
+    });
+    socket.addEventListener(
+      "open",
+      () =>
+        socket.send(
+          JSON.stringify({ id: 1, method: "Runtime.evaluate", params: { expression, returnByValue: true } }),
+        ),
+      { once: true },
+    );
+  });
+}
+
 async function evaluateInLive(match, expression) {
   for (let attempt = 0; attempt < 100; attempt++) {
     const targets = await (await fetch(`http://127.0.0.1:${devtoolsPort}/json`)).json();
     for (const target of targets.filter((entry) => entry.type === "page" && match(entry.url))) {
-      const socket = new WebSocket(target.webSocketDebuggerUrl);
-      await new Promise((resolve) => socket.addEventListener("open", resolve, { once: true }));
-      const value = await new Promise((resolve) => {
-        socket.addEventListener("message", (event) => {
-          const message = JSON.parse(event.data);
-          if (message.id === 1) resolve(message.result?.result?.value ?? null);
-        });
-        socket.send(
-          JSON.stringify({ id: 1, method: "Runtime.evaluate", params: { expression, returnByValue: true } }),
-        );
-      });
-      socket.close();
+      if (!target.webSocketDebuggerUrl) continue;
+      const value = await evaluateTarget(target.webSocketDebuggerUrl, expression);
       if (value !== null) return value;
     }
     await sleep(100);
