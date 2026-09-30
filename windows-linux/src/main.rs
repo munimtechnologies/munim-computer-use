@@ -276,6 +276,20 @@ fn image_result(bytes: Vec<u8>, mime_type: &str, caption: String) -> Value {
     })
 }
 
+/// Captures leave the pointer out. MT Code's Computer View passes
+/// `cursor: true` on display screenshots and draws the returned shape as the
+/// viewer's own cursor. Deliberately not in the tool schema: it serves that
+/// viewer, not agents.
+fn with_cursor(mut result: Value, args: &Value) -> Value {
+    if args.get("cursor").and_then(Value::as_bool) == Some(true)
+        && let Some(cursor) = cursor::current()
+        && let Some(content) = result.get_mut("content").and_then(Value::as_array_mut)
+    {
+        content.push(json!({ "type": "text", "text": format!("cursor: {cursor}") }));
+    }
+    result
+}
+
 fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
 }
@@ -361,7 +375,7 @@ fn call_tool(
             Ok(index) => match capture::capture_display(index, max_width, format) {
                 Ok(capture) => {
                     let text = capture::mapping_text(&capture, &format!("display {index}"));
-                    image_result(capture.bytes, format.mime_type(), text)
+                    with_cursor(image_result(capture.bytes, format.mime_type(), text), &args)
                 }
                 Err(error) => text_result(format!("error: {error}"), true),
             },
@@ -688,18 +702,7 @@ fn run_desktop_tool(
                 })?;
                 let capture = capture::capture_display(index, max_width, format)?;
                 let text = capture::mapping_text(&capture, &format!("display {index}"));
-                let mut result = image_result(capture.bytes, format.mime_type(), text);
-                // Captures leave the pointer out. MT Code's Computer View asks
-                // for its shape here and draws it as the viewer's own cursor.
-                // Deliberately not in the tool schema: it serves that viewer,
-                // not agents.
-                if args.get("cursor").and_then(Value::as_bool) == Some(true)
-                    && let Some(cursor) = cursor::current()
-                    && let Some(content) = result.get_mut("content").and_then(Value::as_array_mut)
-                {
-                    content.push(json!({ "type": "text", "text": format!("cursor: {cursor}") }));
-                }
-                return Ok(result);
+                return Ok(with_cursor(image_result(capture.bytes, format.mime_type(), text), args));
             }
             let app = arg_str(args, "app").ok_or_else(|| {
                 DesktopError::new("provide 'app' to capture a window, or 'display' for a whole screen")
