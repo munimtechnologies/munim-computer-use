@@ -37,14 +37,21 @@ pub const DEFAULT_MAX_WIDTH: u32 = 1400;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureFormat {
     Png,
-    Jpeg,
+    /// JPEG at this quality (1-100).
+    Jpeg(u8),
 }
 
+/// JPEG quality when the caller does not ask for one: small enough for a live
+/// stream, still legible for text.
+pub const DEFAULT_JPEG_QUALITY: u8 = 55;
+
 impl CaptureFormat {
-    pub fn parse(value: Option<&str>) -> Result<Self> {
+    pub fn parse(value: Option<&str>, quality: Option<i64>) -> Result<Self> {
         match value.unwrap_or("png").to_ascii_lowercase().as_str() {
             "png" => Ok(Self::Png),
-            "jpeg" | "jpg" => Ok(Self::Jpeg),
+            "jpeg" | "jpg" => Ok(Self::Jpeg(
+                quality.map_or(DEFAULT_JPEG_QUALITY, |quality| quality.clamp(1, 100) as u8),
+            )),
             other => Err(DesktopError::new(format!(
                 "unsupported screenshot format '{other}' — use png or jpeg"
             ))),
@@ -54,7 +61,7 @@ impl CaptureFormat {
     pub fn mime_type(self) -> &'static str {
         match self {
             Self::Png => "image/png",
-            Self::Jpeg => "image/jpeg",
+            Self::Jpeg(_) => "image/jpeg",
         }
     }
 }
@@ -81,11 +88,11 @@ fn encode_image(image: RgbaImage, max_width: u32, format: CaptureFormat) -> Resu
                 )
                 .map_err(|error| DesktopError::new(format!("failed to encode PNG: {error}")))?;
         }
-        CaptureFormat::Jpeg => {
+        CaptureFormat::Jpeg(quality) => {
             // JPEG has no alpha; flatten onto black so translucent chrome does not
             // become opaque white noise.
             let rgb = image::DynamicImage::ImageRgba8(image).to_rgb8();
-            JpegEncoder::new_with_quality(&mut buffer, 55)
+            JpegEncoder::new_with_quality(&mut buffer, quality)
                 .write_image(
                     rgb.as_raw(),
                     rgb.width(),
@@ -329,7 +336,7 @@ mod tests {
 
     #[test]
     fn encodes_a_jpeg_signature() {
-        let jpeg = encode_image(RgbaImage::new(8, 8), DEFAULT_MAX_WIDTH, CaptureFormat::Jpeg)
+        let jpeg = encode_image(RgbaImage::new(8, 8), DEFAULT_MAX_WIDTH, CaptureFormat::Jpeg(55))
             .expect("encodes");
         assert_eq!(&jpeg[..2], b"\xff\xd8");
     }

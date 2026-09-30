@@ -300,6 +300,12 @@ fn all_tool_defs() -> Value {
                         "type": "string",
                         "enum": ["png", "jpeg"],
                         "description": "Image encoding (default png). Use jpeg for live remote viewing."
+                    },
+                    "quality": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "description": "JPEG quality from 1 to 100 (default 55). Ignored for png. Raise it when small text must stay sharp."
                     }
                 }
             },

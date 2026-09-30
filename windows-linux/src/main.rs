@@ -352,7 +352,7 @@ fn call_tool(
         let max_width = arg_i64(&args, "max_width")
             .unwrap_or(capture::DEFAULT_MAX_WIDTH as i64)
             .clamp(0, 8000) as u32;
-        let format = match capture::CaptureFormat::parse(arg_str(&args, "format")) {
+        let format = match capture::CaptureFormat::parse(arg_str(&args, "format"), arg_i64(&args, "quality")) {
             Ok(format) => format,
             Err(error) => return text_result(format!("error: {error}"), true),
         };
@@ -435,7 +435,7 @@ fn zoom_region(args: &Value) -> Result<Value, DesktopError> {
     let max_width = arg_i64(args, "max_width")
         .unwrap_or(capture::DEFAULT_MAX_WIDTH as i64)
         .clamp(0, 8000) as u32;
-    let format = capture::CaptureFormat::parse(arg_str(args, "format"))?;
+    let format = capture::CaptureFormat::parse(arg_str(args, "format"), arg_i64(args, "quality"))?;
     let capture = capture::capture_region(x0, y0, x1, y1, max_width, format)?;
     let text = capture::mapping_text(&capture, "zoomed region");
     Ok(image_result(capture.bytes, format.mime_type(), text))
@@ -680,7 +680,7 @@ fn run_desktop_tool(
             let max_width = arg_i64(args, "max_width")
                 .unwrap_or(capture::DEFAULT_MAX_WIDTH as i64)
                 .clamp(0, 8000) as u32;
-            let format = capture::CaptureFormat::parse(arg_str(args, "format"))?;
+            let format = capture::CaptureFormat::parse(arg_str(args, "format"), arg_i64(args, "quality"))?;
             if let Some(display) = arg_i64(args, "display") {
                 let index = usize::try_from(display).map_err(|_| {
                     DesktopError::new("display index must be zero or greater")

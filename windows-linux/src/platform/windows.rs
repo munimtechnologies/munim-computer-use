@@ -222,6 +222,18 @@ impl WindowsDesktop {
         down_ok && up_ok
     }
 
+    /// Remote control puts the real cursor exactly where the viewer's pointer
+    /// is, at once. uiautomation's `move_to` glides there over 500 ms, which
+    /// left every streamed pointer move half a second behind the viewer and
+    /// queued the rest behind it; it also normalises absolute coordinates
+    /// against the primary screen only, so a second monitor was unreachable.
+    /// `SetCursorPos` takes virtual-desktop coordinates and posts the
+    /// mouse-move itself, so hover states still follow.
+    fn jump_cursor(x: f64, y: f64) -> Result<()> {
+        Mouse::set_cursor_pos(&UIPoint::new(x.round() as i32, y.round() as i32))
+            .map_err(|error| DesktopError::new(format!("could not move cursor: {error}")))
+    }
+
     /// Hover counterpart of `background_click`: prime the window under the point
     /// with a mouse-move so it paints hover state, without touching the cursor.
     fn background_hover(x: f64, y: f64) -> bool {
@@ -815,10 +827,16 @@ impl Desktop for WindowsDesktop {
 
         let mouse = Mouse::default();
         let point = UIPoint::new(x as i32, y as i32);
+        if identity::remote_control() {
+            Self::jump_cursor(x, y)?;
+        }
         for _ in 0..click_count.max(1) {
-            mouse
-                .click(&point)
-                .map_err(|error| DesktopError::new(format!("click failed: {error}")))?;
+            if identity::remote_control() {
+                mouse.click_button(MouseButton::LEFT)
+            } else {
+                mouse.click(&point)
+            }
+            .map_err(|error| DesktopError::new(format!("click failed: {error}")))?;
         }
         Ok(format!(
             "clicked at ({:.0}, {:.0}) via cursor{}",
@@ -838,9 +856,13 @@ impl Desktop for WindowsDesktop {
         if !identity::remote_control() && Self::background_click(x, y, true) {
             return Ok(format!("right-clicked at ({x:.0}, {y:.0}) in background"));
         }
-        Mouse::default()
-            .right_click(&UIPoint::new(x as i32, y as i32))
-            .map_err(|error| DesktopError::new(format!("right click failed: {error}")))?;
+        if identity::remote_control() {
+            Self::jump_cursor(x, y)?;
+            Mouse::default().click_button(MouseButton::RIGHT)
+        } else {
+            Mouse::default().right_click(&UIPoint::new(x as i32, y as i32))
+        }
+        .map_err(|error| DesktopError::new(format!("right click failed: {error}")))?;
         Ok(format!("right-clicked at ({x:.0}, {y:.0}) via cursor"))
     }
 
@@ -854,9 +876,13 @@ impl Desktop for WindowsDesktop {
                 "hovering at ({x:.0}, {y:.0}) in background — call get_app_state or screenshot to see what appeared"
             ));
         }
-        Mouse::default()
-            .move_to(&UIPoint::new(x as i32, y as i32))
-            .map_err(|error| DesktopError::new(format!("hover failed: {error}")))?;
+        if identity::remote_control() {
+            Self::jump_cursor(x, y)?;
+        } else {
+            Mouse::default()
+                .move_to(&UIPoint::new(x as i32, y as i32))
+                .map_err(|error| DesktopError::new(format!("hover failed: {error}")))?;
+        }
         Ok(format!(
             "hovering at ({x:.0}, {y:.0}) via cursor — call get_app_state or screenshot to see what appeared"
         ))
@@ -875,9 +901,13 @@ impl Desktop for WindowsDesktop {
         // Everything else (Chromium, WPF, UWP, drags between windows) only
         // responds to real mouse input, which moves the user's pointer.
         let mouse = Mouse::default();
-        mouse
-            .move_to(&UIPoint::new(from_x as i32, from_y as i32))
-            .map_err(|error| DesktopError::new(format!("could not reach the drag origin: {error}")))?;
+        if identity::remote_control() {
+            Self::jump_cursor(from_x, from_y)?;
+        } else {
+            mouse
+                .move_to(&UIPoint::new(from_x as i32, from_y as i32))
+                .map_err(|error| DesktopError::new(format!("could not reach the drag origin: {error}")))?;
+        }
         // Fly overlay to the end before the real drag starts (button still up).
         AgentCursor::shared().press(to_x, to_y);
         mouse
@@ -934,9 +964,13 @@ impl Desktop for WindowsDesktop {
             }
             // Last resort: the wheel goes to whatever is under the real
             // pointer, so the pointer has to move there.
-            Mouse::default()
-                .move_to(&UIPoint::new(x as i32, y as i32))
-                .map_err(|error| DesktopError::new(format!("could not move cursor: {error}")))?;
+            if identity::remote_control() {
+                Self::jump_cursor(x, y)?;
+            } else {
+                Mouse::default()
+                    .move_to(&UIPoint::new(x as i32, y as i32))
+                    .map_err(|error| DesktopError::new(format!("could not move cursor: {error}")))?;
+            }
             if horizontal != 0 {
                 Self::scroll_wheel(true, horizontal)?;
             }
