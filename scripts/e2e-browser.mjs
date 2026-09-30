@@ -265,8 +265,9 @@ async function shootPrompt(name) {
   const shot = await evaluateIn(isPrompt, { format: "png" }, "Page.captureScreenshot");
   fs.writeFileSync(path.join(shotsDir, `${name}.png`), Buffer.from(shot.data, "base64"));
 }
+/** Evaluate in the prompt on screen (see evaluateInLive), then retire it. */
 async function inNewPrompt(expression) {
-  const value = await evaluateIn(isPrompt, expression);
+  const value = await evaluateInLive(isPrompt, expression);
   const targets = await (await fetch(`http://127.0.0.1:${devtoolsPort}/json`)).json();
   lastPrompt = Math.max(lastPrompt, ...targets.map((target) => promptId(target.url)));
   return value;
@@ -360,17 +361,21 @@ check("browser_request_credentials fills the page without returning the values",
     reason: "Sign in to run the e2e check",
   });
   // Play the person: read what the prompt shows, type, press Fill in.
-  const shown = await evaluateIn(isPrompt, `new Promise((resolve) => {
-    const ready = () => document.querySelectorAll('input').length === 2;
-    const go = () => resolve({ title: document.getElementById('title').textContent, origin: document.getElementById('origin').textContent,
-      reason: document.getElementById('reason').textContent, types: [...document.querySelectorAll('input')].map((i) => i.type) });
-    if (ready()) go(); else { const t = setInterval(() => { if (ready()) { clearInterval(t); go(); } }, 20); }
-  })`);
+  const shown = await evaluateInLive(
+    isPrompt,
+    `document.querySelectorAll('input').length !== 2 ? null : {
+      title: document.getElementById('title').textContent,
+      origin: document.getElementById('origin').textContent,
+      reason: document.getElementById('reason').textContent,
+      types: [...document.querySelectorAll('input')].map((i) => i.type),
+    }`,
+  );
   assert.equal(shown.origin, base);
   assert.equal(shown.reason, "Sign in to run the e2e check");
   assert.deepEqual(shown.types, ["email", "password"]);
   await shootPrompt("credentials");
   await inNewPrompt(`(() => {
+    if (document.querySelectorAll('input').length !== 2) return null;
     const [email, password] = document.querySelectorAll('input');
     email.value = 'person@example.com';
     password.value = ${JSON.stringify(SECRET)};
@@ -391,9 +396,11 @@ check("closing the sign-in window reports a cancel and fills nothing", async () 
   const snapshot = await ok("browser_snapshot", { tab_id: tab });
   const email = Number(/\[(\d+)\] input\[email\]/.exec(snapshot)[1]);
   const pending = tool("browser_request_credentials", { tab_id: tab, fields: [{ index: email }] });
-  await inNewPrompt(`new Promise((resolve) => {
-    const t = setInterval(() => { const button = document.getElementById('cancel'); if (document.querySelector('input')) { clearInterval(t); button.click(); resolve(true); } }, 20);
-  })`);
+  await inNewPrompt(`(() => {
+    if (!document.querySelector('input')) return null;
+    document.getElementById('cancel').click();
+    return true;
+  })()`);
   const result = await pending;
   assert.match(result.text, /cancelled/);
 });
