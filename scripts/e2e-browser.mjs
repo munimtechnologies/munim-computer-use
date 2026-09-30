@@ -222,6 +222,35 @@ async function evaluateIn(match, expression, method = "Runtime.evaluate") {
   }
   throw new Error("no DevTools target matched");
 }
+/**
+ * Evaluate in every DevTools target whose URL matches, until one returns a
+ * value other than null. A popup can list more than one target for the same
+ * URL for a moment (the document it started with and the one it navigated
+ * to), and only the live one has run its script, so the first match is not
+ * necessarily the page on screen.
+ */
+async function evaluateInLive(match, expression) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const targets = await (await fetch(`http://127.0.0.1:${devtoolsPort}/json`)).json();
+    for (const target of targets.filter((entry) => entry.type === "page" && match(entry.url))) {
+      const socket = new WebSocket(target.webSocketDebuggerUrl);
+      await new Promise((resolve) => socket.addEventListener("open", resolve, { once: true }));
+      const value = await new Promise((resolve) => {
+        socket.addEventListener("message", (event) => {
+          const message = JSON.parse(event.data);
+          if (message.id === 1) resolve(message.result?.result?.value ?? null);
+        });
+        socket.send(
+          JSON.stringify({ id: 1, method: "Runtime.evaluate", params: { expression, returnByValue: true } }),
+        );
+      });
+      socket.close();
+      if (value !== null) return value;
+    }
+    await sleep(100);
+  }
+  throw new Error("no live DevTools target answered");
+}
 // Each prompt window is prompt.html#<id>, ids counting up. An answered one can
 // linger in the target list for a moment, so always take the newest.
 let lastPrompt = 0;
@@ -386,11 +415,20 @@ check("the tab's current page is checked too, not only where it navigates", asyn
 check("an ask rule shows an approval prompt, once", async () => {
   fs.writeFileSync(policyPath, JSON.stringify({ sites: { localhost: "ask" } }));
   const pending = tool("browser_navigate", { tab_id: tab, url: `${otherBase}/next` });
-  await evaluateIn(isPrompt, `new Promise((resolve) => {
-    const t = setInterval(() => { if (document.getElementById('title').textContent.startsWith('Let')) { clearInterval(t); resolve(true); } }, 20);
-  })`);
+  const approvalShown = `document.getElementById('title')?.textContent.startsWith('Let') ? true : null`;
+  await evaluateInLive(isPrompt, approvalShown);
   await shootPrompt("approve-site");
-  const title = await inNewPrompt(`(() => { document.getElementById('ok').click(); return document.getElementById('title').textContent; })()`);
+  const title = await evaluateInLive(
+    isPrompt,
+    `(() => {
+      const title = document.getElementById('title')?.textContent ?? '';
+      if (!title.startsWith('Let')) return null;
+      document.getElementById('ok').click();
+      return title;
+    })()`,
+  );
+  const targets = await (await fetch(`http://127.0.0.1:${devtoolsPort}/json`)).json();
+  lastPrompt = Math.max(lastPrompt, ...targets.map((target) => promptId(target.url)));
   assert.match(title, /Let the agent open localhost/);
   const result = await pending;
   assert.equal(result.isError, false, result.text);
