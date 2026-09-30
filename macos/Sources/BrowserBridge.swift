@@ -268,8 +268,11 @@ enum NativeHost {
 
 /// Pending connections the bridge sockets queue before accept(). Every MCP
 /// process on the machine connects to the owner at launch, so 8 overflowed
-/// when several agents started together and the rest were refused.
-let bridgeListenBacklog: Int32 = 64
+/// when several agents started together and the rest were refused, and 64
+/// still overflowed when a burst outran accept() on a busy machine (CI saw
+/// peer 64 refused). The system maximum (kern.ipc.somaxconn, 128 by default)
+/// is the most macOS will queue anyway.
+let bridgeListenBacklog: Int32 = SOMAXCONN
 
 /// Run a loop that blocks in read()/accept() for its whole life on its own
 /// thread. On GCD's shared pool each idle peer pinned a worker thread, and
