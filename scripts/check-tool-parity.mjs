@@ -11,8 +11,8 @@
 // Deliberate differences, and the only ones allowed:
 //   * get_app_state.window  — macOS only (scope to one window or the agent's
 //     Chrome window).
-//   * screenshot.format, screenshot.quality — Windows/Linux only (jpeg
-//     encoding and its quality).
+//   * screenshot.format, screenshot.quality, screenshot.cursor — Windows/Linux
+//     only (jpeg encoding, its quality, and the pointer shape for viewers).
 //
 // Usage: node scripts/check-tool-parity.mjs   (exit 1 on any mismatch)
 import { readFileSync } from "node:fs";
@@ -28,6 +28,7 @@ const ALLOWED_EXTRAS = {
   rust: [
     ["screenshot", "format"],
     ["screenshot", "quality"],
+    ["screenshot", "cursor"],
   ],
 };
 
@@ -299,5 +300,5 @@ if (problems.length) {
   for (const problem of problems) console.error(`  - ${problem}`);
   process.exit(1);
 }
-console.log(`Tool parity OK: ${swiftNames.length} tools, identical in order, text and schema (allowed extras: get_app_state.window on macOS, screenshot.format and screenshot.quality on Windows/Linux).`);
+console.log(`Tool parity OK: ${swiftNames.length} tools, identical in order, text and schema (allowed extras: get_app_state.window on macOS, screenshot.format, screenshot.quality and screenshot.cursor on Windows/Linux).`);
 }
