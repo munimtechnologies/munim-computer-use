@@ -306,10 +306,6 @@ fn all_tool_defs() -> Value {
                         "minimum": 1,
                         "maximum": 100,
                         "description": "JPEG quality from 1 to 100 (default 55). Ignored for png. Raise it when small text must stay sharp."
-                    },
-                    "cursor": {
-                        "type": "boolean",
-                        "description": "With display: also return the pointer's position and current shape (a PNG plus hotspot) as a 'cursor:' JSON line, since captures leave the pointer out. Windows only; for remote viewers."
                     }
                 }
             },

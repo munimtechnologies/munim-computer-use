@@ -689,8 +689,10 @@ fn run_desktop_tool(
                 let capture = capture::capture_display(index, max_width, format)?;
                 let text = capture::mapping_text(&capture, &format!("display {index}"));
                 let mut result = image_result(capture.bytes, format.mime_type(), text);
-                // Captures leave the pointer out; a remote viewer asks for its
-                // shape here and draws it as its own cursor.
+                // Captures leave the pointer out. MT Code's Computer View asks
+                // for its shape here and draws it as the viewer's own cursor.
+                // Deliberately not in the tool schema: it serves that viewer,
+                // not agents.
                 if args.get("cursor").and_then(Value::as_bool) == Some(true)
                     && let Some(cursor) = cursor::current()
                     && let Some(content) = result.get_mut("content").and_then(Value::as_array_mut)
