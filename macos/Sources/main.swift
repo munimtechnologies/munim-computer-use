@@ -1316,11 +1316,57 @@ func toolActivateApp(_ args: [String: Any]) -> String {
 
 // MARK: - Screen capture
 
-/// Synchronizes capture results so a timed-out waiter never races a late write.
+/// How a capture is encoded. PNG by default: agents read UI text, and PNG keeps
+/// it sharp. JPEG is for live remote viewing, where every frame is replaced a
+/// moment later and bytes matter more than exact pixels. Mirrors the
+/// Windows/Linux server's `format` and `quality`.
+enum ImageEncoding: Equatable {
+    case png
+    /// JPEG at this quality (1-100).
+    case jpeg(Int)
+
+    /// JPEG quality when the caller does not ask for one, as on Windows/Linux.
+    static let defaultJPEGQuality = 55
+
+    static func parse(_ args: [String: Any]) throws -> ImageEncoding {
+        let format = ((args["format"] as? String) ?? "png").lowercased()
+        switch format {
+        case "png":
+            return .png
+        case "jpeg", "jpg":
+            let quality = (args["quality"] as? Int).map { min(max($0, 1), 100) } ?? defaultJPEGQuality
+            return .jpeg(quality)
+        default:
+            throw "error: unsupported screenshot format '\(format)' — use png or jpeg"
+        }
+    }
+
+    var mimeType: String {
+        switch self {
+        case .png: return "image/png"
+        case .jpeg: return "image/jpeg"
+        }
+    }
+
+    func encode(_ image: CGImage) -> Data? {
+        let data = NSMutableData()
+        let type = (self == .png ? "public.png" : "public.jpeg") as CFString
+        guard let destination = CGImageDestinationCreateWithData(data, type, 1, nil) else { return nil }
+        var options: [CFString: Any] = [:]
+        if case .jpeg(let quality) = self {
+            options[kCGImageDestinationLossyCompressionQuality] = Double(quality) / 100
+        }
+        CGImageDestinationAddImage(destination, image, options as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        return data as Data
+    }
+}
+
 /// One capture plus the geometry a model needs to turn image pixels back into
 /// the screen coordinates that click/hover/zoom accept.
 struct CaptureShot {
     let data: Data
+    let mimeType: String
     /// Captured area in global screen points (the coordinate space of click x/y).
     let frame: CGRect
     let pixelWidth: Int
@@ -1328,6 +1374,7 @@ struct CaptureShot {
     let title: String?
 }
 
+/// Synchronizes capture results so a timed-out waiter never races a late write.
 private final class CaptureBox: @unchecked Sendable {
     private let lock = NSLock()
     private var value: CaptureShot?
@@ -1340,6 +1387,47 @@ private final class CaptureBox: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return value
+    }
+}
+
+/// The attached displays, kept between captures. Asking ScreenCaptureKit for
+/// shareable content walks every window on screen, which costs more than the
+/// display capture itself when a viewer asks for frames back to back. Displays
+/// only change when one is attached, removed or rearranged, which AppKit
+/// announces, so the list is dropped then (and after a short lifetime, in case
+/// a notification is missed). Window captures still query fresh: windows open,
+/// close and move all the time, and a stale frame would put clicks in the
+/// wrong place.
+final class DisplayCache: @unchecked Sendable {
+    static let shared = DisplayCache()
+    private static let lifetime: TimeInterval = 30
+    private let lock = NSLock()
+    private var displays: [SCDisplay]?
+    private var fetchedAt = Date.distantPast
+
+    private init() {
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: nil
+        ) { [weak self] _ in self?.invalidate() }
+    }
+
+    func invalidate() {
+        lock.withLock { displays = nil }
+    }
+
+    func current(fresh: Bool = false) async throws -> [SCDisplay] {
+        if !fresh, let cached = lock.withLock({
+            -fetchedAt.timeIntervalSinceNow < Self.lifetime ? displays : nil
+        }) {
+            return cached
+        }
+        let content = try await SCShareableContent.excludingDesktopWindows(
+            false, onScreenWindowsOnly: true)
+        lock.withLock {
+            displays = content.displays
+            fetchedAt = Date()
+        }
+        return content.displays
     }
 }
 
@@ -1362,7 +1450,7 @@ func captureMappingText(_ shot: CaptureShot, label: String) -> String {
 func imageResult(_ shot: CaptureShot, label: String) -> [String: Any] {
     return [
         "content": [
-            ["type": "image", "data": shot.data.base64EncodedString(), "mimeType": "image/png"],
+            ["type": "image", "data": shot.data.base64EncodedString(), "mimeType": shot.mimeType],
             ["type": "text", "text": captureMappingText(shot, label: label)],
         ],
         "isError": false,
@@ -1378,10 +1466,10 @@ func backingScale(for display: SCDisplay) -> CGFloat {
     }?.backingScaleFactor ?? 2
 }
 
-/// Capture a window as PNG. Runs the async ScreenCaptureKit call on a background
+/// Capture a window. Runs the async ScreenCaptureKit call on a background
 /// executor and blocks the JSON-RPC loop until it lands, with a timeout so a
 /// wedged capture can never hang the server.
-func captureWindowPNG(pid: pid_t, maxWidth: Int) -> CaptureShot? {
+func captureWindow(pid: pid_t, maxWidth: Int, encoding: ImageEncoding) -> CaptureShot? {
     let semaphore = DispatchSemaphore(value: 0)
     let box = CaptureBox()
 
@@ -1411,11 +1499,10 @@ func captureWindowPNG(pid: pid_t, maxWidth: Int) -> CaptureShot? {
             let image = try await SCScreenshotManager.captureImage(
                 contentFilter: SCContentFilter(desktopIndependentWindow: window),
                 configuration: config)
-            guard let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])
-            else { return }
+            guard let data = encoding.encode(image) else { return }
             box.set(CaptureShot(
-                data: png, frame: window.frame, pixelWidth: image.width, pixelHeight: image.height,
-                title: window.title))
+                data: data, mimeType: encoding.mimeType, frame: window.frame,
+                pixelWidth: image.width, pixelHeight: image.height, title: window.title))
         } catch {
             box.set(nil)
         }
@@ -1432,96 +1519,94 @@ func captureWindowPNG(pid: pid_t, maxWidth: Int) -> CaptureShot? {
 
 /// Capture a whole display. Window capture covers one app; this is for seeing
 /// the desktop as a whole, including every monitor the user has attached.
-func captureDisplayPNG(index: Int, maxWidth: Int) -> CaptureShot? {
+func captureDisplay(index: Int, maxWidth: Int, encoding: ImageEncoding) -> CaptureShot? {
     let semaphore = DispatchSemaphore(value: 0)
-    let lock = NSLock()
-    var result: CaptureShot?
-    Task.detached {
+    let box = CaptureBox()
+    let task = Task.detached {
         defer { semaphore.signal() }
-        do {
-            let content = try await SCShareableContent.excludingDesktopWindows(
-                false, onScreenWindowsOnly: true)
-            let displays = content.displays
-            guard index >= 0, index < displays.count else { return }
-            let display = displays[index]
-            let config = SCStreamConfiguration()
-            let scale: Double
-            if maxWidth > 0 {
-                scale = min(1.0, Double(maxWidth) / max(1.0, Double(display.width)))
-            } else {
-                scale = 1.0
+        // The cached display list first; if that display is gone or the
+        // capture fails, once more with a fresh list.
+        for fresh in [false, true] {
+            do {
+                let displays = try await DisplayCache.shared.current(fresh: fresh)
+                guard index >= 0, index < displays.count else { continue }
+                let display = displays[index]
+                let config = SCStreamConfiguration()
+                let scale: Double
+                if maxWidth > 0 {
+                    scale = min(1.0, Double(maxWidth) / max(1.0, Double(display.width)))
+                } else {
+                    scale = 1.0
+                }
+                config.width = Int(Double(display.width) * scale)
+                config.height = Int(Double(display.height) * scale)
+                config.showsCursor = false
+                let image = try await SCScreenshotManager.captureImage(
+                    contentFilter: SCContentFilter(display: display, excludingWindows: []),
+                    configuration: config)
+                guard let data = encoding.encode(image) else { return }
+                box.set(CaptureShot(
+                    data: data, mimeType: encoding.mimeType, frame: display.frame,
+                    pixelWidth: image.width, pixelHeight: image.height, title: nil))
+                return
+            } catch {
+                continue
             }
-            config.width = Int(Double(display.width) * scale)
-            config.height = Int(Double(display.height) * scale)
-            config.showsCursor = false
-            let image = try await SCScreenshotManager.captureImage(
-                contentFilter: SCContentFilter(display: display, excludingWindows: []),
-                configuration: config)
-            if let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) {
-                lock.lock()
-                result = CaptureShot(
-                    data: png, frame: display.frame, pixelWidth: image.width, pixelHeight: image.height,
-                    title: nil)
-                lock.unlock()
-            }
-        } catch {
-            lock.lock()
-            result = nil
-            lock.unlock()
         }
     }
-    // On timeout the task may still write `result` — do not read it.
     if semaphore.wait(timeout: .now() + 20) == .timedOut {
+        task.cancel()
+        // Do not read `box` after cancel — the task may still be writing.
         return nil
     }
-    lock.lock()
-    defer { lock.unlock() }
-    return result
+    return box.get()
 }
 
 /// Capture one region of the screen at full physical resolution. `rect` is in
 /// global screen points, the same space click/hover take, so a model can zoom
 /// straight from the coordinates it already knows.
-func captureRegionPNG(rect: CGRect, maxWidth: Int) -> CaptureShot? {
+func captureRegion(rect: CGRect, maxWidth: Int, encoding: ImageEncoding) -> CaptureShot? {
     let semaphore = DispatchSemaphore(value: 0)
     let box = CaptureBox()
     let task = Task.detached {
         defer { semaphore.signal() }
-        do {
-            let content = try await SCShareableContent.excludingDesktopWindows(
-                false, onScreenWindowsOnly: true)
-            let center = CGPoint(x: rect.midX, y: rect.midY)
-            guard let display = content.displays.first(where: { $0.frame.contains(center) })
-                ?? content.displays.first
-            else { return }
-            let clipped = rect.intersection(display.frame)
-            guard clipped.width >= 4, clipped.height >= 4 else { return }
-            let scale = backingScale(for: display)
-            var width = clipped.width * scale
-            var height = clipped.height * scale
-            if maxWidth > 0, width > CGFloat(maxWidth) {
-                let ratio = CGFloat(maxWidth) / width
-                width *= ratio
-                height *= ratio
+        for fresh in [false, true] {
+            do {
+                let displays = try await DisplayCache.shared.current(fresh: fresh)
+                let center = CGPoint(x: rect.midX, y: rect.midY)
+                guard let display = displays.first(where: { $0.frame.contains(center) })
+                    ?? displays.first
+                else { continue }
+                let clipped = rect.intersection(display.frame)
+                guard clipped.width >= 4, clipped.height >= 4 else { continue }
+                let scale = backingScale(for: display)
+                var width = clipped.width * scale
+                var height = clipped.height * scale
+                if maxWidth > 0, width > CGFloat(maxWidth) {
+                    let ratio = CGFloat(maxWidth) / width
+                    width *= ratio
+                    height *= ratio
+                }
+                let config = SCStreamConfiguration()
+                config.sourceRect = CGRect(
+                    x: clipped.origin.x - display.frame.origin.x,
+                    y: clipped.origin.y - display.frame.origin.y,
+                    width: clipped.width, height: clipped.height)
+                config.width = max(1, Int(width.rounded()))
+                config.height = max(1, Int(height.rounded()))
+                config.showsCursor = false
+                if #available(macOS 14.0, *) { config.captureResolution = .best }
+                let image = try await SCScreenshotManager.captureImage(
+                    contentFilter: SCContentFilter(display: display, excludingWindows: []),
+                    configuration: config)
+                guard let data = encoding.encode(image) else { return }
+                box.set(CaptureShot(
+                    data: data, mimeType: encoding.mimeType, frame: clipped,
+                    pixelWidth: image.width, pixelHeight: image.height, title: nil))
+                return
+            } catch {
+                continue
             }
-            let config = SCStreamConfiguration()
-            config.sourceRect = CGRect(
-                x: clipped.origin.x - display.frame.origin.x,
-                y: clipped.origin.y - display.frame.origin.y,
-                width: clipped.width, height: clipped.height)
-            config.width = max(1, Int(width.rounded()))
-            config.height = max(1, Int(height.rounded()))
-            config.showsCursor = false
-            if #available(macOS 14.0, *) { config.captureResolution = .best }
-            let image = try await SCScreenshotManager.captureImage(
-                contentFilter: SCContentFilter(display: display, excludingWindows: []),
-                configuration: config)
-            guard let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])
-            else { return }
-            box.set(CaptureShot(
-                data: png, frame: clipped, pixelWidth: image.width, pixelHeight: image.height, title: nil))
-        } catch {
-            box.set(nil)
         }
     }
     if semaphore.wait(timeout: .now() + 15) == .timedOut {
@@ -1538,17 +1623,16 @@ func toolListDisplays(_ args: [String: Any]) -> String {
     let task = Task.detached {
         defer { semaphore.signal() }
         var collected: [String] = []
-        if let content = try? await SCShareableContent.excludingDesktopWindows(
-            false, onScreenWindowsOnly: true) {
-            for (i, display) in content.displays.enumerated() {
+        // Fresh, and it refreshes the cache the captures read: a viewer lists
+        // displays once, then asks for frames by index.
+        if let displays = try? await DisplayCache.shared.current(fresh: true) {
+            for (i, display) in displays.enumerated() {
                 let frame = display.frame
                 collected.append("[\(i)] \(display.width)x\(display.height) "
                     + "at (\(Int(frame.origin.x)), \(Int(frame.origin.y)))")
             }
         }
-        lock.lock()
-        lines = collected
-        lock.unlock()
+        lock.withLock { lines = collected }
     }
     if semaphore.wait(timeout: .now() + 20) == .timedOut {
         task.cancel()
@@ -3032,6 +3116,17 @@ let toolDefs: [[String: Any]] = [
                     "type": "integer",
                     "description": "Downscale the image to this width in pixels (default 1400). Lower it to save tokens.",
                 ],
+                "format": [
+                    "type": "string",
+                    "enum": ["png", "jpeg"],
+                    "description": "Image encoding (default png). Use jpeg for live remote viewing.",
+                ],
+                "quality": [
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "description": "JPEG quality from 1 to 100 (default 55). Ignored for png. Raise it when small text must stay sharp.",
+                ],
             ],
         ],
         "annotations": [
@@ -4169,7 +4264,12 @@ while let line = readLine(strippingNewline: true) {
                     break
                 }
                 let maxWidth = clampedMaxWidth(args)
-                guard let shot = captureRegionPNG(rect: rect, maxWidth: maxWidth) else {
+                let encoding: ImageEncoding
+                do { encoding = try ImageEncoding.parse(args) } catch {
+                    respond(id: id, result: textResult("\(error)", isError: true))
+                    break
+                }
+                guard let shot = captureRegion(rect: rect, maxWidth: maxWidth, encoding: encoding) else {
                     respond(id: id, result: textResult(
                         "error: could not capture that region — check Screen Recording permission and "
                         + "that the region lies on an attached display (list_displays).", isError: true))
@@ -4179,9 +4279,19 @@ while let line = readLine(strippingNewline: true) {
                 break
             }
             if name == "screenshot" {
+                let encoding: ImageEncoding
+                do { encoding = try ImageEncoding.parse(args) } catch {
+                    respond(id: id, result: textResult("\(error)", isError: true))
+                    break
+                }
                 if let display = args["display"] as? Int {
                     let maxWidth = clampedMaxWidth(args)
-                    guard let shot = captureDisplayPNG(index: display, maxWidth: maxWidth) else {
+                    if (args["live"] as? Bool) == true {
+                        respond(id: id, result: liveScreenshotResult(
+                            args, display: display, maxWidth: maxWidth, encoding: encoding))
+                        break
+                    }
+                    guard let shot = captureDisplay(index: display, maxWidth: maxWidth, encoding: encoding) else {
                         respond(id: id, result: textResult(
                             "error: could not capture display \(display) — check Screen Recording "
                             + "permission, or call list_displays for valid indices.", isError: true))
@@ -4201,7 +4311,9 @@ while let line = readLine(strippingNewline: true) {
                     break
                 }
                 let maxWidth = clampedMaxWidth(args)
-                guard let shot = captureWindowPNG(pid: resolved.app.processIdentifier, maxWidth: maxWidth) else {
+                guard let shot = captureWindow(
+                    pid: resolved.app.processIdentifier, maxWidth: maxWidth, encoding: encoding)
+                else {
                     respond(id: id, result: textResult(
                         "error: screen capture failed. The host app may be missing Screen Recording "
                         + "permission, or this app may have no on-screen window.",

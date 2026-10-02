@@ -149,6 +149,7 @@ pub struct CaptureFrame {
     pub height: f64,
 }
 
+#[derive(Clone)]
 pub struct Capture {
     pub bytes: Vec<u8>,
     pub frame: CaptureFrame,
@@ -172,7 +173,7 @@ pub fn mapping_text(capture: &Capture, label: &str) -> String {
     )
 }
 
-fn finish(image: RgbaImage, frame: CaptureFrame, max_width: u32, format: CaptureFormat) -> Result<Capture> {
+pub(crate) fn finish(image: RgbaImage, frame: CaptureFrame, max_width: u32, format: CaptureFormat) -> Result<Capture> {
     let image = if max_width > 0 && image.width() > max_width {
         let height = ((image.height() as f64) * (max_width as f64) / (image.width() as f64))
             .round()

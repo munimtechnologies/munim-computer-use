@@ -23,6 +23,7 @@ mod install;
 // Only the Windows and Linux backends press keys; macOS builds compile this for tests.
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 mod keys;
+mod live;
 mod platform;
 mod policy;
 mod tools;
@@ -371,6 +372,38 @@ fn call_tool(
             Ok(format) => format,
             Err(error) => return text_result(format!("error: {error}"), true),
         };
+        let Ok(index) = usize::try_from(display) else {
+            return text_result("error: display index must be zero or greater", true);
+        };
+        if args.get("live").and_then(Value::as_bool) == Some(true) {
+            let request = live::LiveRequest {
+                display: index,
+                max_width,
+                format,
+                after: args.get("after").and_then(Value::as_u64),
+                wait_ms: arg_i64(&args, "wait_ms")
+                    .unwrap_or(i64::from(live::DEFAULT_WAIT_MS))
+                    .clamp(0, i64::from(live::MAX_WAIT_MS)) as u32,
+                pointer: args.get("cursor").and_then(Value::as_bool) == Some(true),
+            };
+            match live::frame(&request) {
+                Ok(live::LiveFrame::Changed { capture, seq }) => {
+                    let text = capture::mapping_text(&capture, &format!("display {index}"));
+                    let mut result = image_result(capture.bytes, format.mime_type(), text);
+                    if let Some(content) = result.get_mut("content").and_then(Value::as_array_mut) {
+                        content.push(json!({ "type": "text", "text": live::live_line(seq, true) }));
+                    }
+                    return with_cursor(result, &args);
+                }
+                Ok(live::LiveFrame::Unchanged { seq }) => {
+                    return with_cursor(text_result(live::live_line(seq, false), false), &args);
+                }
+                Err(live::LiveError::Failed(error)) => return text_result(format!("error: {error}"), true),
+                // No live path here: an ordinary capture, without the live line,
+                // tells the viewer to keep polling.
+                Err(live::LiveError::Unsupported) => {}
+            }
+        }
         return match usize::try_from(display) {
             Ok(index) => match capture::capture_display(index, max_width, format) {
                 Ok(capture) => {
