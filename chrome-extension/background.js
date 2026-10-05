@@ -529,6 +529,13 @@ async function attach(tabId) {
   attached.add(tabId);
 }
 
+// Chrome ends a session on its own when the user cancels the "is debugging
+// this browser" bar, DevTools takes the tab, or the renderer goes away.
+// Forget it, so the next command attaches again instead of failing forever.
+chrome.debugger.onDetach.addListener((source) => {
+  if (source.tabId !== undefined) attached.delete(source.tabId);
+});
+
 /// Let go of a tab's debugger session, clearing Chrome's "is debugging this
 /// browser" banner. Safe to call for a tab that was never attached.
 async function detachTab(tabId) {
@@ -552,6 +559,10 @@ const SNAPSHOT_JS = `(() => {
   const out = [];
   const sel = 'a,button,input,textarea,select,cfc-select,mat-option,[role=button],[role=link],[role=textbox],[role=combobox],[role=listbox],[role=option],[role=menu],[role=menuitem],[aria-haspopup],[contenteditable=true],summary';
   let i = 0;
+  // Clear the previous snapshot's indices first. An element hidden since then
+  // would otherwise keep its old number, and querySelector, which returns the
+  // first match, could send a click or a credential fill to it instead.
+  for (const old of document.querySelectorAll('[data-cu-idx]')) old.removeAttribute('data-cu-idx');
   for (const el of document.querySelectorAll(sel)) {
     const r = el.getBoundingClientRect();
     if (r.width < 2 || r.height < 2) continue;
@@ -1233,14 +1244,16 @@ function siteRule(rules, url) {
   try {
     const parsed = new URL(url);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "allow";
-    host = parsed.hostname.toLowerCase();
+    // "bank.example." is the same site as "bank.example"; a trailing dot must
+    // not take a host out from under its rule.
+    host = parsed.hostname.toLowerCase().replace(/\.+$/, "");
   } catch {
     return "allow";
   }
   let best = null;
   for (const entry of rules) {
     if (!entry || typeof entry.pattern !== "string") continue;
-    const pattern = entry.pattern.trim().toLowerCase().replace(/^\*\./, "");
+    const pattern = entry.pattern.trim().toLowerCase().replace(/^\*\./, "").replace(/\.+$/, "");
     const matches = pattern === "*" || host === pattern || host.endsWith("." + pattern);
     if (!matches) continue;
     const specificity = pattern === "*" ? 0 : pattern.length;
