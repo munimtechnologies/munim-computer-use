@@ -563,6 +563,50 @@ test("return_state attaches a fresh snapshot to an action", async () => {
   pageEval = () => ({ result: { value: {} } });
 });
 
+test("a click index that is not a plain number never reaches the page as script", async () => {
+  const evaluated = [];
+  pageEval = (method, params) => {
+    evaluated.push(params.expression ?? "");
+    return { result: { value: { ok: true, x: 1, y: 1 } } };
+  };
+  const payload = `0"]'); globalThis.leaked = 1; ('`;
+  for (const index of [payload, 1.5, -1, { toString: () => "0" }]) {
+    const error = await refuses("click", { tabId: pageTab, index });
+    assert.match(error, /index must be an element index/);
+  }
+  assert.ok(!evaluated.some((expression) => expression.includes("leaked")), "the payload was evaluated");
+  pageEval = () => ({ result: { value: {} } });
+});
+
+test("return_state does not read a blocked site the action landed on", async () => {
+  const sites = [{ pattern: "bank.example", rule: "block" }];
+  const tab = tabs.get(pageTab);
+  const before = tab.url;
+  let snapshots = 0;
+  pageEval = (method, params) => {
+    const expression = params.expression ?? "";
+    if (expression.includes("data-cu-idx=\"2\"")) {
+      // The click follows a link into a blocked site.
+      tab.url = "https://www.bank.example/accounts";
+      return { result: { value: { ok: true, tag: "a", x: 5, y: 5 } } };
+    }
+    if (expression.includes("querySelectorAll(sel)")) {
+      snapshots += 1;
+      return { result: { value: { title: "Accounts", url: tab.url, elements: [] } } };
+    }
+    return { result: { value: {} } };
+  };
+  // return_state waits for the page to settle, so wait for the reply in time.
+  const error = await callAndWait("click", { tabId: pageTab, index: 2, returnState: true, sites }).then(
+    () => "click was supposed to fail",
+    (failure) => failure.message,
+  );
+  assert.match(error, /blocked by the user's Computer Use policy/);
+  assert.equal(snapshots, 0, "the blocked page was read");
+  tab.url = before;
+  pageEval = () => ({ result: { value: {} } });
+});
+
 test("a blocked site is refused before the tab is opened", async () => {
   const tabsBefore = tabs.size;
   const error = await refuses("open_tab", {

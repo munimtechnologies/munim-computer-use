@@ -884,6 +884,11 @@ const CLICK_JS = (index) => `(() => {
 /// Driving the node directly works regardless of whether the tab is rendered,
 /// which is the whole point of working in a tab the user is not looking at.
 async function clickElement(tabId, index) {
+  // The index is spliced into the script CLICK_JS runs in the page, so only a
+  // plain snapshot index may reach it: anything else would run as page script.
+  if (!Number.isInteger(index) || index < 0) {
+    throw new Error("index must be an element index from browser_snapshot");
+  }
   const res = await send(tabId, "Runtime.evaluate", {
     expression: CLICK_JS(index),
     returnByValue: true,
@@ -1110,6 +1115,10 @@ async function settle(tabId, pauseMs = 350, loadBudgetMs = 8000) {
 async function withState(p, result) {
   if (p.returnState !== true) return result;
   await settle(p.tabId);
+  // The action may have left the page it was allowed on (a link, a redirect,
+  // a submitted form): apply the site rules to where the tab is now before
+  // reading it, as browser_snapshot does.
+  await checkTab(requireClientId(p), p.tabId, p.sites, "read");
   return { ...result, snapshot: await snapshot(p.tabId) };
 }
 
