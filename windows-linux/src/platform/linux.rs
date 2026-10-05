@@ -202,6 +202,16 @@ impl LinuxDesktop {
             .map_err(|error| DesktopError::new(format!("could not read character count: {error}")))
     }
 
+    /// A password field the agent must not write into (AT-SPI role
+    /// `PasswordText`), unless the user opted in.
+    fn refuses_secure_input(&self, element: &ElementRef) -> bool {
+        !super::secure_field_input_allowed()
+            && matches!(
+                self.proxy(element).ok().and_then(|proxy| block_on(proxy.get_role()).ok()),
+                Some(Role::PasswordText)
+            )
+    }
+
     /// Ask the toolkit to focus an element, which also raises its window on most
     /// desktops — the closest portable equivalent to activating an app.
     fn grab_focus(&self, element: &ElementRef) -> Result<bool> {
@@ -1222,6 +1232,10 @@ impl Desktop for LinuxDesktop {
         // synthetic keys are not.
         if let Some(id) = element {
             let reference = self.element(id)?;
+            if self.refuses_secure_input(&reference) {
+                let _ = self.grab_focus(&reference);
+                return Ok(super::secure_field_handback(id));
+            }
             if self.insert_text(&reference, text, false).is_ok() {
                 return Ok(format!("typed {} characters into e{id}", text.chars().count()));
             }
@@ -1397,6 +1411,10 @@ impl Desktop for LinuxDesktop {
     fn set_value(&mut self, element: u32, value: &str) -> Result<String> {
         self.ensure_accessibility();
         let reference = self.element(element)?;
+        if self.refuses_secure_input(&reference) {
+            let _ = self.grab_focus(&reference);
+            return Ok(super::secure_field_handback(element));
+        }
         self.insert_text(&reference, value, true).map_err(|error| {
             DesktopError::new(format!(
                 "{error} — not every toolkit allows a direct write; click e{element}, select all \

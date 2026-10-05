@@ -156,6 +156,31 @@ pub fn format_app_list(mut apps: Vec<AppInfo>) -> String {
         .join("\n")
 }
 
+/// Whether the user opted in to typing into password fields
+/// (`COMPUTER_USE_ALLOW_SECURE_FIELD_INPUT=1`). Off by default, as on macOS: a
+/// credential typed by an agent is produced by the model and can stay in the
+/// transcript, so a password field is handed to the user instead.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+pub fn secure_field_input_allowed() -> bool {
+    secure_field_flag_allows(crate::identity::env_var("ALLOW_SECURE_FIELD_INPUT").as_deref())
+}
+
+fn secure_field_flag_allows(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// What `type_text` / `set_value` say after focusing a password field for the
+/// user instead of writing into it. Worded as the macOS server words it.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+pub fn secure_field_handback(id: u32) -> String {
+    format!(
+        "handed control to the user: e{id} is a password field, so it was focused for them to type \
+         into. The credential is deliberately not routed through the model. Tell the user it is \
+         ready, wait for them to say they are done, then continue — do not retry this call. \
+         (COMPUTER_USE_ALLOW_SECURE_FIELD_INPUT=1 lets the agent type throwaway credentials.)"
+    )
+}
+
 /// The operations every backend must provide.
 ///
 /// `&mut self` throughout because `get_app_state` refreshes the element
@@ -243,6 +268,19 @@ mod tests {
         let lines: Vec<&str> = rendered.lines().collect();
         assert!(lines[0].starts_with("Chrome  [chrome]  pid=1  windows=3  FRONTMOST"));
         assert!(lines[1].starts_with("zed"));
+    }
+
+    #[test]
+    fn password_fields_are_refused_unless_the_user_opts_in() {
+        use super::{secure_field_flag_allows, secure_field_handback};
+        assert!(!secure_field_flag_allows(None));
+        assert!(!secure_field_flag_allows(Some("0")));
+        assert!(!secure_field_flag_allows(Some("")));
+        assert!(secure_field_flag_allows(Some("1")));
+        let message = secure_field_handback(7);
+        assert!(message.contains("e7 is a password field"), "{message}");
+        assert!(message.contains("do not retry"), "{message}");
+        assert!(message.contains("COMPUTER_USE_ALLOW_SECURE_FIELD_INPUT=1"), "{message}");
     }
 
     #[test]

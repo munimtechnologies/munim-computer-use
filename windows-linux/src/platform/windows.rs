@@ -89,6 +89,12 @@ impl WindowsDesktop {
         }
     }
 
+    /// A password field the agent must not write into (UIA `IsPassword`),
+    /// unless the user opted in.
+    fn refuses_secure_input(element: &UIElement) -> bool {
+        !super::secure_field_input_allowed() && element.is_password().unwrap_or(false)
+    }
+
     /// Top-level visible windows belonging to `pid`.
     fn top_level_windows(pid: u32) -> Vec<HWND> {
         struct Search {
@@ -920,7 +926,12 @@ impl Desktop for WindowsDesktop {
 
     fn type_text(&mut self, text: &str, element: Option<u32>) -> Result<String> {
         if let Some(id) = element {
-            self.element(id)?
+            let target = self.element(id)?;
+            if Self::refuses_secure_input(target) {
+                let _ = target.set_focus();
+                return Ok(super::secure_field_handback(id));
+            }
+            target
                 .set_focus()
                 .map_err(|error| DesktopError::new(format!("could not focus e{id}: {error}")))?;
         }
@@ -991,6 +1002,10 @@ impl Desktop for WindowsDesktop {
 
     fn set_value(&mut self, element: u32, value: &str) -> Result<String> {
         let target = self.element(element)?;
+        if Self::refuses_secure_input(target) {
+            let _ = target.set_focus();
+            return Ok(super::secure_field_handback(element));
+        }
         let pattern = target.get_pattern::<UIValuePattern>().map_err(|_| {
             DesktopError::new(format!(
                 "e{element} does not accept a value directly — click it and use type_text"
