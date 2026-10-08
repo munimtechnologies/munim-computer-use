@@ -2777,7 +2777,14 @@ func toolBrowserPressKey(_ args: [String: Any]) -> String {
     guard let tabId = args["tab_id"] as? Int else { return "error: missing required argument 'tab_id'" }
     guard let key = args["key"] as? String else { return "error: missing required argument 'key'" }
     return bridgeText(browserSessionCall("press", withReturnState(["tabId": tabId, "key": key], args), args: args)) { payload in
-        withPageAfter("pressed \(key) in tab \(tabId)", payload)
+        var line = "pressed \(key) in tab \(tabId)"
+        // Tab says where focus went, so the next type is not a guess.
+        if payload["handledByPage"] as? Bool == true {
+            line += " — the page handled it itself"
+        } else if let focused = payload["focused"] as? String {
+            line += " — focus is now on \(focused)"
+        }
+        return withPageAfter(line, payload)
     }
 }
 

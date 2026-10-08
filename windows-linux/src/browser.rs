@@ -774,10 +774,19 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
                     "typed {} characters into tab {tab}",
                     args.get("text").and_then(Value::as_str).unwrap_or("").chars().count()
                 ),
-                "press" => format!(
-                    "pressed {} in tab {tab}",
-                    args.get("key").and_then(Value::as_str).unwrap_or("?")
-                ),
+                "press" => {
+                    let mut line = format!(
+                        "pressed {} in tab {tab}",
+                        args.get("key").and_then(Value::as_str).unwrap_or("?")
+                    );
+                    // Tab says where focus went, so the next type is not a guess.
+                    if result.get("handledByPage").and_then(Value::as_bool) == Some(true) {
+                        line.push_str(" — the page handled it itself");
+                    } else if let Some(focused) = result.get("focused").and_then(Value::as_str) {
+                        line.push_str(&format!(" — focus is now on {focused}"));
+                    }
+                    line
+                }
                 "navigate" => format!(
                     "navigated tab {tab} to {}",
                     args.get("url").and_then(Value::as_str).unwrap_or("")
@@ -1341,6 +1350,14 @@ mod tests {
         assert_eq!(
             describe("press", &json!({}), &json!({ "tab_id": 9, "key": "Enter" })),
             "pressed Enter in tab 9"
+        );
+        assert_eq!(
+            describe(
+                "press",
+                &json!({ "pressed": "Tab", "focused": "[7] input \"Privacy policy\"" }),
+                &json!({ "tab_id": 9, "key": "Tab" })
+            ),
+            "pressed Tab in tab 9 — focus is now on [7] input \"Privacy policy\""
         );
         assert_eq!(
             describe("type", &json!({}), &json!({ "tab_id": 9, "text": "hello" })),

@@ -321,15 +321,65 @@ async function openTab(clientId, url) {
   tabOwner.set(tab.id, clientId);
   await ensureGroup(clientId, tab.id);
   await persistOwnedState();
-  // Pages replace their favicon on load (Spotify, YouTube, …). Re-apply the
-  // pointer whenever the document finishes, and also when the tab's own icon
-  // changes, so the strip stays on the agent cursor rather than the site logo.
-  chrome.tabs.onUpdated.addListener(function badge(id, info) {
-    if (id !== tab.id) return;
-    if (info.status === "complete" || info.favIconUrl) markTab(tab.id);
-    if (!tabOwner.has(tab.id)) chrome.tabs.onUpdated.removeListener(badge);
-  });
+  keepBadged(tab.id);
   return { tabId: tab.id, url: tab.url, title: tab.title, clientId };
+}
+
+/// Pages replace their favicon on load (Spotify, YouTube, …). Re-apply the
+/// pointer whenever the document finishes, and also when the tab's own icon
+/// changes, so the strip stays on the agent cursor rather than the site logo.
+function keepBadged(tabId) {
+  chrome.tabs.onUpdated.addListener(function badge(id, info) {
+    if (id !== tabId) return;
+    if (info.status === "complete" || info.favIconUrl) markTab(tabId);
+    if (!tabOwner.has(tabId)) chrome.tabs.onUpdated.removeListener(badge);
+  });
+}
+
+/**
+ * When the agent last clicked or pressed a key in a tab, by tab id. A tab that
+ * opens from one of the agent's tabs shortly after such an action was opened by
+ * the agent (a target=_blank link, a window.open popup), so it belongs to that
+ * task. Without the time bound, a link the user clicks in a tab the agent holds
+ * would be claimed too — and then closed by the agent's cleanup.
+ *
+ * @type {Map<number, { clientId: string, at: number }>}
+ */
+const agentInputAt = new Map();
+const CHILD_TAB_WINDOW_MS = 10_000;
+
+function noteAgentInput(clientId, tabId) {
+  agentInputAt.set(tabId, { clientId, at: Date.now() });
+}
+
+/// Take ownership of a tab the agent's own action opened. It is agent-created,
+/// not adopted, so the task's cleanup closes it like any tab it opened itself.
+function claimChildTab(tab) {
+  const openerId = tab.openerTabId;
+  if (typeof tab.id !== "number" || typeof openerId !== "number") return;
+  if (tabOwner.has(tab.id)) return;
+  const input = agentInputAt.get(openerId);
+  if (!input || Date.now() - input.at > CHILD_TAB_WINDOW_MS) return;
+  const clientId = tabOwner.get(openerId);
+  // The opener changed hands (released, closed) since the action.
+  if (clientId === undefined || clientId !== input.clientId) return;
+  // Ownership is recorded now, synchronously, so a list_tabs or cleanup that is
+  // already queued sees the child; grouping waits its turn in the task's queue.
+  const state = clientState(clientId);
+  state.tabs.add(tab.id);
+  tabOwner.set(tab.id, clientId);
+  void persistOwnedState();
+  keepBadged(tab.id);
+  void enqueue(clientId, async () => {
+    if (tabOwner.get(tab.id) !== clientId) return;
+    try {
+      await ensureGroup(clientId, tab.id);
+    } catch {
+      // A popup window cannot hold a tab group. The tab is still the task's,
+      // and cleanup closes it wherever it is.
+      await markTab(tab.id).catch(() => {});
+    }
+  }).catch(() => {});
 }
 
 async function listTabs(clientId, all = false) {
@@ -990,18 +1040,106 @@ async function typeText(tabId, text) {
   return { typed: text.length };
 }
 
+/// Watch the next Tab keydown, so the follow-up can tell a page that handled
+/// the key itself (an editor indenting, a widget trapping focus) from one where
+/// nothing happened.
+const TAB_PROBE_JS = `(() => {
+  const probe = { before: document.activeElement };
+  probe.listener = (e) => {
+    if (e.key !== 'Tab') return;
+    probe.event = e;
+  };
+  addEventListener('keydown', probe.listener, true);
+  window.__cuTabProbe = probe;
+  return true;
+})()`;
+
+/// Finish a Tab press. Chrome runs its own focus traversal only in a page that
+/// has focus, and an agent tab in the background never does: the keystroke
+/// reaches the page's handlers and then focus stays put, so the next type lands
+/// in the field the agent meant to leave. When that happens, move focus to the
+/// next element in sequential focus order the way the browser would have.
+const TAB_FINISH_JS = `(() => {
+  const probe = window.__cuTabProbe;
+  delete window.__cuTabProbe;
+  if (probe) removeEventListener('keydown', probe.listener, true);
+  const name = (el) => {
+    if (!el || el === document.body || el === document.documentElement) return null;
+    const label = el.getAttribute('aria-label') || el.labels?.[0]?.innerText ||
+      el.getAttribute('placeholder') || el.getAttribute('name') || el.getAttribute('title') ||
+      (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' ? '' : el.innerText) || el.id || '';
+    const index = el.getAttribute('data-cu-idx');
+    return (index !== null ? '[' + index + '] ' : '') + el.tagName.toLowerCase() +
+      (label ? ' "' + String(label).trim().replace(/\\s+/g, ' ').slice(0, 60) + '"' : '');
+  };
+  const before = probe ? probe.before : null;
+  const active = document.activeElement;
+  if (probe && active !== before) return { moved: true, focused: name(active) };
+  if (probe?.event?.defaultPrevented) return { moved: false, handled: true, focused: name(active) };
+  if (active && (active.tagName === 'IFRAME' || active.tagName === 'FRAME' || active.shadowRoot)) {
+    return { moved: false, reason: 'focus is inside a frame or component the extension cannot step through' };
+  }
+  const shown = (el) => {
+    if (el.disabled || el.closest('[inert]') || !el.getClientRects().length) return false;
+    const style = getComputedStyle(el);
+    return style.visibility !== 'hidden' && style.visibility !== 'collapse';
+  };
+  // A radio group is one stop: its checked button, or its first if none is.
+  const radioStop = (el) => {
+    if (el.type !== 'radio' || !el.name) return true;
+    const scope = el.form || document;
+    const group = Array.from(scope.querySelectorAll('input[type=radio]'))
+      .filter((r) => r.name === el.name && shown(r));
+    const checked = group.find((r) => r.checked);
+    return checked ? checked === el : group[0] === el;
+  };
+  const sel = 'a[href], area[href], button, input:not([type=hidden]), select, textarea, iframe, ' +
+    'summary, [contenteditable]:not([contenteditable=false]), [tabindex]';
+  const stops = Array.from(document.querySelectorAll(sel))
+    .filter((el) => el.tabIndex >= 0 && shown(el) && radioStop(el));
+  const order = stops.filter((el) => el.tabIndex > 0).sort((a, b) => a.tabIndex - b.tabIndex)
+    .concat(stops.filter((el) => el.tabIndex === 0));
+  const at = order.indexOf(active);
+  let next;
+  if (at >= 0) next = order[at + 1];
+  else if (active && active !== document.body && active !== document.documentElement) {
+    next = order.find((el) => active.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING);
+  } else next = order[0];
+  if (!next) return { moved: false, reason: 'focus is already on the last element of the page' };
+  next.focus();
+  if (document.activeElement !== next) return { moved: false, reason: 'the next element refused focus' };
+  // Tabbing into a text field selects its contents, as it does for a person.
+  if (next.tagName === 'TEXTAREA' || (next.tagName === 'INPUT' && typeof next.select === 'function' &&
+      /^(text|search|url|tel|email|password|number)$/.test(next.type))) {
+    try { next.select(); } catch {}
+  }
+  return { moved: true, focused: name(next) };
+})()`;
+
 async function pressKey(tabId, key) {
   const map = {
-    Enter: { windowsVirtualKeyCode: 13, key: "Enter", text: "\r" },
-    Tab: { windowsVirtualKeyCode: 9, key: "Tab" },
-    Escape: { windowsVirtualKeyCode: 27, key: "Escape" },
-    Backspace: { windowsVirtualKeyCode: 8, key: "Backspace" },
+    Enter: { windowsVirtualKeyCode: 13, code: "Enter", key: "Enter", text: "\r" },
+    Tab: { windowsVirtualKeyCode: 9, code: "Tab", key: "Tab" },
+    Escape: { windowsVirtualKeyCode: 27, code: "Escape", key: "Escape" },
+    Backspace: { windowsVirtualKeyCode: 8, code: "Backspace", key: "Backspace" },
   };
   const spec = map[key];
   if (!spec) throw new Error(`unsupported key: ${key}`);
+  if (key === "Tab") await send(tabId, "Runtime.evaluate", { expression: TAB_PROBE_JS, returnByValue: true });
   await send(tabId, "Input.dispatchKeyEvent", { type: "keyDown", ...spec });
   await send(tabId, "Input.dispatchKeyEvent", { type: "keyUp", ...spec });
-  return { pressed: key };
+  if (key !== "Tab") return { pressed: key };
+  const res = await send(tabId, "Runtime.evaluate", { expression: TAB_FINISH_JS, returnByValue: true });
+  const focus = res?.result?.value || {};
+  // Reporting success when focus stayed put sent the next type into the wrong
+  // field, so an unmoved Tab is an error the agent can act on.
+  if (!focus.moved && !focus.handled) {
+    throw new Error(
+      `Tab did not move focus (${focus.reason || "the page did not respond"}) — ` +
+        "click the field you want with browser_click instead",
+    );
+  }
+  return { pressed: key, focused: focus.focused ?? null, handledByPage: focus.handled === true };
 }
 
 async function screenshot(tabId) {
@@ -1690,6 +1828,7 @@ const handlers = {
     const clientId = requireClientId(p);
     assertOwned(clientId, p.tabId);
     await checkTab(clientId, p.tabId, p.sites, "click in");
+    noteAgentInput(clientId, p.tabId);
     const result = p.index !== undefined ? await clickElement(p.tabId, p.index) : await clickAt(p.tabId, p.x, p.y);
     return withState(p, result);
   },
@@ -1705,6 +1844,7 @@ const handlers = {
     const clientId = requireClientId(p);
     assertOwned(clientId, p.tabId);
     await checkTab(clientId, p.tabId, p.sites, "press keys in");
+    noteAgentInput(clientId, p.tabId);
     return withState(p, await pressKey(p.tabId, p.key));
   },
   screenshot: async (p) => {
@@ -1758,8 +1898,11 @@ async function handleCommand(msg, replyPort) {
   }
 }
 
+chrome.tabs.onCreated.addListener(claimChildTab);
+
 chrome.tabs.onRemoved.addListener((tabId) => {
   siteFavicons.delete(tabId);
+  agentInputAt.delete(tabId);
   if (!tabOwner.has(tabId) && !attached.has(tabId)) return;
   const clientId = tabOwner.get(tabId);
   if (clientId) {
