@@ -150,6 +150,7 @@ Also looked at: [mediar-ai/mcp-server-macos-use](https://github.com/mediar-ai/mc
 - **Coordinates that land.** Every screenshot and zoom carries its screen origin and pixels-per-point. `zoom` captures any region at full physical resolution.
 - **Your browser, your logins.** The Chrome extension gives the agent its own labelled tab group in your signed-in Chrome, and leaves your tabs alone unless you point it at one.
 - **Or the tab you already have open.** `browser_list_tabs all=true` shows every tab in the browser and `browser_use_tab` takes one over in place — useful when the page is already signed in or mid-flow and re-opening the URL would throw that away. An adopted tab is not moved into the agent's group, not activated and not reloaded; cleanup releases it rather than closing it, and `browser_release_tab` hands it back early.
+- **Tabs the agent's clicks open are the agent's too.** A `target=_blank` link or popup opened by an agent click or key press within 10 seconds joins that task's tabs and group, and its cleanup closes it. A tab opened from an agent tab without a recent agent action stays yours.
 - **Parallel tasks, one extension.** Every MCP process gets its own tab group, and one process can run several tasks by passing a stable `session_id` on its browser calls. A task cannot drive or adopt another task's tabs, and cleanup (including a process exiting) closes only its own. Any number of MCP processes share the one extension: the first owns it and the rest go through it, and if the owner exits another takes over without closing anyone's tabs. Tasks share Chrome's cookies and logins, and desktop apps and the clipboard are not isolated.
 - **Model-agnostic.** No vision model is required for interaction; local models work too.
 - **Look → act → verify.** `hover` for mouse-over menus, `wait` for loads, `query` to find a control by label without reading a whole tree.
@@ -220,7 +221,9 @@ This is not a guarantee of clickability or
 lack of occlusion. Frames and shadow
 roots are not searched. Choose a selector specific to the **new expected UI**;
 an element already present can satisfy it immediately. No arbitrary page script
-is accepted.
+is accepted, and a selector may not test the `value` attribute: React mirrors a
+controlled input's value there, password fields included, so a wait could
+otherwise confirm a password one guessed character at a time.
 
 - `wait_timeout_ms`: defaults to `8000`, accepts integers `0`–`10000`; `0` checks
   once. Requires `wait_for_selector`. The budget covers polling, not browser/API
@@ -248,8 +251,9 @@ Send this to `browser_snapshot`, inspect its readiness and fresh indices, then
 choose the next action. A timeout or tool error does not roll back a click,
 submission, typing, or navigation. Use current state to decide whether a retry is
 safe. Invalid wait types/bounds or an action wait without `return_state: true` are
-rejected before acting. These options require an updated extension as well as the
-native server; older extensions may omit readiness metadata.
+rejected before acting. `null` for an optional argument means the same as leaving
+it out. These options require an updated extension as well as the native server;
+when an older extension ignores them, the result says so and asks for a reload.
 
 Regression checks: `node --test chrome-extension/background.test.mjs` covers the
 wait contract and site-policy guards. The real-browser CI harness
@@ -267,7 +271,10 @@ node scripts/snapshot-dom.test.mjs --chrome /path/to/chrome --source original-ba
 ```
 
 `browser_snapshot` automatically scopes to the topmost visible dialog when one is
-open, so covered background controls cannot consume the dialog's budget. Hidden
+open, so covered background controls cannot consume the dialog's budget. A
+dialog's portalled popups stay in scope: elements its controls point at through
+`aria-controls`/`aria-owns`, open popovers, and controls painted on top of the
+dialog, such as a select's options rendered at the end of `<body>`. Hidden
 and inert subtrees are excluded; reachable offscreen controls remain available.
 Native modeless dialogs and explicit `aria-modal="false"` do not scope the page.
 Native modal dialogs and explicit `aria-modal="true"` are definitive candidates.

@@ -677,9 +677,39 @@ const SNAPSHOT_JS = `((options = {}) => {
     const r = dialog.getBoundingClientRect();
     return r.right > 0 && r.bottom > 0 && r.left < innerWidth && r.top < innerHeight;
   }) || null;
-  const scope = modal || document;
-  for (const el of scope.querySelectorAll(sel)) {
-    if (!visible(el)) continue;
+  // A select, combobox or menu inside the modal often renders its options in a
+  // portal at the end of <body>, outside the dialog. Those stay in scope: roots
+  // the modal's controls point at (aria-controls/aria-owns), open popovers, and
+  // any control painted on top of the modal: inside the modal's rectangle, and
+  // the topmost element at its own centre.
+  const floating = [];
+  if (modal) {
+    for (const owner of modal.querySelectorAll('[aria-controls],[aria-owns]')) {
+      const ids = ((owner.getAttribute('aria-controls') || '') + ' ' + (owner.getAttribute('aria-owns') || '')).split(/\s+/);
+      for (const id of ids) {
+        const root = id && document.getElementById(id);
+        if (root && !modal.contains(root)) floating.push(root);
+      }
+    }
+    try {
+      for (const pop of document.querySelectorAll(':popover-open')) {
+        if (!modal.contains(pop) && !pop.contains(modal)) floating.push(pop);
+      }
+    } catch {}
+  }
+  const bounds = modal ? modal.getBoundingClientRect() : null;
+  const inScope = (el) => {
+    if (!modal || modal.contains(el)) return true;
+    if (floating.some((root) => root.contains(el))) return true;
+    const r = el.getBoundingClientRect();
+    const x = r.left + r.width / 2, y = r.top + r.height / 2;
+    if (x < Math.max(0, bounds.left) || y < Math.max(0, bounds.top) ||
+        x >= Math.min(innerWidth, bounds.right) || y >= Math.min(innerHeight, bounds.bottom)) return false;
+    const hit = document.elementFromPoint(x, y);
+    return !!hit && (hit === el || el.contains(hit));
+  };
+  for (const el of document.querySelectorAll(sel)) {
+    if (!inScope(el) || !visible(el)) continue;
     const index = i++;
     // Tag the full selected scope so indices stay global and earlier pages remain
     // actionable when paging an unchanged UI. Only label/serialize this page.
@@ -1322,10 +1352,31 @@ function validateReadiness(p, action = false) {
   if (typeof p.waitForSelector !== "string" || !p.waitForSelector.trim() || p.waitForSelector.length > 2000) {
     throw new Error("wait_for_selector must be a nonempty CSS selector (at most 2000 characters)");
   }
+  if (testsValueAttribute(p.waitForSelector)) {
+    throw new Error("wait_for_selector cannot test an element's value attribute");
+  }
   if (action && p.returnState !== true) throw new Error("wait_for_selector requires return_state=true on actions");
   if (p.waitTimeoutMs !== undefined && (!Number.isInteger(p.waitTimeoutMs) || p.waitTimeoutMs < 0 || p.waitTimeoutMs > 10000)) {
     throw new Error("wait_timeout_ms must be an integer from 0 to 10000");
   }
+}
+
+/**
+ * Whether a selector reads the `value` attribute. React mirrors a controlled
+ * input's value into it, password fields included, so a wait on
+ * `input[type=password][value^="a"]` would answer met/timeout one guessed
+ * character at a time — the password the agent is never meant to see.
+ * Escapes and comments are undone first, so `[\76 alue]` is caught too.
+ */
+function testsValueAttribute(selector) {
+  const plain = selector
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\\([0-9a-fA-F]{1,6})[ \t\n\r\f]?/g, (_, hex) => {
+      const code = parseInt(hex, 16);
+      return code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : "\ufffd";
+    })
+    .replace(/\\([\s\S])/g, "$1");
+  return /\[\s*(?:[\w*-]*\|)?value\s*(?:[~|^$*]?=|\])/i.test(plain);
 }
 
 /** A visible match in the top-level document, not arbitrary application readiness. */
@@ -1363,7 +1414,11 @@ async function waitForReadiness(p) {
         returnByValue: true,
       });
     } catch (error) {
-      return outcome("error", { error: error.message || "evaluate failed" });
+      // A navigation committing mid-wait destroys the execution context; the
+      // new document is the one to observe, so poll again until the deadline.
+      if (Date.now() >= deadline) return outcome("error", { error: error.message || "evaluate failed" });
+      await sleep(Math.min(100, deadline - Date.now()));
+      continue;
     }
     if (res?.exceptionDetails) return outcome("error", { error: res.exceptionDetails.text || "evaluate failed" });
     const value = res?.result?.value;
@@ -1863,7 +1918,10 @@ const handlers = {
 
 async function handleCommand(msg, replyPort) {
   await ensureStateReady();
-  const { id, command, params = {} } = msg || {};
+  const { id, command, params: raw = {} } = msg || {};
+  // MCP clients may send null for an optional argument they did not set, and
+  // the hosts pass it through; null means absent everywhere below.
+  const params = Object.fromEntries(Object.entries(raw ?? {}).filter(([, value]) => value !== null));
   try {
     const processId = requireClientId(params);
     if (command === "close_client_tabs") {

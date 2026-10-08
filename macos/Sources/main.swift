@@ -2473,7 +2473,14 @@ func withPageAfter(_ line: String, _ payload: [String: Any]) -> String {
 
 /// Readiness is separate from action success; never imply a retry is safe.
 func describeReadiness(_ payload: [String: Any]) -> String {
-    guard let readiness = payload["readiness"] as? [String: Any] else { return "" }
+    guard let readiness = payload["readiness"] as? [String: Any] else {
+        // A current extension always reports readiness with an action's
+        // snapshot, and a total with a snapshot. Without them the extension is
+        // older than this server and silently ignored the new arguments; say so
+        // rather than let the agent believe it waited or paged.
+        let stale = payload["snapshot"] != nil || (payload["elements"] != nil && payload["total"] == nil)
+        return stale ? "note: the Chrome extension is older than this server, so wait_for_selector, offset and limit were ignored — update it and reload it at chrome://extensions.\n" : ""
+    }
     let status = readiness["status"] as? String ?? "unknown"
     let condition = readiness["condition"] as? String ?? "unknown"
     let elapsed = readiness["elapsedMs"] as? Int ?? 0
@@ -3740,7 +3747,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "browser_click",
-        "description": "Click in one of the agent's tabs, either an element by its index from browser_snapshot (preferred) or a point given in page coordinates. Pass index or x and y, not both. Works on a background tab. Use click for native app windows. A click can submit forms or follow links, so snapshot first.",
+        "description": "Click in one of the agent's tabs, either an element by its index from browser_snapshot (preferred) or a point given in page coordinates. Pass index or x and y, not both. Works on a background tab. A tab the click opens (a target=_blank link or a popup) becomes one of the agent's tabs; find it with browser_list_tabs. Use click for native app windows. A click can submit forms or follow links, so snapshot first.",
         "inputSchema": [
             "type": "object",
             "properties": [
@@ -3896,7 +3903,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "browser_press_key",
-        "description": "Press Enter, Tab, Escape or Backspace in one of the agent's tabs, for example Enter to submit a form after browser_type. Only these four keys are supported; use browser_type for characters. Enter can submit forms and Backspace deletes, so check the page state with browser_snapshot first.",
+        "description": "Press Enter, Tab, Escape or Backspace in one of the agent's tabs, for example Enter to submit a form after browser_type. Only these four keys are supported; use browser_type for characters. Tab moves focus to the next field and says which element has it; it fails rather than leave focus where it was. Enter can submit forms and Backspace deletes, so check the page state with browser_snapshot first.",
         "inputSchema": [
             "type": "object",
             "properties": [
@@ -3944,7 +3951,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "browser_close_all_tabs",
-        "description": "Close every tab the agent opened and remove its tab group. Tabs taken over with browser_use_tab are released back to the user, not closed. Call this when finished with the browser so no empty group is left in the user's tab strip. The MCP process also runs this automatically when the Computer Use session ends. Unsaved state in the agent's tabs is lost.",
+        "description": "Close every tab the agent opened, including tabs its clicks opened, and remove its tab group. Tabs taken over with browser_use_tab are released back to the user, not closed. Call this when finished with the browser so no empty group is left in the user's tab strip. The MCP process also runs this automatically when the Computer Use session ends. Unsaved state in the agent's tabs is lost.",
         "inputSchema": [
             "type": "object",
             "properties": [

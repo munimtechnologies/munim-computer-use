@@ -199,6 +199,18 @@ try {
     assert.equal(await evaluate('document.querySelectorAll(\'button[hidden][data-cu-idx]\').length'), 0);
     console.log("PASS bounded pagination, unique actionable global indices, stale-index cleanup");
 
+    // Radix, MUI and Headless UI render an open select's options in a portal
+    // at the end of <body>, outside the dialog that owns the select.
+    const dialog = '<div role="dialog" aria-modal="true" style="position:fixed;inset:0;background:white"><input role="combobox" aria-label="Country" aria-controls="countries" aria-expanded="true"><button>Save</button></div>';
+    await set(`${buttons(10)}${dialog}<div role="listbox" id="countries" style="position:fixed;top:40px;left:0;width:200px;background:white;z-index:5"><div role="option">Canada</div><div role="option">France</div></div>`);
+    assert.deepEqual((await snapshot()).elements.map((el) => el.label), ["Country", "Save", "Canada France", "Canada", "France"]);
+    await set(`${buttons(10)}${dialog.replace(' aria-controls="countries"', "")}<div role="listbox" style="position:fixed;top:40px;left:0;width:200px;background:white;z-index:5"><div role="option">Painted on top</div></div>`);
+    assert.deepEqual((await snapshot()).elements.map((el) => el.label), ["Country", "Save", "Painted on top", "Painted on top"]);
+    await set(`${buttons(10)}${dialog.replace(' aria-controls="countries"', "")}<div popover id="menu"><button>Popover item</button></div>`);
+    await evaluate('document.getElementById("menu").showPopover(); true');
+    assert.deepEqual((await snapshot()).elements.map((el) => el.label), ["Country", "Save", "Popover item"]);
+    console.log("PASS a modal keeps its portalled listbox, painted-on-top options and open popovers");
+
   }
 
   if (suite === "all" || suite === "audit-r1") {

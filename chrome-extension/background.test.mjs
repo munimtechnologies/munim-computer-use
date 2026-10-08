@@ -627,7 +627,11 @@ test("invalid wait contracts are rejected before any stateful action", async () 
     { returnState: true, waitForSelector: 1 },
     { returnState: true, waitForSelector: "x".repeat(2001) },
     { returnState: true, waitTimeoutMs: 100 },
-    ...[-1, 10001, 0.5, "100", null].map((waitTimeoutMs) => ({ returnState: true, waitForSelector: "#ready", waitTimeoutMs })),
+    { returnState: true, waitForSelector: 'input[type=password][value^="a"]' },
+    { returnState: true, waitForSelector: 'form:has(input[VALUE*="x"])' },
+    { returnState: true, waitForSelector: "input[\\76 alue^=a]" },
+    { returnState: true, waitForSelector: "input[*|value]" },
+    ...[-1, 10001, 0.5, "100"].map((waitTimeoutMs) => ({ returnState: true, waitForSelector: "#ready", waitTimeoutMs })),
   ];
   for (const command of ["click", "type", "press", "navigate"]) {
     for (const params of invalid) {
@@ -670,7 +674,7 @@ test("a readiness transport failure preserves the successful action and current 
     if (expression.includes("visibleSelectorInPage")) throw new Error("readiness transport unavailable");
     return { result: { value: { title: "Current", elements: [] } } };
   };
-  const result = await callAndWait("click", { tabId: pageTab, index: 3, returnState: true, waitForSelector: "#ready" });
+  const result = await callAndWait("click", { tabId: pageTab, index: 3, returnState: true, waitForSelector: "#ready", waitTimeoutMs: 300 });
   assert.equal(result.ok, true);
   assert.equal(result.readiness.status, "error");
   assert.equal(result.readiness.error, "readiness transport unavailable");
@@ -791,15 +795,18 @@ test("snapshot forwards bounded pagination and refuses malformed options before 
   assert.ok(expressions[0].endsWith('({"offset":250,"limit":20})'));
   const count = expressions.length;
   const malformed = [
-    { offset: -1 }, { offset: "250" }, { offset: 1.5 }, { offset: null },
+    { offset: -1 }, { offset: "250" }, { offset: 1.5 },
     { offset: 2147483648 }, { offset: Number.MAX_SAFE_INTEGER + 1 },
-    { limit: 0 }, { limit: 251 }, { limit: "10" }, { limit: null },
+    { limit: 0 }, { limit: 251 }, { limit: "10" },
   ];
   for (const args of malformed) {
     assert.match(await refuses("snapshot", { tabId: pageTab, ...args }), /offset must|limit must/);
   }
   assert.equal(expressions.length, count, "malformed pagination reached page script");
   await call("snapshot", { tabId: pageTab });
+  assert.ok(expressions.at(-1).endsWith('({"offset":0,"limit":250})'));
+  // A client that sends null for an unset optional argument gets the default.
+  await call("snapshot", { tabId: pageTab, offset: null, limit: null, waitForSelector: null, waitTimeoutMs: null });
   assert.ok(expressions.at(-1).endsWith('({"offset":0,"limit":250})'));
   pageEval = () => ({ result: { value: {} } });
 });
