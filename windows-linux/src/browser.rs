@@ -987,6 +987,11 @@ pub fn run_native_host() -> std::io::Result<()> {
                 break;
             }
         }
+        // Chrome keeps stdin open for the native port. On Windows, backend EOF
+        // must end this relay process too, or Chrome never observes disconnect
+        // and the extension retains a dead port instead of reconnecting.
+        #[cfg(windows)]
+        std::process::exit(0);
     });
 
     // Chrome → server.

@@ -42,6 +42,17 @@ jobs:
         with:
           workspaces: windows-linux
       - run: cargo test --locked
+      - name: Install Python for Windows native-host regression
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Windows native-host backend EOF and restart
+        if: runner.os == 'Windows'
+        working-directory: .
+        run: |
+          cargo build --locked --manifest-path windows-linux/Cargo.toml
+          python scripts/test-native-host-restart.py --binary windows-linux/target/debug/munim-computer-use.exe
       - name: browser tools end to end (real Chrome)
         if: runner.os == 'Linux'
         working-directory: .
