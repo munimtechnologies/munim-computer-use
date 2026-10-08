@@ -280,8 +280,9 @@ function evaluateTarget(webSocketUrl, expression) {
 }
 
 async function evaluateInLive(match, expression) {
+  let targets = [];
   for (let attempt = 0; attempt < 100; attempt++) {
-    const targets = await (await fetch(`http://127.0.0.1:${devtoolsPort}/json`)).json();
+    targets = await (await fetch(`http://127.0.0.1:${devtoolsPort}/json`)).json();
     for (const target of targets.filter((entry) => entry.type === "page" && match(entry.url))) {
       if (!target.webSocketDebuggerUrl) continue;
       const value = await evaluateTarget(target.webSocketDebuggerUrl, expression);
@@ -289,7 +290,10 @@ async function evaluateInLive(match, expression) {
     }
     await sleep(100);
   }
-  throw new Error("no live DevTools target answered");
+  // Say what was there, so a CI failure shows whether the window never opened,
+  // was already gone, or was open but never matched.
+  const seen = targets.map((target) => `${target.type} ${target.url}`).join("; ");
+  throw new Error(`no live DevTools target answered (last prompt ${lastPrompt}; targets: ${seen})`);
 }
 // Each prompt window is prompt.html#<id>, ids counting up. An answered one can
 // linger in the target list for a moment, so always take the newest.
@@ -447,7 +451,7 @@ check("browser_request_credentials fills the page without returning the values",
     const [email, password] = document.querySelectorAll('input');
     email.value = 'person@example.com';
     password.value = ${JSON.stringify(SECRET)};
-    document.getElementById('ok').click();
+    setTimeout(() => document.getElementById('ok').click(), 0);
     return true;
   })()`);
   const result = await pending;
@@ -466,7 +470,9 @@ check("closing the sign-in window reports a cancel and fills nothing", async () 
   const pending = tool("browser_request_credentials", { tab_id: tab, fields: [{ index: email }] });
   await inNewPrompt(`(() => {
     if (!document.querySelector('input')) return null;
-    document.getElementById('cancel').click();
+    // Cancelling closes this window. Click after the reply is on its way, or
+    // the window can close first and the evaluation never answers.
+    setTimeout(() => document.getElementById('cancel').click(), 0);
     return true;
   })()`);
   const result = await pending;
@@ -498,7 +504,7 @@ check("an ask rule shows an approval prompt, once", async () => {
     `(() => {
       const title = document.getElementById('title')?.textContent ?? '';
       if (!title.startsWith('Let')) return null;
-      document.getElementById('ok').click();
+      setTimeout(() => document.getElementById('ok').click(), 0);
       return title;
     })()`,
   );

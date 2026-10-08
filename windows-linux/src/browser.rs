@@ -814,7 +814,15 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
 
 /// Readiness is separate from action success; never imply a retry is safe.
 fn describe_readiness(result: &Value) -> String {
-    let Some(readiness) = result.get("readiness") else { return String::new() };
+    let Some(readiness) = result.get("readiness") else {
+        // A current extension always reports readiness with an action's
+        // snapshot, and a total with a snapshot. Without them the extension is
+        // older than this server and silently ignored the new arguments; say so
+        // rather than let the agent believe it waited or paged.
+        let stale = result.get("snapshot").is_some()
+            || (result.get("elements").is_some() && result.get("total").is_none());
+        return if stale { "note: the Chrome extension is older than this server, so wait_for_selector, offset and limit were ignored — update it and reload it at chrome://extensions.\n".to_string() } else { String::new() };
+    };
     let status = readiness.get("status").and_then(Value::as_str).unwrap_or("unknown");
     let condition = readiness.get("condition").and_then(Value::as_str).unwrap_or("unknown");
     let elapsed = readiness.get("elapsedMs").and_then(Value::as_u64).unwrap_or(0);
@@ -1031,10 +1039,10 @@ pub fn run_native_host() -> std::io::Result<()> {
                 break;
             }
         }
-        // Chrome keeps stdin open for the native port. On Windows, backend EOF
-        // must end this relay process too, or Chrome never observes disconnect
-        // and the extension retains a dead port instead of reconnecting.
-        #[cfg(windows)]
+        // Chrome keeps stdin open for the native port, so backend EOF must end
+        // this relay process too, or Chrome never observes disconnect and the
+        // extension retains a dead port instead of reconnecting. Linux relays
+        // block on stdin the same way Windows ones do.
         std::process::exit(0);
     });
 
@@ -1301,6 +1309,10 @@ mod tests {
         assert!(text.contains("truncated — continue with browser_snapshot offset=270, limit=20"));
         assert!(text.contains("[250] button \"Next\""));
         let last = describe_snapshot(&json!({"total": 300, "offset": 300, "truncated": false}));
+        // An extension older than the server answers without readiness/total.
+        assert!(super::describe_readiness(&json!({ "elements": [] })).contains("older than this server"));
+        assert!(super::describe_readiness(&json!({ "snapshot": {} })).contains("older than this server"));
+        assert_eq!(super::describe_readiness(&json!({ "elements": [], "total": 0 })), "");
         assert!(!last.contains("continue with"));
     }
 
