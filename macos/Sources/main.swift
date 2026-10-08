@@ -2451,7 +2451,7 @@ func browserCallTimeout(_ command: String, _ args: [String: Any], sitesAsk: Bool
     }
     // The extension's site approval prompt waits up to two minutes.
     if sitesAsk { timeout = max(timeout, 120 + promptGrace) }
-    if args["return_state"] as? Bool == true { timeout += 10 }
+    if args["return_state"] as? Bool == true || args["wait_for_selector"] != nil { timeout += 15 }
     return timeout
 }
 
@@ -2459,6 +2459,8 @@ func browserCallTimeout(_ command: String, _ args: [String: Any], sitesAsk: Bool
 func withReturnState(_ params: [String: Any], _ args: [String: Any]) -> [String: Any] {
     var params = params
     if args["return_state"] as? Bool == true { params["returnState"] = true }
+    if let selector = args["wait_for_selector"] { params["waitForSelector"] = selector }
+    if let timeout = args["wait_timeout_ms"] { params["waitTimeoutMs"] = timeout }
     return params
 }
 
@@ -2466,7 +2468,19 @@ func withReturnState(_ params: [String: Any], _ args: [String: Any]) -> [String:
 /// extension sent one back (return_state).
 func withPageAfter(_ line: String, _ payload: [String: Any]) -> String {
     guard let snapshot = payload["snapshot"] as? [String: Any] else { return line }
-    return line + "\n\npage after the action (earlier indices are no longer valid):\n" + describeSnapshot(snapshot)
+    return line + "\n\n" + describeReadiness(payload) + "page after the action (earlier indices are no longer valid):\n" + describeSnapshot(snapshot)
+}
+
+/// Readiness is separate from action success; never imply a retry is safe.
+func describeReadiness(_ payload: [String: Any]) -> String {
+    guard let readiness = payload["readiness"] as? [String: Any] else { return "" }
+    let status = readiness["status"] as? String ?? "unknown"
+    let condition = readiness["condition"] as? String ?? "unknown"
+    let elapsed = readiness["elapsedMs"] as? Int ?? 0
+    var line = "readiness: \(status) (\(condition), \(elapsed) ms)"
+    if let selector = readiness["selector"] as? String { line += " selector=\(selector)" }
+    if let error = readiness["error"] as? String { line += " — \(error)" }
+    return line + "; only the stated condition was checked, not general app readiness. Re-observe with browser_snapshot before repeating a non-idempotent action.\n"
 }
 
 func toolBrowserOpenTab(_ args: [String: Any]) -> String {
@@ -2620,6 +2634,15 @@ func bridgeText(_ result: BridgeOutcome, _ describe: ([String: Any]) -> String) 
 func describeSnapshot(_ payload: [String: Any]) -> String {
     let elements = payload["elements"] as? [[String: Any]] ?? []
     var lines = ["\(payload["title"] as? String ?? "?")  [\(payload["url"] as? String ?? "")]"]
+    if let total = payload["total"] as? Int {
+        let offset = payload["offset"] as? Int ?? 0
+        let limit = payload["limit"] as? Int ?? 250
+        let scope = payload["scope"] as? String ?? "page"
+        lines.append("scope: \(scope); offset=\(offset), limit=\(limit), total=\(total)")
+        if payload["truncated"] as? Bool == true, let next = payload["nextOffset"] as? Int {
+            lines.append("truncated — continue with browser_snapshot offset=\(next), limit=\(limit) (same tab_id/session_id; unchanged UI keeps indices)")
+        }
+    }
     for element in elements {
         let index = element["i"] as? Int ?? -1
         let tag = element["tag"] as? String ?? "?"
@@ -2632,7 +2655,15 @@ func describeSnapshot(_ payload: [String: Any]) -> String {
 
 func toolBrowserSnapshot(_ args: [String: Any]) -> String {
     guard let tabId = args["tab_id"] as? Int else { return "error: missing required argument 'tab_id'" }
-    return bridgeText(browserSessionCall("snapshot", ["tabId": tabId], args: args), describeSnapshot)
+    var params: [String: Any] = ["tabId": tabId]
+    // Preserve invalid values too: the extension validates the same contract on
+    // every platform instead of silently replacing a malformed request.
+    for key in ["offset", "limit"] {
+        if let value = args[key] { params[key] = value }
+    }
+    return bridgeText(browserSessionCall("snapshot", withReturnState(params, args), args: args)) { payload in
+        describeReadiness(payload) + describeSnapshot(payload)
+    }
 }
 
 /// browser_read: the page text, and where to continue if it was cut off.
@@ -3608,7 +3639,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "browser_snapshot",
-        "description": "List the interactive elements (links, buttons, inputs) on the page in one of the agent's tabs, with the index each one has for browser_click, plus the page title and URL. Inputs show their type, such as input[password]. Works on a background tab, so the user can be looking at something else. Use it before every browser_click, because indices change when the page changes; use browser_read for the page's text. Read-only.",
+        "description": "List the interactive elements (links, buttons, inputs) on the page in one of the agent's tabs, with the index each one has for browser_click, plus the page title and URL. Inputs show their type, such as input[password]. Works on a background tab, so the user can be looking at something else. Use it before every browser_click, because indices change when the page changes; use browser_read for the page's text. Read-only. Automatically scopes to the topmost visible dialog when one is open, excluding hidden/inert controls but retaining reachable offscreen controls. Results report scope, total and truncation. Continue with offset and limit on the same tab/session; indices stay global across pages of an unchanged UI. Snapshot again after UI changes.",
         "inputSchema": [
             "type": "object",
             "properties": [
@@ -3621,6 +3652,30 @@ let toolDefs: [[String: Any]] = [
                 "tab_id": [
                     "type": "integer",
                     "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs",
+                ],
+                "offset": [
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 2147483647,
+                    "description": "Control offset for pagination (default 0). Use the continuation offset from the previous result on an unchanged UI.",
+                ],
+                "limit": [
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 250,
+                    "description": "Maximum controls returned per page (default 250, maximum 250).",
+                ],
+                "wait_for_selector": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2000,
+                    "description": "Wait for any visible element matching this CSS selector in the top-level document (not frames or shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI.",
+                ],
+                "wait_timeout_ms": [
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 10000,
+                    "description": "Bound for wait_for_selector in milliseconds (default 8000, maximum 10000; 0 checks once). Requires wait_for_selector. Timeout preserves action success and returns current state. Use browser_snapshot with the same wait to re-observe without repeating an action.",
                 ],
             ],
             "required": ["tab_id"],
@@ -3706,7 +3761,19 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "return_state": [
                     "type": "boolean",
-                    "description": "After acting, wait for the page to settle (and finish loading, if the action navigated) and append a fresh browser_snapshot of this tab, so you can pick the next index in the same call. Its indices replace earlier ones.",
+                    "description": "Append a current snapshot and readiness status after acting. Without wait_for_selector, only a short pause and bounded navigation wait are used; SPA readiness is not guaranteed. Snapshot indices replace earlier ones. A timeout does not mean the action failed: re-observe with browser_snapshot before repeating it.",
+                ],
+                "wait_for_selector": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2000,
+                    "description": "Wait for any visible element matching this CSS selector in the top-level document (not frames or shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI.",
+                ],
+                "wait_timeout_ms": [
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 10000,
+                    "description": "Bound for wait_for_selector in milliseconds (default 8000, maximum 10000; 0 checks once). Requires wait_for_selector. Timeout preserves action success and returns current state. Use browser_snapshot with the same wait to re-observe without repeating an action.",
                 ],
             ],
             "required": ["tab_id"],
@@ -3741,7 +3808,19 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "return_state": [
                     "type": "boolean",
-                    "description": "After acting, wait for the page to settle (and finish loading, if the action navigated) and append a fresh browser_snapshot of this tab, so you can pick the next index in the same call. Its indices replace earlier ones.",
+                    "description": "Append a current snapshot and readiness status after acting. Without wait_for_selector, only a short pause and bounded navigation wait are used; SPA readiness is not guaranteed. Snapshot indices replace earlier ones. A timeout does not mean the action failed: re-observe with browser_snapshot before repeating it.",
+                ],
+                "wait_for_selector": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2000,
+                    "description": "Wait for any visible element matching this CSS selector in the top-level document (not frames or shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI.",
+                ],
+                "wait_timeout_ms": [
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 10000,
+                    "description": "Bound for wait_for_selector in milliseconds (default 8000, maximum 10000; 0 checks once). Requires wait_for_selector. Timeout preserves action success and returns current state. Use browser_snapshot with the same wait to re-observe without repeating an action.",
                 ],
             ],
             "required": ["tab_id", "text"],
@@ -3831,7 +3910,19 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "return_state": [
                     "type": "boolean",
-                    "description": "After acting, wait for the page to settle (and finish loading, if the action navigated) and append a fresh browser_snapshot of this tab, so you can pick the next index in the same call. Its indices replace earlier ones.",
+                    "description": "Append a current snapshot and readiness status after acting. Without wait_for_selector, only a short pause and bounded navigation wait are used; SPA readiness is not guaranteed. Snapshot indices replace earlier ones. A timeout does not mean the action failed: re-observe with browser_snapshot before repeating it.",
+                ],
+                "wait_for_selector": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2000,
+                    "description": "Wait for any visible element matching this CSS selector in the top-level document (not frames or shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI.",
+                ],
+                "wait_timeout_ms": [
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 10000,
+                    "description": "Bound for wait_for_selector in milliseconds (default 8000, maximum 10000; 0 checks once). Requires wait_for_selector. Timeout preserves action success and returns current state. Use browser_snapshot with the same wait to re-observe without repeating an action.",
                 ],
             ],
             "required": ["tab_id", "key"],
@@ -3888,7 +3979,19 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "return_state": [
                     "type": "boolean",
-                    "description": "After acting, wait for the page to settle (and finish loading, if the action navigated) and append a fresh browser_snapshot of this tab, so you can pick the next index in the same call. Its indices replace earlier ones.",
+                    "description": "Append a current snapshot and readiness status after acting. Without wait_for_selector, only a short pause and bounded navigation wait are used; SPA readiness is not guaranteed. Snapshot indices replace earlier ones. A timeout does not mean the action failed: re-observe with browser_snapshot before repeating it.",
+                ],
+                "wait_for_selector": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2000,
+                    "description": "Wait for any visible element matching this CSS selector in the top-level document (not frames or shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI.",
+                ],
+                "wait_timeout_ms": [
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 10000,
+                    "description": "Bound for wait_for_selector in milliseconds (default 8000, maximum 10000; 0 checks once). Requires wait_for_selector. Timeout preserves action success and returns current state. Use browser_snapshot with the same wait to re-observe without repeating an action.",
                 ],
             ],
             "required": ["tab_id", "url"],
@@ -3933,7 +4036,7 @@ func negotiatedProtocolVersion(_ params: [String: Any]) -> String {
 }
 
 /// Returned in the `initialize` result; identical in the Rust server.
-let serverInstructions = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Pass return_state on an action to get the updated state back in the same call instead of reading again. Use browser_read to read a page's text. Never ask for, or type, a password or code yourself: browser_request_credentials lets the user enter it without you seeing it. The user's Computer Use policy can block apps and sites or require their approval; when a call says so, do not work around it. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf."
+let serverInstructions = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Pass return_state on an action to get current state back in the same call. For delayed browser UI, use wait_for_selector with return_state and inspect readiness; a loaded tab is not SPA readiness. A timeout does not undo the action: re-observe with browser_snapshot and the same wait before repeating a non-idempotent action. Use browser_read to read a page's text. Never ask for, or type, a password or code yourself: browser_request_credentials lets the user enter it without you seeing it. The user's Computer Use policy can block apps and sites or require their approval; when a call says so, do not work around it. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf."
 
 // MARK: - Clipboard
 

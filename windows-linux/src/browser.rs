@@ -641,8 +641,8 @@ fn call_timeout(command: &str, args: &Value, sites_ask: bool) -> Duration {
         // The extension's site approval prompt waits up to two minutes.
         timeout = timeout.max(Duration::from_secs(120) + PROMPT_GRACE);
     }
-    if args.get("return_state").and_then(Value::as_bool) == Some(true) {
-        timeout += Duration::from_secs(10);
+    if args.get("return_state").and_then(Value::as_bool) == Some(true) || args.get("wait_for_selector").is_some() {
+        timeout += Duration::from_secs(15);
     }
     timeout
 }
@@ -657,12 +657,18 @@ fn normalise(_command: &str, args: &Value) -> Value {
     if let Some(session) = args.get("session_id").filter(|v| !v.is_null()) {
         map.insert("sessionId".into(), session.clone());
     }
-    for key in ["url", "text", "key", "index", "x", "y", "all", "query", "offset", "fields", "reason"] {
+    for key in ["url", "text", "key", "index", "x", "y", "all", "query", "offset", "limit", "fields", "reason"] {
         if let Some(value) = args.get(key) {
             map.insert(key.into(), value.clone());
         }
     }
-    for (from, to) in [("max_chars", "maxChars"), ("include_links", "includeLinks"), ("return_state", "returnState")] {
+    for (from, to) in [
+        ("max_chars", "maxChars"),
+        ("include_links", "includeLinks"),
+        ("return_state", "returnState"),
+        ("wait_for_selector", "waitForSelector"),
+        ("wait_timeout_ms", "waitTimeoutMs"),
+    ] {
         if let Some(value) = args.get(from) {
             map.insert(to.into(), value.clone());
         }
@@ -721,7 +727,7 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
                 .unwrap_or(-1);
             format!("released tab {tab} back to the user")
         }
-        "snapshot" => describe_snapshot(result),
+        "snapshot" => format!("{}{}", describe_readiness(result), describe_snapshot(result)),
         "read" => describe_read(result),
         "request_credentials" => describe_credentials(result, args),
         "close_all_tabs" => {
@@ -787,13 +793,31 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
             // return_state: the page as it stands after the action.
             match result.get("snapshot") {
                 Some(snapshot) => format!(
-                    "{line}\n\npage after the action (earlier indices are no longer valid):\n{}",
+                    "{line}\n\n{}page after the action (earlier indices are no longer valid):\n{}",
+                    describe_readiness(result),
                     describe_snapshot(snapshot)
                 ),
                 None => line,
             }
         }
     }
+}
+
+/// Readiness is separate from action success; never imply a retry is safe.
+fn describe_readiness(result: &Value) -> String {
+    let Some(readiness) = result.get("readiness") else { return String::new() };
+    let status = readiness.get("status").and_then(Value::as_str).unwrap_or("unknown");
+    let condition = readiness.get("condition").and_then(Value::as_str).unwrap_or("unknown");
+    let elapsed = readiness.get("elapsedMs").and_then(Value::as_u64).unwrap_or(0);
+    let mut line = format!("readiness: {status} ({condition}, {elapsed} ms)");
+    if let Some(selector) = readiness.get("selector").and_then(Value::as_str) {
+        line.push_str(&format!(" selector={selector}"));
+    }
+    if let Some(error) = readiness.get("error").and_then(Value::as_str) {
+        line.push_str(&format!(" — {error}"));
+    }
+    line.push_str("; only the stated condition was checked, not general app readiness. Re-observe with browser_snapshot before repeating a non-idempotent action.\n");
+    line
 }
 
 /// browser_read: the page text, and where to continue if it was cut off.
@@ -924,6 +948,17 @@ fn describe_snapshot(result: &Value) -> String {
         result.get("title").and_then(Value::as_str).unwrap_or("?"),
         result.get("url").and_then(Value::as_str).unwrap_or("")
     )];
+    if let Some(total) = result.get("total").and_then(Value::as_u64) {
+        let offset = result.get("offset").and_then(Value::as_u64).unwrap_or(0);
+        let limit = result.get("limit").and_then(Value::as_u64).unwrap_or(250);
+        let scope = result.get("scope").and_then(Value::as_str).unwrap_or("page");
+        lines.push(format!("scope: {scope}; offset={offset}, limit={limit}, total={total}"));
+        if result.get("truncated").and_then(Value::as_bool) == Some(true) {
+            if let Some(next) = result.get("nextOffset").and_then(Value::as_u64) {
+                lines.push(format!("truncated — continue with browser_snapshot offset={next}, limit={limit} (same tab_id/session_id; unchanged UI keeps indices)"));
+            }
+        }
+    }
     for element in result
         .get("elements")
         .and_then(Value::as_array)
@@ -1084,6 +1119,37 @@ mod tests {
     }
 
     #[test]
+    fn readiness_arguments_and_headroom_reach_every_stateful_browser_command() {
+        let args = json!({ "tab_id": 1, "return_state": true, "wait_for_selector": "[role=dialog] button", "wait_timeout_ms": 10000 });
+        for command in ["click", "type", "press", "navigate", "snapshot"] {
+            let params = normalise(command, &args);
+            assert_eq!(params["waitForSelector"], args["wait_for_selector"]);
+            assert_eq!(params["waitTimeoutMs"], json!(10000));
+            assert_eq!(call_timeout(command, &args, false), Duration::from_secs(35));
+        }
+        assert_eq!(call_timeout("snapshot", &json!({ "wait_for_selector": "#ready" }), false), Duration::from_secs(35));
+        // Invalid values are preserved for extension validation before acting.
+        assert_eq!(normalise("click", &json!({ "wait_timeout_ms": -1 }))["waitTimeoutMs"], json!(-1));
+    }
+
+    #[test]
+    fn readiness_status_survives_action_and_snapshot_text_rendering() {
+        for status in ["met", "timeout", "error", "not_requested"] {
+            let readiness = json!({ "status": status, "condition": "visible_selector", "selector": "#ready", "elapsedMs": 100, "error": "invalid CSS selector" });
+            let snapshot = json!({ "title": "Current", "url": "https://s.example", "elements": [] });
+            let action = describe("click", &json!({ "ok": true, "snapshot": snapshot, "readiness": readiness }), &json!({ "tab_id": 1 }));
+            assert!(action.starts_with("clicked in tab 1"), "{action}");
+            let observation = describe("snapshot", &json!({ "title": "Current", "elements": [], "readiness": readiness }), &json!({}));
+            for text in [action, observation] {
+                assert!(text.contains(&format!("readiness: {status} (visible_selector, 100 ms)")), "{text}");
+                assert!(text.contains("selector=#ready"), "{text}");
+                assert!(text.contains("invalid CSS selector"), "{text}");
+                assert!(text.contains("Re-observe with browser_snapshot"), "{text}");
+            }
+        }
+    }
+
+    #[test]
     fn prompts_get_more_time_than_plain_commands() {
         assert_eq!(call_timeout("click", &json!({}), false), Duration::from_secs(20));
         assert!(call_timeout("request_credentials", &json!({ "timeout_seconds": 300 }), false) > Duration::from_secs(300));
@@ -1209,6 +1275,24 @@ mod tests {
         // Releasing only must not claim a group was removed.
         let rendered = describe("close_all_tabs", &json!({ "closed": 0, "released": 1 }), &json!({}));
         assert!(!rendered.contains("removed the tab group"), "{rendered}");
+    }
+
+    #[test]
+    fn snapshot_pagination_is_forwarded_and_described() {
+        let params = normalise("snapshot", &json!({"tab_id": 7, "offset": 250, "limit": 20}));
+        assert_eq!(params["offset"], 250);
+        assert_eq!(params["limit"], 20);
+        let result = json!({
+            "title": "Many controls", "url": "https://example.com/", "scope": "modal",
+            "offset": 250, "limit": 20, "total": 300, "truncated": true, "nextOffset": 270,
+            "elements": [{"i": 250, "tag": "button", "label": "Next", "inView": true}]
+        });
+        let text = describe_snapshot(&result);
+        assert!(text.contains("scope: modal; offset=250, limit=20, total=300"));
+        assert!(text.contains("truncated — continue with browser_snapshot offset=270, limit=20"));
+        assert!(text.contains("[250] button \"Next\""));
+        let last = describe_snapshot(&json!({"total": 300, "offset": 300, "truncated": false}));
+        assert!(!last.contains("continue with"));
     }
 
     #[test]

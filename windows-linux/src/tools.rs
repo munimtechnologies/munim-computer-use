@@ -24,7 +24,7 @@ pub fn browser_control_enabled() -> bool {
 }
 
 /// Returned in the `initialize` result; identical in the Swift server.
-pub const SERVER_INSTRUCTIONS: &str = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Pass return_state on an action to get the updated state back in the same call instead of reading again. Use browser_read to read a page's text. Never ask for, or type, a password or code yourself: browser_request_credentials lets the user enter it without you seeing it. The user's Computer Use policy can block apps and sites or require their approval; when a call says so, do not work around it. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf.";
+pub const SERVER_INSTRUCTIONS: &str = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Pass return_state on an action to get current state back in the same call. For delayed browser UI, use wait_for_selector with return_state and inspect readiness; a loaded tab is not SPA readiness. A timeout does not undo the action: re-observe with browser_snapshot and the same wait before repeating a non-idempotent action. Use browser_read to read a page's text. Never ask for, or type, a password or code yourself: browser_request_credentials lets the user enter it without you seeing it. The user's Computer Use policy can block apps and sites or require their approval; when a call says so, do not work around it. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf.";
 
 pub fn tool_defs() -> Value {
     let Value::Array(defs) = all_tool_defs() else {
@@ -788,7 +788,7 @@ fn all_tool_defs() -> Value {
         },
         {
             "name": "browser_snapshot",
-            "description": "List the interactive elements (links, buttons, inputs) on the page in one of the agent's tabs, with the index each one has for browser_click, plus the page title and URL. Inputs show their type, such as input[password]. Works on a background tab, so the user can be looking at something else. Use it before every browser_click, because indices change when the page changes; use browser_read for the page's text. Read-only.",
+            "description": "List the interactive elements (links, buttons, inputs) on the page in one of the agent's tabs, with the index each one has for browser_click, plus the page title and URL. Inputs show their type, such as input[password]. Works on a background tab, so the user can be looking at something else. Use it before every browser_click, because indices change when the page changes; use browser_read for the page's text. Read-only. Automatically scopes to the topmost visible dialog when one is open, excluding hidden/inert controls but retaining reachable offscreen controls. Results report scope, total and truncation. Continue with offset and limit on the same tab/session; indices stay global across pages of an unchanged UI. Snapshot again after UI changes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -801,6 +801,30 @@ fn all_tool_defs() -> Value {
                     "tab_id": {
                         "type": "integer",
                         "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 2147483647,
+                        "description": "Control offset for pagination (default 0). Use the continuation offset from the previous result on an unchanged UI."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 250,
+                        "description": "Maximum controls returned per page (default 250, maximum 250)."
+                    },
+                    "wait_for_selector": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2000,
+                        "description": "Wait for any visible element matching this CSS selector in the top-level document (not frames or shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
+                    },
+                    "wait_timeout_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 10000,
+                        "description": "Bound for wait_for_selector in milliseconds (default 8000, maximum 10000; 0 checks once). Requires wait_for_selector. Timeout preserves action success and returns current state. Use browser_snapshot with the same wait to re-observe without repeating an action."
                     }
                 },
                 "required": ["tab_id"]
@@ -886,7 +910,19 @@ fn all_tool_defs() -> Value {
                     },
                     "return_state": {
                         "type": "boolean",
-                        "description": "After acting, wait for the page to settle (and finish loading, if the action navigated) and append a fresh browser_snapshot of this tab, so you can pick the next index in the same call. Its indices replace earlier ones."
+                        "description": "Append a current snapshot and readiness status after acting. Without wait_for_selector, only a short pause and bounded navigation wait are used; SPA readiness is not guaranteed. Snapshot indices replace earlier ones. A timeout does not mean the action failed: re-observe with browser_snapshot before repeating it."
+                    },
+                    "wait_for_selector": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2000,
+                        "description": "Wait for any visible element matching this CSS selector in the top-level document (not frames or shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
+                    },
+                    "wait_timeout_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 10000,
+                        "description": "Bound for wait_for_selector in milliseconds (default 8000, maximum 10000; 0 checks once). Requires wait_for_selector. Timeout preserves action success and returns current state. Use browser_snapshot with the same wait to re-observe without repeating an action."
                     }
                 },
                 "required": ["tab_id"]
@@ -921,7 +957,19 @@ fn all_tool_defs() -> Value {
                     },
                     "return_state": {
                         "type": "boolean",
-                        "description": "After acting, wait for the page to settle (and finish loading, if the action navigated) and append a fresh browser_snapshot of this tab, so you can pick the next index in the same call. Its indices replace earlier ones."
+                        "description": "Append a current snapshot and readiness status after acting. Without wait_for_selector, only a short pause and bounded navigation wait are used; SPA readiness is not guaranteed. Snapshot indices replace earlier ones. A timeout does not mean the action failed: re-observe with browser_snapshot before repeating it."
+                    },
+                    "wait_for_selector": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2000,
+                        "description": "Wait for any visible element matching this CSS selector in the top-level document (not frames or shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
+                    },
+                    "wait_timeout_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 10000,
+                        "description": "Bound for wait_for_selector in milliseconds (default 8000, maximum 10000; 0 checks once). Requires wait_for_selector. Timeout preserves action success and returns current state. Use browser_snapshot with the same wait to re-observe without repeating an action."
                     }
                 },
                 "required": ["tab_id", "text"]
@@ -1011,7 +1059,19 @@ fn all_tool_defs() -> Value {
                     },
                     "return_state": {
                         "type": "boolean",
-                        "description": "After acting, wait for the page to settle (and finish loading, if the action navigated) and append a fresh browser_snapshot of this tab, so you can pick the next index in the same call. Its indices replace earlier ones."
+                        "description": "Append a current snapshot and readiness status after acting. Without wait_for_selector, only a short pause and bounded navigation wait are used; SPA readiness is not guaranteed. Snapshot indices replace earlier ones. A timeout does not mean the action failed: re-observe with browser_snapshot before repeating it."
+                    },
+                    "wait_for_selector": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2000,
+                        "description": "Wait for any visible element matching this CSS selector in the top-level document (not frames or shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
+                    },
+                    "wait_timeout_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 10000,
+                        "description": "Bound for wait_for_selector in milliseconds (default 8000, maximum 10000; 0 checks once). Requires wait_for_selector. Timeout preserves action success and returns current state. Use browser_snapshot with the same wait to re-observe without repeating an action."
                     }
                 },
                 "required": ["tab_id", "key"]
@@ -1068,7 +1128,19 @@ fn all_tool_defs() -> Value {
                     },
                     "return_state": {
                         "type": "boolean",
-                        "description": "After acting, wait for the page to settle (and finish loading, if the action navigated) and append a fresh browser_snapshot of this tab, so you can pick the next index in the same call. Its indices replace earlier ones."
+                        "description": "Append a current snapshot and readiness status after acting. Without wait_for_selector, only a short pause and bounded navigation wait are used; SPA readiness is not guaranteed. Snapshot indices replace earlier ones. A timeout does not mean the action failed: re-observe with browser_snapshot before repeating it."
+                    },
+                    "wait_for_selector": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2000,
+                        "description": "Wait for any visible element matching this CSS selector in the top-level document (not frames or shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
+                    },
+                    "wait_timeout_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 10000,
+                        "description": "Bound for wait_for_selector in milliseconds (default 8000, maximum 10000; 0 checks once). Requires wait_for_selector. Timeout preserves action success and returns current state. Use browser_snapshot with the same wait to re-observe without repeating an action."
                     }
                 },
                 "required": ["tab_id", "url"]

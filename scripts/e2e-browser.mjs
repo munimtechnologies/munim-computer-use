@@ -43,15 +43,19 @@ const PREFILLED = "PREFILLED-VALUE-MUST-NOT-LEAK";
 const sleep = (ms) => new Promise((resume) => setTimeout(resume, ms));
 
 // Short base path: a Unix socket path must fit in 104 bytes on macOS.
-const root = fs.mkdtempSync(path.join(os.platform() === "win32" ? os.tmpdir() : "/tmp", "cu-e2e-"));
+const root = fs.mkdtempSync(path.join(os.platform() === "win32" ? (process.env.TMPDIR || os.tmpdir()) : "/tmp", "cu-e2e-"));
 const children = [];
 function cleanup() {
   for (const child of children) {
     try {
-      child.kill("SIGKILL");
+      // Each POSIX child owns an isolated process group, including Chromium's
+      // renderers and native hosts. Killing just its launcher leaves writers.
+      if (os.platform() === "win32") child.kill("SIGKILL");
+      else process.kill(-child.pid, "SIGKILL");
     } catch {}
   }
-  fs.rmSync(root, { recursive: true, force: true });
+  // Chrome's children may still be exiting after SIGKILL; retry filesystem races.
+  fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }
 process.on("exit", cleanup);
 
@@ -67,6 +71,18 @@ const article = [
   '<a href="/next">Next page</a>',
 ].join("\n");
 const pages = {
+  "/spa": `<title>Delayed dialog</title><button id="open">Open dialog</button><script>
+    window.clicks = 0;
+    document.getElementById('open').onclick = () => {
+      window.clicks++;
+      setTimeout(() => {
+        const modal = document.createElement('div');
+        modal.setAttribute('role', 'dialog');
+        modal.innerHTML = '<h1>Connect your Domain</h1><input aria-label="Domain"><button>Next</button>';
+        document.body.append(modal);
+      }, 1100);
+    };
+  </script>`,
   "/article": `<title>Article</title>${article}`,
   "/login": `<title>Sign in</title>
     <form onsubmit="event.preventDefault(); document.title = 'Signed in as ' + email.value;">
@@ -119,6 +135,7 @@ const policyPath = path.join(root, "policy.json");
 // ── the MCP server ──────────────────────────────────────────────────────────
 
 const server = spawn(serverBinary, ["--profile", profilePath], {
+  detached: os.platform() !== "win32",
   env: { ...process.env, COMPUTER_USE_POLICY: policyPath },
   stdio: ["pipe", "pipe", "pipe"],
 });
@@ -183,7 +200,7 @@ const chromeArgs = [
   ...(os.platform() === "linux" ? ["--no-sandbox"] : []),
   "about:blank",
 ];
-const chrome = spawn(chromeBinary, chromeArgs, { stdio: ["ignore", "ignore", "pipe"] });
+const chrome = spawn(chromeBinary, chromeArgs, { detached: os.platform() !== "win32", stdio: ["ignore", "ignore", "pipe"] });
 children.push(chrome);
 let chromeLog = "";
 chrome.stderr.on("data", (chunk) => (chromeLog += chunk));
@@ -362,6 +379,34 @@ check("browser_click with return_state comes back with the next page", async () 
   assert.match(text, /button "Continue"/);
 });
 
+check("return_state waits for a delayed SPA dialog after exactly one click", async () => {
+  await ok("browser_navigate", { tab_id: tab, url: `${base}/spa`, return_state: true });
+  const snapshot = await ok("browser_snapshot", { tab_id: tab });
+  const index = Number(/\[(\d+)\] button "Open dialog"/.exec(snapshot)[1]);
+  const text = await ok("browser_click", {
+    tab_id: tab, index, return_state: true, wait_for_selector: "[role=dialog] button", wait_timeout_ms: 3000,
+  });
+  assert.match(text, /readiness: met \(visible_selector/);
+  assert.match(text, /button "Next"/);
+  const counts = await evaluateIn((url) => url === `${base}/spa`, "[window.clicks, document.querySelectorAll('[role=dialog]').length, location.href]");
+  assert.deepEqual(counts, [1, 1, `${base}/spa`]);
+});
+
+check("a timed-out SPA observation can be waited on without clicking again", async () => {
+  await ok("browser_navigate", { tab_id: tab, url: `${base}/spa`, return_state: true });
+  const snapshot = await ok("browser_snapshot", { tab_id: tab });
+  const index = Number(/\[(\d+)\] button "Open dialog"/.exec(snapshot)[1]);
+  const text = await ok("browser_click", {
+    tab_id: tab, index, return_state: true, wait_for_selector: "[role=dialog] button", wait_timeout_ms: 0,
+  });
+  assert.match(text, /clicked in tab/);
+  assert.match(text, /readiness: timeout/);
+  const observed = await ok("browser_snapshot", { tab_id: tab, wait_for_selector: "[role=dialog] button", wait_timeout_ms: 3000 });
+  assert.match(observed, /readiness: met/);
+  assert.match(observed, /button "Next"/);
+  assert.deepEqual(await evaluateIn((url) => url === `${base}/spa`, "[window.clicks, document.querySelectorAll('[role=dialog]').length]"), [1, 1]);
+});
+
 check("browser_navigate with return_state waits for the load", async () => {
   const text = await ok("browser_navigate", { tab_id: tab, url: `${base}/login`, return_state: true });
   assert.match(text, /Sign in {2}\[/);
@@ -472,6 +517,43 @@ check("an invalid policy file blocks instead of being ignored", async () => {
   assert.equal(result.isError, true);
   assert.match(result.text, /policy file .* is invalid/);
   fs.rmSync(policyPath);
+});
+
+check("snapshot scopes appended modal controls and indexed actions reach them", async () => {
+  await ok("browser_navigate", { tab_id: tab, url: `${base}/next`, return_state: true });
+  const background = Array.from({ length: 260 }, (_, i) => `<button>Background ${i}</button>`).join("");
+  const html = `<main aria-hidden="true">${background}</main><div role="dialog" aria-modal="true" style="position:fixed;inset:0;background:white"><input aria-label="Domain"><button id="modal-next">Next</button><button>Verify</button></div>`;
+  await evaluateIn((url) => url === `${base}/next`, `document.body.innerHTML = ${JSON.stringify(html)}; document.getElementById('modal-next').onclick = () => document.title = 'Modal target clicked'; true`);
+  const state = await ok("browser_snapshot", { tab_id: tab });
+  assert.match(state, /scope: modal; offset=0, limit=250, total=3/);
+  assert.match(state, /\[0\] input "Domain"/);
+  assert.match(state, /\[1\] button "Next"/);
+  assert.match(state, /\[2\] button "Verify"/);
+  assert.doesNotMatch(state, /Background/);
+  const after = await ok("browser_click", { tab_id: tab, index: 1, return_state: true });
+  assert.match(after, /Modal target clicked/);
+  assert.match(after, /scope: modal/);
+});
+
+check("snapshot pagination reaches all controls with stable global indices", async () => {
+  const html = Array.from({ length: 270 }, (_, i) => `<button>Control ${i}</button>`).join("");
+  await evaluateIn((url) => url === `${base}/next`, `document.body.innerHTML = ${JSON.stringify(html)}; document.querySelectorAll('button')[250].onclick = () => document.title = 'Page two clicked'; true`);
+  const first = await ok("browser_snapshot", { tab_id: tab });
+  assert.match(first, /scope: page; offset=0, limit=250, total=270/);
+  assert.match(first, /truncated — continue with browser_snapshot offset=250, limit=250/);
+  assert.doesNotMatch(first, /\[250\] button/);
+  const second = await ok("browser_snapshot", { tab_id: tab, offset: 250, limit: 20 });
+  assert.match(second, /scope: page; offset=250, limit=20, total=270/);
+  assert.match(second, /\[250\] button "Control 250"/);
+  assert.match(second, /\[269\] button "Control 269"/);
+  assert.doesNotMatch(second, /truncated/);
+  const after = await ok("browser_click", { tab_id: tab, index: 250, return_state: true });
+  assert.match(after, /Page two clicked/);
+  for (const options of [{ offset: -1 }, { limit: 251 }]) {
+    const result = await tool("browser_snapshot", { tab_id: tab, ...options });
+    assert.equal(result.isError, true);
+    assert.match(result.text, /offset must|limit must/);
+  }
 });
 
 let failed = 0;

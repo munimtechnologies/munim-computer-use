@@ -153,7 +153,7 @@ Also looked at: [mediar-ai/mcp-server-macos-use](https://github.com/mediar-ai/mc
 - **Parallel tasks, one extension.** Every MCP process gets its own tab group, and one process can run several tasks by passing a stable `session_id` on its browser calls. A task cannot drive or adopt another task's tabs, and cleanup (including a process exiting) closes only its own. Any number of MCP processes share the one extension: the first owns it and the rest go through it, and if the owner exits another takes over without closing anyone's tabs. Tasks share Chrome's cookies and logins, and desktop apps and the clipboard are not isolated.
 - **Model-agnostic.** No vision model is required for interaction; local models work too.
 - **Look → act → verify.** `hover` for mouse-over menus, `wait` for loads, `query` to find a control by label without reading a whole tree.
-- **Act and look in one call.** Pass `return_state: true` to any action (`click`, `type_text`, `set_value`, `browser_click`, `browser_navigate`, …) and the result carries the app's fresh accessibility tree, or the page's fresh snapshot, taken once the UI has settled. That halves the round trips of a look-act-verify loop. `state_query` narrows the desktop tree the same way `query` does.
+- **Act and look in one call.** Pass `return_state: true` to any action (`click`, `type_text`, `set_value`, `browser_click`, `browser_navigate`, …) and the result carries the app's fresh accessibility tree, or the page's current snapshot. Browser actions report readiness separately: a loaded tab is not proof that delayed SPA UI has rendered. Use `wait_for_selector` for an expected visible element (see below). `state_query` narrows the desktop tree the same way `query` does.
 - **Pages as text.** `browser_read` returns a page's readable text with its headings, including what is scrolled out of view, from a tab in the background. It comes in chunks you can continue with `offset`, `query` keeps only the matching lines under their heading, and `include_links` lists the links.
 - **Passwords stay out of the conversation.** `browser_request_credentials` asks the user to sign in in a small Chrome window that shows the site's real origin. What they type goes straight into the page's fields and is never returned to the model. `browser_snapshot` never shows a password field's value, and on the desktop, typing into password fields is refused by default.
 - **Pick up what you are looking at.** `get_app_state` and `screenshot` take `app: "frontmost"` for the app in front of the user, so a client can hand the agent "this window" in one step.
@@ -198,7 +198,90 @@ This is a guard rail for an agent that follows its instructions, not a sandbox. 
 | Clipboard | `clipboard_read`, `clipboard_write` (plain text)                                                                                                                                                         |
 | Browser | `browser_open_tab`, `browser_list_tabs`, `browser_use_tab`, `browser_release_tab`, `browser_select_tab`, `browser_navigate`, `browser_snapshot`, `browser_read`, `browser_click`, `browser_type`, `browser_request_credentials`, `browser_press_key`, `browser_close_tab`, `browser_close_all_tabs` |
 
-Every action tool also takes `return_state`, which returns the state after the action in the same call.
+Every action tool also takes `return_state`, which returns current state after the action in the same call.
+
+### Browser readiness and safe re-observation
+
+`browser_click`, `browser_type`, `browser_press_key`, and `browser_navigate` accept
+`wait_for_selector` together with `return_state: true`. `browser_snapshot` accepts
+the same wait **without performing an action**:
+
+```json
+{"tab_id": 42, "index": 0, "return_state": true,
+ "wait_for_selector": "[role=dialog] button", "wait_timeout_ms": 3000}
+```
+
+The extension polls for any matching visible element in the top-level document,
+independently of resource loading, including same-document rendering. It shares
+the snapshot's visibility rules: at least 2×2 CSS pixels; no hidden, aria-hidden,
+inert or fully transparent ancestor. Self-transparent native form controls remain
+available for styled upload/checkbox hit targets; transparent containers do not.
+This is not a guarantee of clickability or
+lack of occlusion. Frames and shadow
+roots are not searched. Choose a selector specific to the **new expected UI**;
+an element already present can satisfy it immediately. No arbitrary page script
+is accepted.
+
+- `wait_timeout_ms`: defaults to `8000`, accepts integers `0`–`10000`; `0` checks
+  once. Requires `wait_for_selector`. The budget covers polling, not browser/API
+  latency or user site-approval prompts. Site rules are rechecked before every
+  observation and before the final snapshot.
+- `readiness: met (visible_selector, … ms)`: the specified condition was observed,
+  not a guarantee that all network requests, animations, or application work ended.
+- `readiness: timeout`: the condition was not observed within the budget. The
+  action's success remains separate, and the current snapshot is still returned.
+- `readiness: error`: the condition could not be evaluated (for example invalid
+  CSS); the action can still have succeeded. Correct the wait and re-observe.
+- Without a selector, `return_state` retains the short pause and bounded
+  navigation-load wait, but reports `not_requested (document_load, … ms)` rather
+  than claiming SPA readiness. A navigation-load budget expiry reports `timeout`.
+  A plain `browser_snapshot` without a wait remains an immediate observation.
+
+If a returned snapshot looks unchanged, **do not repeat a non-idempotent click**
+just because expected UI is absent. Wait/re-observe first:
+
+```json
+{"tab_id": 42, "wait_for_selector": "[role=dialog] button", "wait_timeout_ms": 3000}
+```
+
+Send this to `browser_snapshot`, inspect its readiness and fresh indices, then
+choose the next action. A timeout or tool error does not roll back a click,
+submission, typing, or navigation. Use current state to decide whether a retry is
+safe. Invalid wait types/bounds or an action wait without `return_state: true` are
+rejected before acting. These options require an updated extension as well as the
+native server; older extensions may omit readiness metadata.
+
+Regression checks: `node --test chrome-extension/background.test.mjs` covers the
+wait contract and site-policy guards. The real-browser CI harness
+`scripts/e2e-browser.mjs` tests a dialog delayed by 1100 ms without navigation,
+one click only, plus timeout and read-only recovery. The dependency-free CDP
+regressions cover both snapshot scoping/pagination and SPA readiness. Run against
+an isolated Chrome/Chromium profile; no Playwright module is required:
+
+```bash
+node scripts/snapshot-dom.test.mjs --chrome /path/to/chrome
+# Extract the pre-fix source; each suite must fail independently:
+git show deb4c7a:chrome-extension/background.js > original-background.js
+node scripts/snapshot-dom.test.mjs --chrome /path/to/chrome --source original-background.js --suite snapshot
+node scripts/snapshot-dom.test.mjs --chrome /path/to/chrome --source original-background.js --suite readiness
+```
+
+`browser_snapshot` automatically scopes to the topmost visible dialog when one is
+open, so covered background controls cannot consume the dialog's budget. Hidden
+and inert subtrees are excluded; reachable offscreen controls remain available.
+Native modeless dialogs and explicit `aria-modal="false"` do not scope the page.
+Native modal dialogs and explicit `aria-modal="true"` are definitive candidates.
+Implicit ARIA dialogs are heuristically scoped only when they cover the viewport
+centre and are topmost there, rather than merely at their own centre. With no
+hit-test stack, centre coverage is the fallback. Corner chat widgets and bottom
+cookie banners therefore retain the page's indexed controls.
+It returns up to `limit` controls (default and maximum `250`), reports `scope`,
+`offset`, `limit`, and `total`, and explicitly says when it is truncated and which
+`offset` to request next. Continue on the same `tab_id` and `session_id`. Indices
+are global within the selected scope and stay actionable across pages of an
+unchanged UI; after a UI change or navigation, take a fresh snapshot from
+`offset=0`. An action's `return_state` also starts at `offset=0` and uses the same
+scope and truncation reporting.
 
 Names, argument shapes and descriptions are identical on every platform, and CI enforces it (`node scripts/check-tool-parity.mjs`); a model that learned them on a Mac needs nothing new on Windows. To change a tool, edit both literals at once with `scripts/tool-defs.mjs` rather than by hand.
 
@@ -228,6 +311,8 @@ Linux notes: element actions work everywhere; coordinate clicks need an X11 or X
 cd windows-linux && cargo test                  # Rust server
 node chrome-extension/background.test.mjs       # extension, against a fake Chrome
 node scripts/check-tool-parity.mjs              # Swift and Rust tool lists match
+# Snapshot and SPA readiness regressions (dependency-free CDP, isolated profile):
+node scripts/snapshot-dom.test.mjs --chrome <Chrome for Testing binary>
 # The browser tools end to end, in a throwaway Chrome for Testing profile that
 # never touches your own Chrome (npx playwright install chromium to get one):
 node scripts/e2e-browser.mjs --server <munim-computer-use binary> --chrome <Chrome for Testing binary>

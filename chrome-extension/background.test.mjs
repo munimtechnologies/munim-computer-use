@@ -567,7 +567,138 @@ test("return_state attaches a fresh snapshot to an action", async () => {
   assert.equal(plain.snapshot, undefined, "no snapshot unless asked");
   const withState = await callAndWait("click", { tabId: pageTab, index: 3, returnState: true });
   assert.equal(withState.snapshot.title, "After");
+  assert.equal(withState.readiness.status, "not_requested", "tab.complete must not claim SPA readiness");
   pageEval = () => ({ result: { value: {} } });
+});
+
+test("every stateful action forwards an explicit wait and preserves its successful result", async () => {
+  for (const [command, args] of [["click", { index: 3 }], ["type", { text: "hello" }], ["press", { key: "Enter" }], ["navigate", { url: "https://shop.example/next" }]]) {
+    let observations = 0;
+    pageEval = (_method, params) => {
+      const expression = params.expression ?? "";
+      if (expression.includes("visibleSelectorInPage")) {
+        observations++;
+        return { result: { value: { met: observations >= 2 } } };
+      }
+      if (expression.includes("data-cu-idx=\"3\"")) return { result: { value: { ok: true, tag: "button", x: 5, y: 5 } } };
+      if (expression.includes("querySelectorAll(sel)")) return { result: { value: { title: "Ready", elements: [] } } };
+      return { result: { value: {} } };
+    };
+    const result = await callAndWait(command, { tabId: pageTab, ...args, returnState: true, waitForSelector: "#ready", waitTimeoutMs: 1000 });
+    assert.equal(result.readiness.status, "met", command);
+    assert.equal(result.snapshot.title, "Ready", command);
+    assert.equal(observations, 2, command);
+  }
+  pageEval = () => ({ result: { value: {} } });
+});
+
+test("snapshot waits without another action, including an immediate timeout", async () => {
+  let actions = 0;
+  pageEval = (method, params) => {
+    const expression = params.expression ?? "";
+    if (method.startsWith("Input.") || expression.includes("data-cu-idx=\"")) actions++;
+    if (expression.includes("visibleSelectorInPage")) return { result: { value: { met: false } } };
+    return { result: { value: { title: "Current", elements: [] } } };
+  };
+  const result = await callAndWait("snapshot", { tabId: pageTab, waitForSelector: "#missing", waitTimeoutMs: 0 });
+  assert.equal(result.readiness.status, "timeout");
+  assert.equal(result.title, "Current");
+  assert.equal(actions, 0);
+  pageEval = () => ({ result: { value: {} } });
+});
+
+test("invalid wait contracts are rejected before any stateful action", async () => {
+  let sideEffects = 0;
+  const before = tabs.get(pageTab).url;
+  pageEval = () => { sideEffects++; return { result: { value: {} } }; };
+  const invalid = [
+    { waitForSelector: "#ready" },
+    { returnState: true, waitForSelector: "" },
+    { returnState: true, waitForSelector: 1 },
+    { returnState: true, waitForSelector: "x".repeat(2001) },
+    { returnState: true, waitTimeoutMs: 100 },
+    ...[-1, 10001, 0.5, "100", null].map((waitTimeoutMs) => ({ returnState: true, waitForSelector: "#ready", waitTimeoutMs })),
+  ];
+  for (const command of ["click", "type", "press", "navigate"]) {
+    for (const params of invalid) {
+      const error = await refuses(command, { tabId: pageTab, index: 3, text: "x", key: "Enter", url: "https://changed.example", ...params });
+      assert.match(error, /wait_for_selector|wait_timeout_ms/);
+    }
+  }
+  assert.equal(sideEffects, 0);
+  assert.equal(tabs.get(pageTab).url, before);
+  pageEval = () => ({ result: { value: {} } });
+});
+
+test("a readiness evaluation error is not reported as a failed click", async () => {
+  let clicks = 0;
+  pageEval = (_method, params) => {
+    const expression = params.expression ?? "";
+    if (expression.includes("data-cu-idx=\"3\"")) {
+      clicks++;
+      return { result: { value: { ok: true, x: 5, y: 5 } } };
+    }
+    if (expression.includes("visibleSelectorInPage")) return { result: { value: { error: "invalid CSS selector" } } };
+    return { result: { value: { title: "Current", elements: [] } } };
+  };
+  const result = await callAndWait("click", { tabId: pageTab, index: 3, returnState: true, waitForSelector: "[" });
+  assert.equal(result.ok, true);
+  assert.equal(result.readiness.status, "error");
+  assert.equal(result.readiness.error, "invalid CSS selector");
+  assert.equal(clicks, 1);
+  pageEval = () => ({ result: { value: {} } });
+});
+
+test("a readiness transport failure preserves the successful action and current snapshot", async () => {
+  let clicks = 0;
+  pageEval = (_method, params) => {
+    const expression = params.expression ?? "";
+    if (expression.includes("data-cu-idx=\"3\"")) {
+      clicks++;
+      return { result: { value: { ok: true, x: 5, y: 5 } } };
+    }
+    if (expression.includes("visibleSelectorInPage")) throw new Error("readiness transport unavailable");
+    return { result: { value: { title: "Current", elements: [] } } };
+  };
+  const result = await callAndWait("click", { tabId: pageTab, index: 3, returnState: true, waitForSelector: "#ready" });
+  assert.equal(result.ok, true);
+  assert.equal(result.readiness.status, "error");
+  assert.equal(result.readiness.error, "readiness transport unavailable");
+  assert.equal(result.snapshot.title, "Current");
+  assert.equal(clicks, 1);
+  pageEval = () => ({ result: { value: {} } });
+});
+
+test("an explicit wait rechecks site rules before each selector observation", async () => {
+  const tab = tabs.get(pageTab);
+  const before = tab.url;
+  let observations = 0;
+  pageEval = (_method, params) => {
+    if ((params.expression ?? "").includes("visibleSelectorInPage")) {
+      observations++;
+      tab.url = "https://bank.example/accounts";
+      return { result: { value: { met: false } } };
+    }
+    return { result: { value: {} } };
+  };
+  const error = await callAndWait("snapshot", { tabId: pageTab, waitForSelector: "#ready", waitTimeoutMs: 1000, sites: [{ pattern: "bank.example", rule: "block" }] }).then(
+    () => "expected refusal", (failure) => failure.message,
+  );
+  assert.match(error, /blocked by the user's Computer Use policy/);
+  assert.equal(observations, 1, "a selector was evaluated after the redirect was blocked");
+  tab.url = before;
+  pageEval = () => ({ result: { value: {} } });
+});
+
+test("navigation loading is bounded and is not confused with an explicit condition", async () => {
+  const tab = tabs.get(pageTab);
+  tab.status = "loading";
+  const start = Date.now();
+  const result = await vm.runInContext(`settle(${pageTab}, 0, 25)`, extensionContext);
+  assert.equal(result.status, "timeout");
+  assert.equal(result.condition, "document_load");
+  assert.ok(Date.now() - start < 500);
+  tab.status = "complete";
 });
 
 test("a click index that is not a plain number never reaches the page as script", async () => {
@@ -640,12 +771,36 @@ test("a debugger session Chrome ended is attached again on the next command", as
   pageEval = () => ({ result: { value: {} } });
 });
 
+test("snapshot forwards bounded pagination and refuses malformed options before evaluation", async () => {
+  const expressions = [];
+  pageEval = (method, params) => {
+    if (params.expression?.includes("querySelectorAll(sel)")) expressions.push(params.expression);
+    return { result: { value: {} } };
+  };
+  await call("snapshot", { tabId: pageTab, offset: 250, limit: 20 });
+  assert.ok(expressions[0].endsWith('({"offset":250,"limit":20})'));
+  const count = expressions.length;
+  const malformed = [
+    { offset: -1 }, { offset: "250" }, { offset: 1.5 }, { offset: null },
+    { offset: 2147483648 }, { offset: Number.MAX_SAFE_INTEGER + 1 },
+    { limit: 0 }, { limit: 251 }, { limit: "10" }, { limit: null },
+  ];
+  for (const args of malformed) {
+    assert.match(await refuses("snapshot", { tabId: pageTab, ...args }), /offset must|limit must/);
+  }
+  assert.equal(expressions.length, count, "malformed pagination reached page script");
+  await call("snapshot", { tabId: pageTab });
+  assert.ok(expressions.at(-1).endsWith('({"offset":0,"limit":250})'));
+  pageEval = () => ({ result: { value: {} } });
+});
+
 test("a snapshot clears indices an earlier snapshot left on now-hidden elements", () => {
   const element = (tag, { hidden = false, idx } = {}) => {
     const attributes = new Map(idx === undefined ? [] : [["data-cu-idx", idx]]);
     return {
       tagName: tag.toUpperCase(),
       innerText: tag,
+      matches: () => false,
       hidden,
       getAttribute: (name) => attributes.get(name) ?? null,
       setAttribute: (name, value) => attributes.set(name, String(value)),
@@ -661,12 +816,13 @@ test("a snapshot clears indices an earlier snapshot left on now-hidden elements"
   const document = {
     title: "Step 2",
     querySelectorAll: (selector) =>
-      selector === "[data-cu-idx]" ? elements.filter((el) => el.hasAttribute("data-cu-idx")) : elements,
+      selector === "[data-cu-idx]" ? elements.filter((el) => el.hasAttribute("data-cu-idx")) : selector.startsWith("dialog") ? [] : elements,
   };
   const page = vm.createContext({
     document,
     location: { href: "https://shop.example/step2" },
     innerHeight: 800,
+    innerWidth: 1200,
     getComputedStyle: () => ({ visibility: "visible", display: "block" }),
   });
   const result = vm.runInContext(vm.runInContext("SNAPSHOT_JS", extensionContext), page);

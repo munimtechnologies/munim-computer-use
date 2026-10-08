@@ -59,6 +59,7 @@ jobs:
         run: |
           cargo build --release --locked --manifest-path windows-linux/Cargo.toml
           chrome=$(npx -y @puppeteer/browsers install chrome@stable --path "$RUNNER_TEMP/cft" | tail -1 | sed 's/^[^ ]* //')
+          node scripts/snapshot-dom.test.mjs --chrome "$chrome"
           node scripts/e2e-browser.mjs --server "$PWD/windows-linux/target/release/munim-computer-use" --chrome "$chrome"
 
   swift:
@@ -88,6 +89,7 @@ jobs:
         with:
           node-version: 22
       - run: node --test chrome-extension/background.test.mjs
+      - run: node scripts/snapshot-cleanup.test.mjs
       - run: node scripts/build-extension.test.mjs
       - run: node scripts/check-tool-parity.mjs
       - run: node scripts/tool-defs.mjs --check
