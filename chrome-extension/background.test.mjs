@@ -48,6 +48,15 @@ let sent = [];
 /** Tabs the extension attached the debugger to, in order. */
 const attaches = [];
 let debuggerDetachListener = null;
+let tabCreatedListener = null;
+
+/** A tab the page opened (target=_blank, window.open), as Chrome reports it. */
+function openChild(openerTabId, url = "https://shop.example/terms") {
+  const child = makeTab({ url });
+  child.openerTabId = openerTabId;
+  tabCreatedListener(child);
+  return child.id;
+}
 
 // Most tests drive the MT Code host's port; the multi-host tests pick one.
 const nativeListener = (msg) => portFor(MT_HOST).onMessageListener(msg);
@@ -120,6 +129,7 @@ const chrome = {
     ungroup: async (ids) => ids.forEach((id) => { tabs.get(id).groupId = -1; }),
     onUpdated: { addListener() {}, removeListener() {} },
     onRemoved: { addListener() {} },
+    onCreated: { addListener: (fn) => { tabCreatedListener = fn; } },
   },
   tabGroups: {
     get: async (id) => {
@@ -943,6 +953,88 @@ test("credentials refuse an index that is not a text field", async () => {
       : { result: { value: {} } };
   const error = await refuses("request_credentials", { tabId: pageTab, fields: [{ index: 4 }] });
   assert.match(error, /not a text field/);
+  pageEval = () => ({ result: { value: {} } });
+});
+
+// ── tabs the agent's own actions open ──────────────────────────────────────
+
+test("a tab the agent's click opens belongs to the task and is cleaned up with it", async () => {
+  const parent = (await call("open_tab", { url: "https://shop.example/help", sessionId: "child" })).tabId;
+  pageEval = () => ({ result: { value: { ok: true, tag: "a", x: 5, y: 5 } } });
+  await callAndWait("click", { tabId: parent, index: 1, sessionId: "child" });
+  pageEval = () => ({ result: { value: {} } });
+  const child = openChild(parent);
+  const listed = await call("list_tabs", { sessionId: "child" });
+  const row = listed.tabs.find((tab) => tab.tabId === child);
+  assert.ok(row, "the child is one of the task's tabs");
+  assert.equal(row.adopted, false, "it is agent-created, not adopted");
+  await call("ping", { sessionId: "child" });
+  assert.equal(tabs.get(child).groupId, tabs.get(parent).groupId, "it joins the task's group");
+  const cleaned = await call("close_all_tabs", { sessionId: "child" });
+  assert.equal(cleaned.closed, 2);
+  assert.ok(!tabs.has(child), "cleanup closed the child");
+});
+
+test("a tab opened from an agent tab with no recent agent action stays the user's", async () => {
+  const parent = (await call("open_tab", { url: "https://shop.example/help", sessionId: "idle" })).tabId;
+  const child = openChild(parent);
+  const listed = await call("list_tabs", { sessionId: "idle" });
+  assert.ok(!listed.tabs.some((tab) => tab.tabId === child), "the user's own click is not claimed");
+  await call("close_all_tabs", { sessionId: "idle" });
+  assert.ok(tabs.has(child), "cleanup left the user's tab open");
+  tabs.delete(child);
+});
+
+test("a child of another task's tab is not claimed by this one", async () => {
+  const parent = (await call("open_tab", { url: "https://shop.example/help", sessionId: "mine" })).tabId;
+  pageEval = () => ({ result: { value: { ok: true, tag: "a", x: 5, y: 5 } } });
+  await callAndWait("click", { tabId: parent, index: 1, sessionId: "mine" });
+  pageEval = () => ({ result: { value: {} } });
+  const child = openChild(parent);
+  const theirs = await call("list_tabs", { sessionId: "theirs" });
+  assert.ok(!theirs.tabs.some((tab) => tab.tabId === child));
+  await call("close_all_tabs", { sessionId: "mine" });
+});
+
+// ── Tab key ────────────────────────────────────────────────────────────────
+
+let formTab;
+test("a fresh agent tab for the Tab key tests", async () => {
+  formTab = (await call("open_tab", { url: "https://console.example/branding" })).tabId;
+});
+
+test("Tab in a background tab moves focus itself and says where it went", async () => {
+  const keys = [];
+  pageEval = (method, params) => {
+    if (method === "Input.dispatchKeyEvent") keys.push(params.type);
+    if ((params.expression ?? "").includes("__cuTabProbe;")) {
+      return { result: { value: { moved: true, focused: '[7] input "Privacy policy link"' } } };
+    }
+    return { result: { value: {} } };
+  };
+  const result = await callAndWait("press", { tabId: formTab, key: "Tab" });
+  assert.deepEqual([...keys], ["keyDown", "keyUp"], "the page still sees the keystroke");
+  assert.equal(result.focused, '[7] input "Privacy policy link"');
+  pageEval = () => ({ result: { value: {} } });
+});
+
+test("a Tab that moves nothing is an error, not a success", async () => {
+  pageEval = (method, params) =>
+    (params.expression ?? "").includes("__cuTabProbe;")
+      ? { result: { value: { moved: false, reason: "focus is already on the last element of the page" } } }
+      : { result: { value: {} } };
+  const error = await refuses("press", { tabId: formTab, key: "Tab" });
+  assert.match(error, /Tab did not move focus \(focus is already on the last element/);
+  pageEval = () => ({ result: { value: {} } });
+});
+
+test("a Tab the page handled itself is a success", async () => {
+  pageEval = (method, params) =>
+    (params.expression ?? "").includes("__cuTabProbe;")
+      ? { result: { value: { moved: false, handled: true, focused: "textarea" } } }
+      : { result: { value: {} } };
+  const result = await callAndWait("press", { tabId: formTab, key: "Tab" });
+  assert.equal(result.handledByPage, true);
   pageEval = () => ({ result: { value: {} } });
 });
 
