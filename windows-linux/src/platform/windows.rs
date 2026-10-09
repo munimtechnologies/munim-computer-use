@@ -187,9 +187,18 @@ impl WindowsDesktop {
         if at.0.is_null() {
             return Ok(());
         }
-        let top = owner(unsafe { GetAncestor(at, GA_ROOT) });
+        let root = unsafe { GetAncestor(at, GA_ROOT) };
+        let top = owner(root);
         if top == owner(window) || top == std::process::id() {
             return Ok(());
+        }
+        // A Windows Security prompt (a firewall or credential prompt) lays an
+        // invisible layer over the whole screen that takes every click until
+        // it is answered, which activating the app cannot get past.
+        let mut buf = [0u16; 64];
+        let len = unsafe { GetClassNameW(root, &mut buf) };
+        if String::from_utf16_lossy(&buf[..len.max(0) as usize]).starts_with("Shell_SystemDim") {
+            return Err(outline::system_prompt_error(id));
         }
         Err(DesktopError::new(format!(
             "e{id} is covered by another window — bring it forward with activate_app, or use an action that works through accessibility"
