@@ -145,6 +145,12 @@ Also looked at: [mediar-ai/mcp-server-macos-use](https://github.com/mediar-ai/mc
 ## Why it works well
 
 - **Accessibility first, pixels second.** `get_app_state` returns the app's accessibility tree with stable element ids, so the agent presses _the button_ instead of guessing at a coordinate. It costs a fraction of the tokens of a screenshot and it is what scores highest on OSWorld-style tasks. Screenshots are for verifying and for content the tree cannot describe.
+- **What is on screen, fast.** `get_app_state` lists what is in view: a list or table gives its visible rows, and anything scrolled away is skipped and counted (`offscreen: true` lists it too). Attributes are read in one request per element. A Finder window of 2,000 files reads in 165 ms instead of 2.2 s, and the outline has room for the app's other windows.
+- **Dialogs first.** While a sheet, alert or popover blocks a window, only its controls are listed, with a note saying so, so the agent answers the dialog instead of clicking behind it.
+- **Electron and Chromium apps.** Slack, VS Code, Discord, Spotify and other Chromium-based apps expose their tree only to a client that asks; `get_app_state` asks, and says so while a background app is still building it.
+- **Text the tree cannot describe.** When an app exposes no labelled controls, its window is read with on-device OCR (Apple Vision on macOS) and the text is listed with ids that `click`, `hover`, `right_click` and `drag` accept. The image never leaves the machine. `ocr: "always"` or `"never"` overrides it.
+- **Ids that fail instead of misfiring.** Every id is rechecked before an action. If its element is gone, or its role or name changed (a dialog swapped its buttons, a list re-sorted), the action fails with a clear error instead of acting on whatever sits there now.
+- **Waits as long as the app takes.** `return_state` waits for the app's accessibility notifications to stop instead of a fixed pause: about 230 ms for a field edit (was 350 ms), and long enough for a sheet to finish sliding in.
 - **Background control.** Events are addressed to the target window (SkyLight on macOS, UI Automation patterns and posted window messages on Windows). On macOS the agent never takes your mouse or keyboard; see [Works alongside you](#works-alongside-you) for the exact guarantee on each platform.
 - **Pointer overlay, not your pointer.** A soft lavender agent pointer shows where the agent is acting. Your cursor is untouched.
 - **Coordinates that land.** Every screenshot and zoom carries its screen origin and pixels-per-point. `zoom` captures any region at full physical resolution.
@@ -164,6 +170,8 @@ Also looked at: [mediar-ai/mcp-server-macos-use](https://github.com/mediar-ai/mc
 The agent has its own pointer; yours stays yours.
 
 **macOS — guaranteed.** Every action goes through accessibility (press, set value, select text, show menu, scroll bars) or through events addressed to the target app's process and window. The server never moves your pointer, never posts into the system-wide input stream, and never holds or blocks your input, so you can keep clicking and typing in other apps while the agent works — even in the same app, on another window. Events come from a private source, so a modifier you are holding does not leak into the agent's clicks. The target app may be brought forward when that is the point of the step (`activate_app`, or handing you a password field), but not on every action.
+
+Command shortcuts sent to a background app run through its menu bar (macOS gives menu key equivalents only to the front app), so `cmd+W`, `cmd+S` and the like work without bringing it forward. A minimized window, or a hidden app, is moved for the moment it needs pixels or input (typing, a coordinate click, a screenshot, OCR) onto an invisible display, where it works while nobody sees it; it is minimized or hidden again after 20 idle seconds, when another app's window needs the display, or when the server exits. If you bring the app up yourself meanwhile, its windows come back on screen where they were. Accessibility actions on such a window (press, set value) need none of this. `COMPUTER_USE_PARK_WINDOWS=0` turns it off, and those actions then return an error asking for the window to be restored.
 
 The exceptions refuse instead of borrowing your pointer: a click, hover or scroll with no target app (coordinates over the desktop before any `get_app_state`), and drags that leave the source window (between apps, or onto the desktop). The error says what to pass instead.
 
@@ -341,6 +349,7 @@ The standalone server's host is `com.munimtech.computer_use.desktop`; MT Code, w
 | `COMPUTER_USE_AGENT_CURSOR_TASK_FADE_SECS` | How long the pointer stays after the last tool call (default 8) |
 | `COMPUTER_USE_ALLOW_SECURE_FIELD_INPUT=1`  | Allow typing into password fields (refused by default)          |
 | `COMPUTER_USE_REMOTE_CONTROL=1`            | Remote-desktop mode: input takes over the real pointer          |
+| `COMPUTER_USE_PARK_WINDOWS=0`              | macOS: do not move minimized or hidden windows to an invisible display to act on them |
 | `COMPUTER_USE_POLICY=<file>`               | Where to read the [app and site policy](#apps-and-sites-the-agent-may-use) (default `policy.json` in the support directory) |
 
 ### Remote control
@@ -404,6 +413,6 @@ This repository mirrors the `native/` tree of [munimtechnologies/mtcode](https:/
 
 ## Credits and license
 
-Designed and built by [Munim Technologies](https://munimtech.com) (Munim, Inc.) for MT Code. Copyright 2026 Munim, Inc. Licensed under the Apache License 2.0; see `LICENSE`.
+Designed and built by [Munim Technologies](https://munimtech.com) (Munim, Inc.) for MT Code. On-screen pruning, dialog scoping, notification-based settling, OCR fallback, menu shortcuts and window parking follow [arc-cua](https://github.com/shhivv/arc-cua) (MIT). Copyright 2026 Munim, Inc. Licensed under the Apache License 2.0; see `LICENSE`.
 
 Comparison sources: [Codex Computer Use](https://openai.com/index/codex-for-almost-everything/) and [its docs](https://developers.openai.com/codex/app/computer-use) · [OpenAI Agents API computer use](https://developers.openai.com/api/docs/guides/agents-api/tools/computer-use) · [Anthropic computer-use demo](https://github.com/anthropics/anthropic-quickstarts/tree/main/computer-use-demo) · [CursorTouch/Windows-MCP](https://github.com/CursorTouch/Windows-MCP) · [CursorTouch/MacOS-MCP](https://github.com/CursorTouch/MacOS-MCP) · [QwenLM/open-computer-use](https://github.com/QwenLM/open-computer-use) · [zavora-ai/computer-use-mcp](https://github.com/zavora-ai/computer-use-mcp) · [mediar-ai/mcp-server-macos-use](https://github.com/mediar-ai/mcp-server-macos-use) · [deploymenttheory/windows-mcp-server](https://github.com/deploymenttheory/windows-mcp-server) · [nuphus-mcp](https://github.com/mrpulor-gh/nuphus-mcp) · [computer-control-mcp](https://github.com/AB498/computer-control-mcp) · [microsoft/playwright-mcp](https://github.com/microsoft/playwright-mcp)

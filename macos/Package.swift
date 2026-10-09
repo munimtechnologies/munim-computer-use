@@ -10,8 +10,16 @@ let package = Package(
   // CGWindowListCreateImage path for window capture.
   platforms: [.macOS(.v14)],
   targets: [
+    // Private CoreGraphics API for the invisible display that background
+    // control parks minimized and hidden windows on. Objective-C, so ARC
+    // handles the private classes' init family.
+    .target(
+      name: "VirtualDisplay",
+      path: "VirtualDisplay",
+    ),
     .executableTarget(
       name: "munim-computer-use",
+      dependencies: ["VirtualDisplay"],
       path: "Sources",
     ),
   ],
