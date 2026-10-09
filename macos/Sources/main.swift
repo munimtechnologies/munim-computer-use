@@ -4022,7 +4022,7 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "return_state": [
                     "type": "boolean",
-                    "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
+                    "description": "Append a current snapshot and readiness status after acting. Without wait_for_selector, only a short pause and bounded navigation wait are used; SPA readiness is not guaranteed. Snapshot indices replace earlier ones. A timeout does not mean the action failed: re-observe with browser_snapshot before repeating it.",
                 ],
                 "wait_for_selector": [
                     "type": "string",
@@ -4069,7 +4069,7 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "return_state": [
                     "type": "boolean",
-                    "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
+                    "description": "Append a current snapshot and readiness status after acting. Without wait_for_selector, only a short pause and bounded navigation wait are used; SPA readiness is not guaranteed. Snapshot indices replace earlier ones. A timeout does not mean the action failed: re-observe with browser_snapshot before repeating it.",
                 ],
                 "wait_for_selector": [
                     "type": "string",
@@ -4171,7 +4171,7 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "return_state": [
                     "type": "boolean",
-                    "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
+                    "description": "Append a current snapshot and readiness status after acting. Without wait_for_selector, only a short pause and bounded navigation wait are used; SPA readiness is not guaranteed. Snapshot indices replace earlier ones. A timeout does not mean the action failed: re-observe with browser_snapshot before repeating it.",
                 ],
                 "wait_for_selector": [
                     "type": "string",
@@ -4240,7 +4240,7 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "return_state": [
                     "type": "boolean",
-                    "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
+                    "description": "Append a current snapshot and readiness status after acting. Without wait_for_selector, only a short pause and bounded navigation wait are used; SPA readiness is not guaranteed. Snapshot indices replace earlier ones. A timeout does not mean the action failed: re-observe with browser_snapshot before repeating it.",
                 ],
                 "wait_for_selector": [
                     "type": "string",

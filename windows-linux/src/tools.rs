@@ -72,7 +72,7 @@ fn all_tool_defs() -> Value {
         },
         {
             "name": "get_app_state",
-            "description": "Read an app's accessibility tree as an indented outline in which interactive elements carry ids like [e12] that click, type_text, set_value, scroll, hover and select_text accept. Use it instead of screenshot whenever you intend to act: it is far cheaper in tokens and gives exact targets. Call it before interacting and again after the UI changes, because ids are per-snapshot and a stale id fails. Read-only; it describes the app's visible windows and does not change focus.",
+            "description": "Read an app's accessibility tree as an indented outline in which interactive elements carry ids like [e12] that click, type_text, set_value, scroll, hover and select_text accept. Use it instead of screenshot whenever you intend to act: it is far cheaper in tokens and gives exact targets. Call it before interacting and again after the UI changes, because ids are per-snapshot. Each id is rechecked before an action: one whose element is gone or has changed fails instead of acting on something else. The outline lists what is on screen: rows of long lists and content scrolled out of view are skipped (scroll, or pass offscreen), and while a dialog, sheet or popover blocks a window only its controls are listed. When an app exposes little to accessibility, its on-screen text is read with OCR and listed with ids too. Read-only; it does not change focus.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -91,6 +91,15 @@ fn all_tool_defs() -> Value {
                     "query": {
                         "type": "string",
                         "description": "Only list elements whose role, label or value contains this text (case-insensitive). Ids stay valid. Use it instead of raising max_elements when you know what you are looking for."
+                    },
+                    "offscreen": {
+                        "type": "boolean",
+                        "description": "Also list elements scrolled out of view, such as every row of a long list (default false). Prefer scrolling or `query`: this can make the outline far larger."
+                    },
+                    "ocr": {
+                        "type": "string",
+                        "enum": ["auto", "always", "never"],
+                        "description": "Read on-screen text with OCR and list it with ids that click, hover, right_click and drag accept: auto (default) only when the app exposes no labelled controls to accessibility, always, or never. macOS and Windows; macOS needs Screen Recording permission."
                     }
                 },
                 "required": ["app"]
@@ -127,7 +136,7 @@ fn all_tool_defs() -> Value {
                     },
                     "return_state": {
                         "type": "boolean",
-                        "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
+                        "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
                     },
                     "state_query": {
                         "type": "string",
@@ -159,7 +168,7 @@ fn all_tool_defs() -> Value {
                     },
                     "return_state": {
                         "type": "boolean",
-                        "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
+                        "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
                     },
                     "state_query": {
                         "type": "string",
@@ -195,7 +204,7 @@ fn all_tool_defs() -> Value {
                     },
                     "return_state": {
                         "type": "boolean",
-                        "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
+                        "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
                     },
                     "state_query": {
                         "type": "string",
@@ -241,7 +250,7 @@ fn all_tool_defs() -> Value {
                     },
                     "return_state": {
                         "type": "boolean",
-                        "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
+                        "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
                     },
                     "state_query": {
                         "type": "string",
@@ -352,7 +361,7 @@ fn all_tool_defs() -> Value {
                     },
                     "return_state": {
                         "type": "boolean",
-                        "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
+                        "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
                     },
                     "state_query": {
                         "type": "string",
@@ -400,7 +409,7 @@ fn all_tool_defs() -> Value {
                     },
                     "return_state": {
                         "type": "boolean",
-                        "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
+                        "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
                     },
                     "state_query": {
                         "type": "string",
@@ -432,7 +441,7 @@ fn all_tool_defs() -> Value {
                     },
                     "return_state": {
                         "type": "boolean",
-                        "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
+                        "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
                     },
                     "state_query": {
                         "type": "string",
@@ -506,7 +515,7 @@ fn all_tool_defs() -> Value {
                     },
                     "return_state": {
                         "type": "boolean",
-                        "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
+                        "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
                     },
                     "state_query": {
                         "type": "string",
@@ -562,7 +571,7 @@ fn all_tool_defs() -> Value {
                     },
                     "return_state": {
                         "type": "boolean",
-                        "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
+                        "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id."
                     },
                     "state_query": {
                         "type": "string",

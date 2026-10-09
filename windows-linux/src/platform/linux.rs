@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use atspi::proxy::accessible::AccessibleProxy;
-use atspi::{connection::AccessibilityConnection, Role};
+use atspi::{connection::AccessibilityConnection, CoordType, Role, State};
 use futures_lite::future::block_on;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
@@ -23,8 +23,9 @@ use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 use xcap::Window;
 
-use super::{Desktop, DesktopError, Point, Result, ScrollDirection, format_app_list};
+use super::{Desktop, DesktopError, Point, Result, ScrollDirection, StateOptions, format_app_list};
 use super::agent_cursor::AgentCursor;
+use super::outline::{self, Bounds, Fingerprint, OcrMode, truncate};
 use crate::apps;
 use crate::keys::{Key, Named};
 
@@ -47,7 +48,51 @@ struct ElementRef {
 pub struct LinuxDesktop {
     accessibility: Option<AccessibilityConnection>,
     x11: Option<(RustConnection, usize)>,
-    registry: HashMap<u32, ElementRef>,
+    /// Elements from the latest `get_app_state`, with what each was when listed.
+    registry: HashMap<u32, (ElementRef, Fingerprint)>,
+}
+
+/// What visiting one node of the tree came to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Visit {
+    Listed,
+    /// Left out as off screen, with its subtree.
+    Skipped,
+    /// Unreadable, or past a limit.
+    Nothing,
+}
+
+/// Running totals of one `get_app_state` walk.
+struct Walk {
+    options: StateOptions,
+    next_id: u32,
+    /// Nodes inspected, which is what `max_elements` caps: every one costs
+    /// D-Bus round trips whether or not it prints.
+    visited: usize,
+    rows: Vec<String>,
+    /// Subtree roots left out as off screen.
+    skipped: usize,
+    /// Collect modal dialogs (first pass only), with the depth each was at.
+    find_dialogs: bool,
+    dialogs: Vec<(ElementRef, usize)>,
+    /// The app's top-level windows (depth 1), dialogs included.
+    frames: usize,
+}
+
+impl Walk {
+    fn new(options: StateOptions, find_dialogs: bool) -> Self {
+        Self { options, next_id: 0, visited: 0, rows: Vec::new(), skipped: 0, find_dialogs, dialogs: Vec::new(), frames: 0 }
+    }
+
+    /// A modal dialog blocks something only when there is something behind
+    /// it: a dialog inside a window, or one of several top-level windows. A
+    /// dialog that is the app's only window (zenity, a GTK prompt) is the app.
+    fn blocking_dialogs(&mut self) -> Vec<ElementRef> {
+        let top_level = self.dialogs.iter().filter(|(_, depth)| *depth == 1).count();
+        let blocks = self.dialogs.iter().any(|(_, depth)| *depth > 1) || self.frames > top_level;
+        let dialogs = std::mem::take(&mut self.dialogs);
+        if blocks { dialogs.into_iter().map(|(dialog, _)| dialog).collect() } else { Vec::new() }
+    }
 }
 
 impl LinuxDesktop {
@@ -104,12 +149,35 @@ impl LinuxDesktop {
         .map_err(|error| DesktopError::new(format!("element is gone: {error}")))
     }
 
+    /// Resolve an id, rechecking that the element is still what was listed:
+    /// acting on whatever now sits at a stale path is worse than failing.
     fn element(&self, id: u32) -> Result<ElementRef> {
-        self.registry.get(&id).cloned().ok_or_else(|| {
+        let (reference, recorded) = self.registry.get(&id).cloned().ok_or_else(|| {
             DesktopError::new(format!(
                 "element e{id} is not in the current snapshot — call get_app_state again, ids are per-snapshot"
             ))
-        })
+        })?;
+        let current = self.proxy(&reference).ok().and_then(|proxy| {
+            let role = block_on(proxy.get_role()).ok().filter(|role| *role != Role::Invalid)?;
+            let name = block_on(proxy.name()).ok()?;
+            Some(Fingerprint { role: format!("{role:?}"), name })
+        });
+        outline::check_fresh(id, &recorded, current.as_ref())?;
+        Ok(reference)
+    }
+
+    /// An element's rectangle in the given coordinates, when it has one.
+    fn extents(&self, element: &ElementRef, coords: CoordType) -> Option<Bounds> {
+        let component = block_on(
+            atspi::proxy::component::ComponentProxy::builder(self.bus().ok()?.connection())
+                .destination(element.bus.clone())
+                .and_then(|builder| builder.path(element.path.clone()))
+                .ok()?
+                .build(),
+        )
+        .ok()?;
+        let (x, y, width, height) = block_on(component.get_extents(coords)).ok()?;
+        Some(Bounds::new(f64::from(x), f64::from(y), f64::from(width), f64::from(height)))
     }
 
     /// Screen rectangle centre of an element, via the Component interface.
@@ -572,37 +640,63 @@ impl LinuxDesktop {
         }
     }
 
-    fn walk(
-        &mut self,
-        element: &ElementRef,
-        depth: usize,
-        max_depth: usize,
-        max_elements: usize,
-        next_id: &mut u32,
-        visited: &mut usize,
-        lines: &mut Vec<String>,
-    ) {
+    /// `clip` is the visible part of the window and the scroll containers
+    /// around `element`, in window coordinates (which native Wayland clients
+    /// report too). Off-screen nodes are skipped with their subtrees unless
+    /// `offscreen` asked for everything; nothing in a minimized window is.
+    fn walk(&mut self, walk: &mut Walk, element: &ElementRef, depth: usize, clip: Option<Bounds>, iconified: bool) -> Visit {
+        let limits = walk.options;
         // Count every node we inspect — unnamed non-interactive parents still
         // cost D-Bus round-trips and must not bypass `max_elements`.
-        if depth > max_depth || *visited >= max_elements {
-            return;
+        if depth > limits.max_depth || walk.visited >= limits.max_elements {
+            return Visit::Nothing;
         }
         // Read everything the proxy can tell us, then drop it: it borrows
         // `self`, and the registry below needs that borrow released.
-        let Some((name, role, children)) = ({
+        let Some((name, role, children, state)) = ({
             match self.proxy(element) {
                 Ok(proxy) => {
                     let name = block_on(proxy.name()).unwrap_or_default();
                     let role = block_on(proxy.get_role()).unwrap_or(Role::Invalid);
                     let children = block_on(proxy.get_children()).unwrap_or_default();
-                    Some((name, role, children))
+                    let state = block_on(proxy.get_state()).ok();
+                    Some((name, role, children, state))
                 }
                 Err(_) => None,
             }
         }) else {
-            return;
+            return Visit::Nothing;
         };
-        *visited += 1;
+        walk.visited += 1;
+
+        let has = |flag: State| state.is_some_and(|state| state.contains(flag));
+        let bounds = if depth > 0 { self.extents(element, CoordType::Window) } else { None };
+        let iconified = iconified || has(State::Iconified);
+        let floats = matches!(
+            role,
+            Role::Menu | Role::PopupMenu | Role::Dialog | Role::Alert | Role::FileChooser | Role::Window | Role::ToolTip
+        );
+        // SHOWING is VISIBLE with every ancestor visible too, which toolkits
+        // clear for content scrolled out of view. An unreadable state says
+        // nothing either way.
+        let not_showing = state.is_some() && !has(State::Showing);
+        let row = matches!(role, Role::ListItem | Role::TreeItem | Role::TableRow | Role::TableCell);
+        if depth > 0 && !limits.offscreen && !iconified && outline::is_off_screen(bounds, clip, not_showing, floats, row) {
+            walk.skipped += 1;
+            return Visit::Skipped;
+        }
+        // Only windows on screen (or minimized) count as something a dialog
+        // could block.
+        if depth == 1 {
+            walk.frames += 1;
+        }
+        if depth > 0
+            && walk.find_dialogs
+            && matches!(role, Role::Dialog | Role::Alert | Role::FileChooser)
+            && has(State::Modal)
+        {
+            walk.dialogs.push((element.clone(), depth));
+        }
 
         let interactive = matches!(
             role,
@@ -624,9 +718,10 @@ impl LinuxDesktop {
         if !name.is_empty() || interactive {
             let mut row = "  ".repeat(depth);
             if interactive {
-                *next_id += 1;
-                row.push_str(&format!("[e{next_id}] "));
-                self.registry.insert(*next_id, element.clone());
+                walk.next_id += 1;
+                row.push_str(&format!("[e{}] ", walk.next_id));
+                let fingerprint = Fingerprint { role: format!("{role:?}"), name: name.clone() };
+                self.registry.insert(walk.next_id, (element.clone(), fingerprint));
             }
             row.push_str(&format!("{role:?}"));
             if !name.is_empty() {
@@ -637,31 +732,46 @@ impl LinuxDesktop {
             if interactive && let Ok((x, y)) = self.center(element) {
                 row.push_str(&format!(" @({x:.0},{y:.0})"));
             }
-            lines.push(row);
+            walk.rows.push(row);
         }
 
-        for child in children {
-            if *visited >= max_elements {
-                lines.push(format!(
-                    "{}… truncated at {max_elements} elements — raise max_elements or target a child",
-                    "  ".repeat(depth + 1)
+        // The window itself is the first clip; floating popups start their own.
+        let clip = if floats {
+            bounds.filter(Bounds::has_area)
+        } else if clip.is_none() || matches!(role, Role::ScrollPane | Role::Viewport) {
+            outline::narrow_clip(clip, bounds)
+        } else {
+            clip
+        };
+        // Rows of a list come in order, so once they run past the bottom of
+        // the view the rest are off screen too: count them without a D-Bus
+        // round trip per row.
+        let ordered = matches!(role, Role::List | Role::ListBox | Role::Table | Role::Tree | Role::TreeTable);
+        let mut seen_visible = false;
+        let total = children.len();
+        for (index, child) in children.into_iter().enumerate() {
+            if walk.visited >= limits.max_elements {
+                walk.rows.push(format!(
+                    "{}… truncated at {} elements — raise max_elements or target a child",
+                    "  ".repeat(depth + 1),
+                    limits.max_elements
                 ));
-                return;
+                break;
             }
             let reference = ElementRef {
                 bus: child.name().map(|name| name.to_string()).unwrap_or_default(),
                 path: child.path().to_string(),
             };
-            self.walk(
-                &reference,
-                depth + 1,
-                max_depth,
-                max_elements,
-                next_id,
-                visited,
-                lines,
-            );
+            match self.walk(walk, &reference, depth + 1, clip, iconified) {
+                Visit::Skipped if ordered && seen_visible => {
+                    walk.skipped += total - index - 1;
+                    break;
+                }
+                Visit::Listed => seen_visible = true,
+                _ => {}
+            }
         }
+        Visit::Listed
     }
 
     /// Top-level application objects on the a11y bus, with their pids.
@@ -705,14 +815,6 @@ impl LinuxDesktop {
         }
         Ok(applications)
     }
-}
-
-fn truncate(value: &str, limit: usize) -> String {
-    let cleaned = value.replace(['\n', '\r'], " ");
-    if cleaned.chars().count() <= limit {
-        return cleaned;
-    }
-    cleaned.chars().take(limit).collect::<String>() + "…"
 }
 
 /// Prefer PID when the query is numeric, then an exact AT-SPI name match;
@@ -997,25 +1099,39 @@ impl Desktop for LinuxDesktop {
         }
     }
 
-    fn get_app_state(&mut self, app: &str, max_depth: usize, max_elements: usize) -> Result<String> {
+    fn get_app_state(&mut self, app: &str, options: &StateOptions) -> Result<String> {
         // Invalidate prior snapshot IDs even if this refresh fails to find `app`.
         self.registry.clear();
         let applications = self.applications()?;
         let (reference, name, _) = match_application(&applications, app)?;
 
-        let mut next_id = 0u32;
-        let mut visited = 0usize;
-        let mut lines = vec![format!("{name}")];
-        self.walk(
-            &reference,
-            0,
-            max_depth,
-            max_elements,
-            &mut next_id,
-            &mut visited,
-            &mut lines,
-        );
-        if next_id == 0 {
+        let mut walk = Walk::new(*options, true);
+        self.walk(&mut walk, &reference, 0, None, false);
+        // A modal dialog blocks the window behind it: list only the dialog,
+        // since nothing else takes input until it is dismissed.
+        let dialogs = walk.blocking_dialogs();
+        let scoped = !dialogs.is_empty();
+        if scoped {
+            self.registry.clear();
+            walk = Walk::new(*options, false);
+            for dialog in dialogs {
+                self.walk(&mut walk, &dialog, 0, None, false);
+            }
+        }
+
+        let mut lines = vec![name];
+        if scoped {
+            lines.push(outline::DIALOG_NOTE.to_string());
+        }
+        if options.ocr == OcrMode::Always {
+            lines.push("note: OCR is not available on Linux".to_string());
+        }
+        lines.push(String::new());
+        lines.extend(walk.rows);
+        if walk.skipped > 0 {
+            lines.push(outline::offscreen_line(walk.skipped));
+        }
+        if walk.next_id == 0 {
             lines.push(
                 "no interactive elements exposed — use screenshot and click with coordinates"
                     .to_string(),

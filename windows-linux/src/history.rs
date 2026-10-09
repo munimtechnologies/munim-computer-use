@@ -270,7 +270,14 @@ fn sample_frontmost(desktop: &mut dyn Desktop) -> Result<Sample, DesktopError> {
     let (app_name, app_id, pid) = parse_app_line(front)
         .ok_or_else(|| DesktopError::new(format!("could not parse frontmost app line: {front}")))?;
     // Only report accessibility granted when AT-SPI actually answered.
-    let (outline, accessibility_granted) = match desktop.get_app_state(&app_name, 4, 40) {
+    // A shallow, on-screen read, and never OCR: this runs in the background.
+    let options = crate::platform::StateOptions {
+        max_depth: 4,
+        max_elements: 40,
+        offscreen: false,
+        ocr: crate::platform::outline::OcrMode::Never,
+    };
+    let (outline, accessibility_granted) = match desktop.get_app_state(&app_name, &options) {
         Ok(text) => (text, true),
         Err(_) => (String::new(), false),
     };
@@ -428,10 +435,11 @@ fn find_unescaped_char(haystack: &str, needle: char) -> Option<usize> {
 /// Prefer a document/address-bar URL from the outline; otherwise the frame title.
 /// Ordinary link rows must not replace the current page URL for privacy filters.
 fn window_title_from_outline(outline: &str, app_name: &str) -> Option<String> {
+    // Notes (an open dialog) and the off-screen count are not rows.
     let lines: Vec<&str> = outline
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
+        .filter(|line| !line.is_empty() && !line.starts_with("note: ") && !line.starts_with("… "))
         .collect();
     if lines.is_empty() {
         return None;
