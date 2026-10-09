@@ -26,6 +26,7 @@ mod keys;
 mod live;
 mod platform;
 mod policy;
+mod settle;
 mod tools;
 
 use std::io::{self, BufRead, Write};
@@ -33,7 +34,8 @@ use std::io::{self, BufRead, Write};
 use base64::Engine as _;
 use serde_json::{Value, json};
 
-use platform::{Desktop, DesktopError, Point, ScrollDirection};
+use platform::outline::OcrMode;
+use platform::{Desktop, DesktopError, Point, ScrollDirection, StateOptions};
 
 /// Protocol revisions this server speaks, newest first. The tool surface is the
 /// same in all of them; a client asking for one gets it echoed back.
@@ -506,7 +508,8 @@ fn wait_seconds(args: &Value) -> Result<String, DesktopError> {
 
 /// Narrow an accessibility outline to the lines that mention `query`. Element ids
 /// stay valid — the backend registered every element while walking; only the
-/// printout is filtered. Window headers (`── window`) are kept for context.
+/// printout is filtered. Section headers (`── window`, `── on-screen text`) and
+/// the off-screen count are kept for context.
 fn filter_app_state(outline: &str, query: &str) -> String {
     let needle = query.trim().to_lowercase();
     if needle.is_empty() {
@@ -522,12 +525,13 @@ fn filter_app_state(outline: &str, query: &str) -> String {
         header.push(line);
     }
     let body: Vec<&str> = lines.collect();
+    let context = |line: &str| line.starts_with("── ") || line.starts_with("… ");
     let matching: Vec<&str> = body
         .iter()
         .copied()
-        .filter(|line| line.starts_with("── window") || line.to_lowercase().contains(&needle))
+        .filter(|line| context(line) || line.to_lowercase().contains(&needle))
         .collect();
-    let count = matching.iter().filter(|line| !line.starts_with("── window")).count();
+    let count = matching.iter().filter(|line| !context(line)).count();
     let mut out = header.join("\n");
     out.push_str(&format!(
         "\nfilter: \"{}\" — {count} matching element{}",
@@ -543,13 +547,12 @@ fn filter_app_state(outline: &str, query: &str) -> String {
     out
 }
 
-/// The app and limits of the latest `get_app_state`, which `return_state`
+/// The app and options of the latest `get_app_state`, which `return_state`
 /// reads again after an action: element ids only ever come from that snapshot,
 /// so it is the app the action was aimed at.
 struct LastRead {
     app: String,
-    max_depth: usize,
-    max_elements: usize,
+    options: StateOptions,
 }
 
 static LAST_READ: std::sync::Mutex<Option<LastRead>> = std::sync::Mutex::new(None);
@@ -566,10 +569,6 @@ const STATEFUL_ACTIONS: [&str; 9] = [
     "hover",
     "select_text",
 ];
-
-/// Pause between an action and the snapshot `return_state` takes, so the app
-/// has handled the input and redrawn before it is read.
-const SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// `frontmost` names the app the user is looking at; anything else passes through.
 fn resolve_app_query(app: &str) -> Result<String, DesktopError> {
@@ -600,31 +599,44 @@ fn check_app_policy(desktop: &mut dyn Desktop, app: &str) -> Result<(), DesktopE
 fn read_app_state(
     desktop: &mut dyn Desktop,
     app: &str,
-    max_depth: usize,
-    max_elements: usize,
+    options: StateOptions,
     query: Option<&str>,
 ) -> Result<String, DesktopError> {
-    let outline = desktop.get_app_state(app, max_depth, max_elements)?;
+    let outline = desktop.get_app_state(app, &options)?;
     *LAST_READ.lock().unwrap_or_else(|poison| poison.into_inner()) =
-        Some(LastRead { app: app.to_string(), max_depth, max_elements });
+        Some(LastRead { app: app.to_string(), options });
     Ok(match query {
         Some(query) if !query.trim().is_empty() => filter_app_state(&outline, query),
         _ => outline,
     })
 }
 
-/// The text `return_state` appends after an action.
-fn state_after_action(desktop: &mut dyn Desktop, args: &Value) -> String {
-    let last = LAST_READ
+fn last_read() -> Option<(String, StateOptions)> {
+    LAST_READ
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .as_ref()
-        .map(|last| (last.app.clone(), last.max_depth, last.max_elements));
-    let Some((app, max_depth, max_elements)) = last else {
+        .map(|last| (last.app.clone(), last.options))
+}
+
+/// Start counting the events of the app `return_state` will read, before the
+/// action runs. Only Windows has an event source; elsewhere this is `None` and
+/// the settle is a fixed pause.
+fn watch_for_state(desktop: &mut dyn Desktop) -> Option<settle::Watch> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let (app, _) = last_read()?;
+    settle::watch(desktop.resolve_pid(&app).ok()?)
+}
+
+/// The text `return_state` appends after an action.
+fn state_after_action(desktop: &mut dyn Desktop, args: &Value, watch: Option<settle::Watch>) -> String {
+    let Some((app, options)) = last_read() else {
         return "\n\n(return_state: no app has been read yet — call get_app_state first)".to_string();
     };
-    std::thread::sleep(SETTLE);
-    match read_app_state(desktop, &app, max_depth, max_elements, arg_str(args, "state_query")) {
+    settle::settle(watch);
+    match read_app_state(desktop, &app, options, arg_str(args, "state_query")) {
         Ok(outline) => format!("\n\nstate after the action (earlier ids are no longer valid):\n{outline}"),
         Err(error) => format!("\n\n(return_state: could not read {app} again: {error})"),
     }
@@ -635,6 +647,9 @@ fn run_desktop_tool(
     args: &Value,
     desktop: &mut dyn Desktop,
 ) -> Result<Value, DesktopError> {
+    let wants_state =
+        STATEFUL_ACTIONS.contains(&name) && args.get("return_state").and_then(Value::as_bool) == Some(true);
+    let watch = if wants_state { watch_for_state(desktop) } else { None };
     let text = match name {
         "list_apps" => desktop.list_apps()?,
         "get_app_state" => {
@@ -642,9 +657,13 @@ fn run_desktop_tool(
                 .ok_or_else(|| DesktopError::new("missing required argument 'app'"))?;
             let app = resolve_app_query(app)?;
             check_app_policy(desktop, &app)?;
-            let max_depth = arg_i64(args, "max_depth").unwrap_or(18).clamp(1, 60) as usize;
-            let max_elements = arg_i64(args, "max_elements").unwrap_or(800).clamp(1, 5000) as usize;
-            read_app_state(desktop, &app, max_depth, max_elements, arg_str(args, "query"))?
+            let options = StateOptions {
+                max_depth: arg_i64(args, "max_depth").unwrap_or(18).clamp(1, 60) as usize,
+                max_elements: arg_i64(args, "max_elements").unwrap_or(800).clamp(1, 5000) as usize,
+                offscreen: args.get("offscreen").and_then(Value::as_bool).unwrap_or(false),
+                ocr: OcrMode::parse(arg_str(args, "ocr"))?,
+            };
+            read_app_state(desktop, &app, options, arg_str(args, "query"))?
         }
         "hover" => desktop.hover(point_from(args, "element_id", "x", "y")?)?,
         "activate_app" => {
@@ -751,8 +770,8 @@ fn run_desktop_tool(
             return Err(DesktopError::new(format!("unknown tool '{other}'")));
         }
     };
-    let text = if STATEFUL_ACTIONS.contains(&name) && args.get("return_state").and_then(Value::as_bool) == Some(true) {
-        text + &state_after_action(desktop, args)
+    let text = if wants_state {
+        text + &state_after_action(desktop, args, watch)
     } else {
         text
     };
@@ -817,6 +836,26 @@ mod tests {
     }
 
     #[test]
+    fn app_state_filter_keeps_section_headers_and_the_offscreen_count() {
+        let outline = "App (pid 1), 1 window(s)\nnote: a dialog is open — only its controls are listed; dismiss it (for example with Escape) to reach the window behind\n\n── window 0: \"Main\"\n  [e1] Button \"Play\"\n… 12 off-screen elements skipped; scroll, or pass offscreen=true to list them\n\n── on-screen text (OCR)\n  [e2] Text \"Get Lucky\"\n  [e3] Text \"Daft Punk\"";
+        let filtered = super::filter_app_state(outline, "lucky");
+        assert!(filtered.contains("note: a dialog is open"), "{filtered}");
+        assert!(filtered.contains("── on-screen text (OCR)"), "{filtered}");
+        assert!(filtered.contains("… 12 off-screen elements skipped"), "{filtered}");
+        assert!(filtered.contains("[e2] Text \"Get Lucky\""), "{filtered}");
+        assert!(filtered.contains("1 matching element"), "{filtered}");
+        assert!(!filtered.contains("[e1]") && !filtered.contains("[e3]"), "{filtered}");
+    }
+
+    #[test]
+    fn an_unknown_ocr_mode_is_refused() {
+        let mut desktop = FakeDesktop::default();
+        let error = super::run_desktop_tool("get_app_state", &json!({ "app": "Fake", "ocr": "sometimes" }), &mut desktop).unwrap_err();
+        assert!(error.0.contains("auto, always, or never"), "{}", error.0);
+        assert_eq!(desktop.reads, 0);
+    }
+
+    #[test]
     fn app_state_filter_reports_no_matches() {
         let filtered = super::filter_app_state("App\n\n  [e1] Button \"Go\"", "zzz");
         assert!(filtered.contains("0 matching elements"), "{filtered}");
@@ -860,7 +899,7 @@ mod tests {
         fn list_apps(&mut self) -> crate::platform::Result<String> {
             Ok("Fake  [fake]  pid=1  windows=1  FRONTMOST".into())
         }
-        fn get_app_state(&mut self, app: &str, _: usize, _: usize) -> crate::platform::Result<String> {
+        fn get_app_state(&mut self, app: &str, _: &crate::platform::StateOptions) -> crate::platform::Result<String> {
             self.reads += 1;
             Ok(format!("{app} [fake] pid=1\n\n── window 0: \"Main\"\n  [e1] Button \"Save\"\n  [e2] Button \"Cancel {}\"", self.reads))
         }

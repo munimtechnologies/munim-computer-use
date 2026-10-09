@@ -290,10 +290,30 @@ pub fn capture_app_window(pid: u32, max_width: u32, format: CaptureFormat) -> Re
 fn capture_app_window_inner(pid: u32, max_width: u32, format: CaptureFormat) -> Result<(Capture, String)> {
     let windows = Window::all()
         .map_err(|error| DesktopError::new(format!("failed to enumerate windows: {error}")))?;
+    let window = pick_window(&windows, pid, None)?;
+    let title = window.title().unwrap_or_default();
+    let (image, frame) = window_pixels(window)?;
+    Ok((finish(image, frame, max_width, format)?, title))
+}
 
+/// The raw pixels of one of `pid`'s windows and where it sits on screen, for
+/// OCR. The largest window, unless `window` names one by its native id.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn capture_window_image(pid: u32, window: Option<u32>) -> Result<(RgbaImage, CaptureFrame)> {
+    guarded("window capture", || {
+        let windows = Window::all()
+            .map_err(|error| DesktopError::new(format!("failed to enumerate windows: {error}")))?;
+        window_pixels(pick_window(&windows, pid, window)?)
+    })
+}
+
+fn pick_window(windows: &[Window], pid: u32, wanted: Option<u32>) -> Result<&Window> {
     let mut best: Option<(u32, &Window)> = None;
-    for window in &windows {
+    for window in windows {
         if window.pid().unwrap_or(0) != pid || window.is_minimized().unwrap_or(false) {
+            continue;
+        }
+        if wanted.is_some() && window.id().ok() != wanted {
             continue;
         }
         let area = window.width().unwrap_or(0).saturating_mul(window.height().unwrap_or(0));
@@ -305,12 +325,14 @@ fn capture_app_window_inner(pid: u32, max_width: u32, format: CaptureFormat) -> 
         }
     }
 
-    let (_, window) = best.ok_or_else(|| {
+    best.map(|(_, window)| window).ok_or_else(|| {
         DesktopError::new(format!(
             "pid {pid} has no capturable window — it may be minimized or have no UI"
         ))
-    })?;
-    let title = window.title().unwrap_or_default();
+    })
+}
+
+fn window_pixels(window: &Window) -> Result<(RgbaImage, CaptureFrame)> {
     let frame = CaptureFrame {
         x: f64::from(window.x().unwrap_or(0)),
         y: f64::from(window.y().unwrap_or(0)),
@@ -320,7 +342,7 @@ fn capture_app_window_inner(pid: u32, max_width: u32, format: CaptureFormat) -> 
     let image = window
         .capture_image()
         .map_err(|error| DesktopError::new(format!("failed to capture window: {error}")))?;
-    Ok((finish(image, frame, max_width, format)?, title))
+    Ok((image, frame))
 }
 
 #[cfg(test)]

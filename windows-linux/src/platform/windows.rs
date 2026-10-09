@@ -10,27 +10,33 @@ use std::collections::HashMap;
 
 use uiautomation::UIAutomation;
 use uiautomation::UIElement;
+use uiautomation::core::{UICacheRequest, UICondition};
 use uiautomation::inputs::{Keyboard, Mouse, MouseButton};
-use uiautomation::patterns::{UIInvokePattern, UIScrollPattern, UITextPattern, UIValuePattern};
-use uiautomation::types::{Handle, Point as UIPoint, ScrollAmount};
+use uiautomation::patterns::{
+    UIInvokePattern, UIScrollPattern, UISelectionItemPattern, UITextPattern, UITogglePattern, UIValuePattern,
+};
+use uiautomation::types::{Handle, Point as UIPoint, ScrollAmount, TreeScope, UIProperty};
+use uiautomation::variants::Variant;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::core::BOOL;
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MOUSE_EVENT_FLAGS,
-    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT,
-    MapVirtualKeyW, SendInput, VIRTUAL_KEY, VkKeyScanW,
+    IsWindowEnabled, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC,
+    MOUSE_EVENT_FLAGS, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_WHEEL,
+    MOUSEINPUT, MapVirtualKeyW, SendInput, VIRTUAL_KEY, VkKeyScanW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    ChildWindowFromPointEx, CWP_SKIPDISABLED, CWP_SKIPINVISIBLE, EnumWindows, GetClassNameW,
-    GetWindowLongW, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, SW_RESTORE,
+    ChildWindowFromPointEx, CWP_SKIPDISABLED, CWP_SKIPINVISIBLE, EnumWindows, GW_OWNER, GetClassNameW,
+    GA_ROOT, GetAncestor, GetWindow, GetWindowLongW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
+    PostMessageW, SW_RESTORE,
     SetForegroundWindow, ShowWindow, WindowFromPoint, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, GWL_STYLE,
 };
 
 use super::agent_cursor::AgentCursor;
-use super::{Desktop, DesktopError, Point, Result, ScrollDirection, format_app_list};
+use super::outline::{self, Bounds, Fingerprint, Listed, OcrMode, OcrText, truncate};
+use super::{Desktop, DesktopError, Point, Result, ScrollDirection, StateOptions, format_app_list};
 use crate::apps;
 use crate::identity;
 use crate::keys::{self, Key, Named};
@@ -38,30 +44,156 @@ use crate::keys::{self, Key, Named};
 /// One wheel notch, as Windows defines it.
 const WHEEL_DELTA: i32 = 120;
 
+/// What an id from the latest `get_app_state` stands for.
+enum Entry {
+    /// An accessibility element, with what it was when listed and the
+    /// top-level window it lives in.
+    Element { element: UIElement, fingerprint: Fingerprint, window: HWND },
+    /// A line of on-screen text OCR found in `window`, acted on at its centre.
+    Ocr { center: (f64, f64), window: HWND },
+}
+
+/// A registry entry that passed the freshness check.
+enum Target {
+    Element { element: UIElement, window: HWND, minimized: bool },
+    Ocr { x: f64, y: f64, window: HWND },
+}
+
 pub struct WindowsDesktop {
     automation: UIAutomation,
-    /// Element handles from the most recent `get_app_state`, keyed by the
-    /// numeric part of the `e12` ids handed to the model.
-    registry: HashMap<u32, UIElement>,
+    /// Entries from the most recent `get_app_state`, keyed by the numeric
+    /// part of the `e12` ids handed to the model.
+    registry: HashMap<u32, Entry>,
+    /// Fetches a parent's children with every property the walk reads in one
+    /// cross-process call, instead of a round trip per property per element.
+    /// `None` if the request could not be built; the walk then reads live.
+    batch: Option<Batch>,
 }
+
+struct Batch {
+    request: UICacheRequest,
+    all: UICondition,
+    /// Children of a scroll container minus the rows UIA reports scrolled
+    /// away, so a long list costs its visible rows rather than all of them.
+    without_hidden_rows: UICondition,
+    /// Just those hidden rows, to count them without fetching their properties.
+    hidden_rows: UICondition,
+}
+
+/// The properties `Node::cached` reads.
+const BATCHED: [UIProperty; 10] = [
+    UIProperty::ControlType,
+    UIProperty::Name,
+    UIProperty::IsEnabled,
+    UIProperty::IsOffscreen,
+    UIProperty::BoundingRectangle,
+    UIProperty::ValueValue,
+    UIProperty::IsScrollPatternAvailable,
+    UIProperty::IsWindowPatternAvailable,
+    UIProperty::WindowIsModal,
+    UIProperty::IsDialog,
+];
 
 impl WindowsDesktop {
     pub fn new() -> Result<Self> {
         let automation = UIAutomation::new().map_err(|error| {
             DesktopError::new(format!("failed to initialise UI Automation: {error}"))
         })?;
+        let batch = Self::batch_request(&automation);
         Ok(Self {
             automation,
             registry: HashMap::new(),
+            batch,
         })
     }
 
-    fn element(&self, id: u32) -> Result<&UIElement> {
-        self.registry.get(&id).ok_or_else(|| {
+    fn batch_request(automation: &UIAutomation) -> Option<Batch> {
+        let request = automation.create_cache_request().ok()?;
+        for property in BATCHED {
+            // IsDialog needs Windows 10 1809; older systems just go without it.
+            if request.add_property(property).is_err() && property != UIProperty::IsDialog {
+                return None;
+            }
+        }
+        // Rows as `Node::is_row` defines them: ListItem, TreeItem, DataItem.
+        let row_type = |id: i32| automation.create_property_condition(UIProperty::ControlType, Variant::from(id), None);
+        let rows = automation.create_or_condition(
+            automation.create_or_condition(row_type(50007).ok()?, row_type(50024).ok()?).ok()?,
+            row_type(50029).ok()?,
+        ).ok()?;
+        let offscreen = || automation.create_property_condition(UIProperty::IsOffscreen, Variant::from(true), None);
+        let hidden_rows = automation.create_and_condition(offscreen().ok()?, rows).ok()?;
+        let without_hidden_rows = automation.create_not_condition(hidden_rows.clone()).ok()?;
+        Some(Batch { request, all: automation.create_true_condition().ok()?, without_hidden_rows, hidden_rows })
+    }
+
+    /// Resolve an id, rechecking that the element is still what was listed:
+    /// acting on whatever now sits at a stale handle is worse than failing.
+    fn resolve(&self, id: u32) -> Result<Target> {
+        let entry = self.registry.get(&id).ok_or_else(|| {
             DesktopError::new(format!(
                 "element e{id} is not in the current snapshot — call get_app_state again, ids are per-snapshot"
             ))
-        })
+        })?;
+        match entry {
+            Entry::Ocr { center, window } => Ok(Target::Ocr { x: center.0, y: center.1, window: *window }),
+            Entry::Element { element, fingerprint, window } => {
+                // A destroyed window's controls can still answer from a
+                // proxy's cache, so check the window itself first.
+                let current = if unsafe { IsWindow(Some(*window)) }.as_bool() { Self::fingerprint(element) } else { None };
+                outline::check_fresh(id, fingerprint, current.as_ref())?;
+                Ok(Target::Element {
+                    element: element.clone(),
+                    window: *window,
+                    minimized: unsafe { IsIconic(*window) }.as_bool(),
+                })
+            }
+        }
+    }
+
+    /// The element's role and name as it is now; `None` once it is gone.
+    fn fingerprint(element: &UIElement) -> Option<Fingerprint> {
+        let role = element.get_control_type().ok()?;
+        let name = element.get_name().ok()?;
+        Some(Fingerprint { role: format!("{role:?}"), name })
+    }
+
+    /// Where a coordinate action aims at a resolved target.
+    fn target_point(id: u32, target: &Target) -> Result<(f64, f64)> {
+        let (x, y, window) = match target {
+            Target::Ocr { x, y, window } => (*x, *y, *window),
+            // A minimized window's controls sit far off screen: a click there
+            // would land on whatever is actually at those coordinates.
+            Target::Element { minimized: true, .. } => return Err(outline::minimized_error(id)),
+            Target::Element { element, window, .. } => {
+                let (x, y) = Self::center(element)?;
+                (x, y, *window)
+            }
+        };
+        Self::check_uncovered(id, window, x, y)?;
+        Ok((x, y))
+    }
+
+    /// A coordinate action reaches whatever window is on top at the point:
+    /// the real cursor clicks it, and posted messages go to it. When another
+    /// app's window covers the target there, refuse rather than act on it.
+    fn check_uncovered(id: u32, window: HWND, x: f64, y: f64) -> Result<()> {
+        let owner = |hwnd: HWND| {
+            let mut pid = 0u32;
+            unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+            pid
+        };
+        let at = unsafe { WindowFromPoint(POINT { x: x.round() as i32, y: y.round() as i32 }) };
+        if at.0.is_null() {
+            return Ok(());
+        }
+        let top = owner(unsafe { GetAncestor(at, GA_ROOT) });
+        if top == owner(window) || top == std::process::id() {
+            return Ok(());
+        }
+        Err(DesktopError::new(format!(
+            "e{id} is covered by another window — bring it forward with activate_app, or use an action that works through accessibility"
+        )))
     }
 
     /// Centre of an element in screen coordinates.
@@ -85,8 +217,37 @@ impl WindowsDesktop {
     fn point_coordinates(&self, target: Point) -> Result<(f64, f64)> {
         match target {
             Point::Screen(x, y) => Ok((x, y)),
-            Point::Element(id) => Self::center(self.element(id)?),
+            Point::Element(id) => Self::target_point(id, &self.resolve(id)?),
         }
+    }
+
+    /// Press an element through its own patterns rather than a pointer. Invoke
+    /// is the control's own click handler. A minimized window cannot take a
+    /// pointer click at all, so there Toggle and SelectionItem stand in for
+    /// the click on checkboxes, list rows and tabs.
+    fn press_through_patterns(id: u32, element: &UIElement, minimized: bool) -> Option<String> {
+        if let Ok(invoke) = element.get_pattern::<UIInvokePattern>() {
+            // Wait for the agent pointer to land before invoking, matching Mac.
+            if !minimized && let Ok((x, y)) = Self::center(element) {
+                AgentCursor::shared().press(x, y);
+            }
+            if invoke.invoke().is_ok() {
+                return Some(format!("pressed e{id}"));
+            }
+        }
+        if minimized {
+            if let Ok(toggle) = element.get_pattern::<UITogglePattern>()
+                && toggle.toggle().is_ok()
+            {
+                return Some(format!("toggled e{id}"));
+            }
+            if let Ok(item) = element.get_pattern::<UISelectionItemPattern>()
+                && item.select().is_ok()
+            {
+                return Some(format!("selected e{id}"));
+            }
+        }
+        None
     }
 
     /// A password field the agent must not write into (UIA `IsPassword`),
@@ -420,28 +581,64 @@ impl WindowsDesktop {
         Ok(())
     }
 
+    /// The children of `element`, with their properties. With `skip_hidden_rows`,
+    /// rows UIA reports scrolled away are left out on the provider's side and
+    /// only counted; the second number is that count.
+    fn children(&self, element: &UIElement, skip_hidden_rows: bool) -> (Vec<Node>, usize) {
+        if let Some(batch) = &self.batch {
+            if skip_hidden_rows
+                && let Ok(found) = element.find_all_build_cache(TreeScope::Children, &batch.without_hidden_rows, &batch.request)
+            {
+                // Counting needs no properties, which is what makes it cheap:
+                // 3,000 ListBox rows count in about a fifth of the time it
+                // takes to fetch them.
+                let hidden = element.find_all(TreeScope::Children, &batch.hidden_rows).map_or(0, |rows| rows.len());
+                return (found.into_iter().map(Node::cached).collect(), hidden);
+            }
+            // A provider that cannot answer FindAll has no children to offer
+            // a walker either.
+            let found = element
+                .find_all_build_cache(TreeScope::Children, &batch.all, &batch.request)
+                .map(|found| found.into_iter().map(Node::cached).collect())
+                .unwrap_or_default();
+            return (found, 0);
+        }
+        let Ok(walker) = self.automation.create_tree_walker() else {
+            return (Vec::new(), 0);
+        };
+        let mut nodes = Vec::new();
+        let mut child = walker.get_first_child(element).ok();
+        while let Some(current) = child {
+            child = walker.get_next_sibling(&current).ok();
+            nodes.push(Node::live(current));
+        }
+        (nodes, 0)
+    }
+
+    /// A top-level window as the root of a walk.
+    fn window_node(&self, window: HWND) -> Option<Node> {
+        let handle = Handle::from(window.0 as isize);
+        if let Some(batch) = &self.batch
+            && let Ok(element) = self.automation.element_from_handle_build_cache(handle, &batch.request)
+        {
+            return Some(Node::cached(element));
+        }
+        self.automation.element_from_handle(Handle::from(window.0 as isize)).ok().map(Node::live)
+    }
+
     /// Render one element as an outline row, registering it when it is
     /// interactive enough to be worth an id.
-    fn describe(&mut self, element: &UIElement, depth: usize, next_id: &mut u32) -> Option<String> {
-        let control_type = element
-            .get_control_type()
-            .map(|kind| format!("{kind:?}"))
-            .unwrap_or_else(|_| "Unknown".to_string());
-        let name = element.get_name().unwrap_or_default();
-        let value = element
-            .get_pattern::<UIValuePattern>()
-            .ok()
-            .and_then(|pattern| pattern.get_value().ok())
-            .filter(|value| !value.is_empty());
-
+    fn describe(&mut self, walk: &mut Walk, node: &Node, depth: usize, window: HWND, chrome: bool) -> Option<String> {
+        let control_type = node.control_type.as_str();
         // Rows with nothing to say are noise in an already large tree.
-        if name.is_empty() && value.is_none() && control_type == "Pane" {
+        if node.name.is_empty() && node.value.is_none() && control_type == "Pane" {
             return None;
         }
 
-        let interactive = element.is_enabled().unwrap_or(false)
+        let enabled = node.enabled.unwrap_or(false);
+        let interactive = enabled
             && matches!(
-                control_type.as_str(),
+                control_type,
                 "Button"
                     | "CheckBox"
                     | "ComboBox"
@@ -459,73 +656,281 @@ impl WindowsDesktop {
                     | "Tree"
                     | "TreeItem"
             );
+        if !chrome && is_app_control(control_type, &node.name, enabled) {
+            walk.app_control = true;
+        }
+        if let Some(bounds) = node.bounds {
+            walk.listed.push(Listed {
+                bounds,
+                name: node.name.clone(),
+                value: node.value.clone().unwrap_or_default(),
+                chrome: control_type == "TitleBar",
+            });
+        }
 
         let mut row = "  ".repeat(depth);
         if interactive {
-            *next_id += 1;
-            row.push_str(&format!("[e{next_id}] "));
-            self.registry.insert(*next_id, element.clone());
+            walk.next_id += 1;
+            row.push_str(&format!("[e{}] ", walk.next_id));
+            self.registry.insert(
+                walk.next_id,
+                Entry::Element {
+                    element: node.element.clone(),
+                    fingerprint: Fingerprint { role: node.control_type.clone(), name: node.name.clone() },
+                    window,
+                },
+            );
         }
-        row.push_str(&control_type);
-        if !name.is_empty() {
-            row.push_str(&format!(" \"{}\"", truncate(&name, 120)));
+        row.push_str(control_type);
+        if !node.name.is_empty() {
+            row.push_str(&format!(" \"{}\"", truncate(&node.name, 120)));
         }
-        if let Some(value) = value {
-            row.push_str(&format!(" = \"{}\"", truncate(&value, 120)));
+        if let Some(value) = &node.value {
+            row.push_str(&format!(" = \"{}\"", truncate(value, 120)));
         }
-        if !element.is_enabled().unwrap_or(true) {
+        if !node.enabled.unwrap_or(true) {
             row.push_str(" (disabled)");
         }
         Some(row)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn walk(
-        &mut self,
-        element: &UIElement,
-        depth: usize,
-        max_depth: usize,
-        max_elements: usize,
-        next_id: &mut u32,
-        lines: &mut Vec<String>,
-    ) {
-        if depth > max_depth || lines.len() >= max_elements {
+    /// Walk one top-level window, or a dialog inside one.
+    fn walk_root(&mut self, walk: &mut Walk, root: &Node, window: &WindowInfo) {
+        // A minimized window reports every control as off screen, so nothing
+        // is left out of one.
+        let clip = if window.minimized { None } else { root.bounds.filter(Bounds::has_area) };
+        self.walk(walk, root, 0, clip, window, false);
+    }
+
+    /// `clip` is the visible part of the window and the scroll containers
+    /// around `node`. Children outside it are skipped with their subtrees,
+    /// unless `offscreen` asked for everything.
+    fn walk(&mut self, walk: &mut Walk, node: &Node, depth: usize, clip: Option<Bounds>, window: &WindowInfo, chrome: bool) {
+        let limits = walk.options;
+        if depth > limits.max_depth || walk.rows.len() >= limits.max_elements {
             return;
         }
-        if let Some(row) = self.describe(element, depth, next_id) {
-            lines.push(row);
+        if let Some(row) = self.describe(walk, node, depth, window.hwnd, chrome) {
+            walk.rows.push(row);
         }
         // At max_depth we still describe this node, but skip child enumeration —
         // walking siblings would only waste UIA work with no lines added.
-        if depth == max_depth {
+        if depth == limits.max_depth {
+            walk.cut_short = true;
             return;
         }
 
-        let walker = match self.automation.create_tree_walker() {
-            Ok(walker) => walker,
-            Err(_) => return,
+        let chrome = chrome || node.control_type == "TitleBar";
+        let clip = if node.floats() {
+            node.bounds.filter(Bounds::has_area)
+        } else if node.scrolls {
+            outline::narrow_clip(clip, node.bounds)
+        } else {
+            clip
         };
-        let mut child = walker.get_first_child(element).ok();
-        while let Some(current) = child {
-            if lines.len() >= max_elements {
-                lines.push(format!(
-                    "{}… truncated at {max_elements} elements — raise max_elements or target a child",
-                    "  ".repeat(depth + 1)
+        let prune = !limits.offscreen && !window.minimized;
+        // Long lists live in scroll containers: leave their hidden rows to
+        // the provider rather than fetching every one.
+        let (children, hidden_rows) = self.children(&node.element, prune && node.scrolls);
+        walk.skipped += hidden_rows;
+        for child in children {
+            if walk.rows.len() >= limits.max_elements {
+                walk.rows.push(format!(
+                    "{}… truncated at {} elements — raise max_elements or target a child",
+                    "  ".repeat(depth + 1),
+                    limits.max_elements
                 ));
                 return;
             }
-            self.walk(&current, depth + 1, max_depth, max_elements, next_id, lines);
-            child = walker.get_next_sibling(&current).ok();
+            if prune && outline::is_off_screen(child.bounds, clip, child.offscreen, child.floats(), child.is_row()) {
+                walk.skipped += 1;
+                continue;
+            }
+            if walk.find_dialogs && child.dialog {
+                walk.dialogs.push((window.clone(), child.element.clone()));
+            }
+            self.walk(walk, &child, depth + 1, clip, window, chrome);
+        }
+    }
+
+    /// Top-level dialogs that disable the window that owns them, the way a
+    /// modal dialog does: its owner is one of the app's windows and no longer
+    /// takes input.
+    fn blocking_dialogs(windows: &[HWND]) -> Vec<HWND> {
+        windows
+            .iter()
+            .copied()
+            .filter(|window| {
+                let Ok(owner) = (unsafe { GetWindow(*window, GW_OWNER) }) else {
+                    return false;
+                };
+                !owner.0.is_null()
+                    && windows.iter().any(|other| other.0 == owner.0)
+                    && !unsafe { IsWindowEnabled(owner) }.as_bool()
+            })
+            .collect()
+    }
+
+    /// Run OCR on one of `pid`'s windows (the largest when `window` is None).
+    fn read_text(pid: u32, window: Option<HWND>) -> std::result::Result<Vec<OcrText>, String> {
+        let wanted = window.map(|window| window.0 as usize as u32);
+        let (image, frame) = crate::capture::capture_window_image(pid, wanted).map_err(|error| error.0)?;
+        super::ocr::recognize(&image, &frame)
+    }
+}
+
+/// One element's properties, read in a batch (`cached`) or one by one (`live`).
+struct Node {
+    element: UIElement,
+    control_type: String,
+    name: String,
+    value: Option<String>,
+    enabled: Option<bool>,
+    /// UIA's IsOffscreen: scrolled out of view or collapsed away.
+    offscreen: bool,
+    bounds: Option<Bounds>,
+    /// Has a ScrollPattern, so it clips its children to its own bounds.
+    scrolls: bool,
+    /// A modal window or dialog: blocks the window it is in.
+    dialog: bool,
+}
+
+fn variant_bool(value: uiautomation::Result<Variant>) -> bool {
+    value.ok().and_then(|value| TryInto::<bool>::try_into(value).ok()).unwrap_or(false)
+}
+
+fn bounds_of(rect: uiautomation::Result<uiautomation::types::Rect>) -> Option<Bounds> {
+    rect.ok().map(|rect| {
+        Bounds::from_edges(
+            f64::from(rect.get_left()),
+            f64::from(rect.get_top()),
+            f64::from(rect.get_right()),
+            f64::from(rect.get_bottom()),
+        )
+    })
+}
+
+impl Node {
+    fn cached(element: UIElement) -> Self {
+        let control_type = element
+            .get_cached_control_type()
+            .map(|kind| format!("{kind:?}"))
+            .unwrap_or_else(|_| "Unknown".to_string());
+        let modal = variant_bool(element.get_cached_property_value(UIProperty::IsWindowPatternAvailable))
+            && variant_bool(element.get_cached_property_value(UIProperty::WindowIsModal));
+        let dialog = (control_type == "Window" && modal)
+            || variant_bool(element.get_cached_property_value(UIProperty::IsDialog));
+        Self {
+            name: element.get_cached_name().unwrap_or_default(),
+            value: element
+                .get_cached_property_value(UIProperty::ValueValue)
+                .ok()
+                .and_then(|value| TryInto::<String>::try_into(value).ok())
+                .filter(|value| !value.is_empty()),
+            enabled: element.is_cached_enabled().ok(),
+            offscreen: element.is_cached_offscreen().unwrap_or(false),
+            bounds: bounds_of(element.get_cached_bounding_rectangle()),
+            scrolls: variant_bool(element.get_cached_property_value(UIProperty::IsScrollPatternAvailable)),
+            dialog,
+            control_type,
+            element,
+        }
+    }
+
+    fn live(element: UIElement) -> Self {
+        let control_type = element
+            .get_control_type()
+            .map(|kind| format!("{kind:?}"))
+            .unwrap_or_else(|_| "Unknown".to_string());
+        let modal = variant_bool(element.get_property_value(UIProperty::IsWindowPatternAvailable))
+            && variant_bool(element.get_property_value(UIProperty::WindowIsModal));
+        let dialog = (control_type == "Window" && modal) || element.is_dialog().unwrap_or(false);
+        Self {
+            name: element.get_name().unwrap_or_default(),
+            value: element
+                .get_pattern::<UIValuePattern>()
+                .ok()
+                .and_then(|pattern| pattern.get_value().ok())
+                .filter(|value| !value.is_empty()),
+            enabled: element.is_enabled().ok(),
+            offscreen: element.is_offscreen().unwrap_or(false),
+            bounds: bounds_of(element.get_bounding_rectangle()),
+            scrolls: variant_bool(element.get_property_value(UIProperty::IsScrollPatternAvailable)),
+            dialog,
+            control_type,
+            element,
+        }
+    }
+
+    fn is_row(&self) -> bool {
+        matches!(self.control_type.as_str(), "ListItem" | "TreeItem" | "DataItem")
+    }
+
+    /// Menus, tooltips, popups and dialogs float outside their parents, so
+    /// they are never skipped as off screen and start a clip of their own.
+    fn floats(&self) -> bool {
+        self.dialog || matches!(self.control_type.as_str(), "Menu" | "ToolTip" | "Window")
+    }
+}
+
+/// The top-level window a walk is in.
+#[derive(Clone)]
+struct WindowInfo {
+    hwnd: HWND,
+    index: usize,
+    title: String,
+    minimized: bool,
+}
+
+/// Running totals of one `get_app_state` walk.
+struct Walk {
+    options: StateOptions,
+    next_id: u32,
+    rows: Vec<String>,
+    /// Subtree roots left out as off screen.
+    skipped: usize,
+    /// Every listed element with bounds, so OCR does not repeat them.
+    listed: Vec<Listed>,
+    /// A labelled control of the app itself was listed (`ocr: auto`).
+    app_control: bool,
+    /// max_depth stopped the walk somewhere, so controls may lie deeper:
+    /// too little is known to call the app inaccessible (`ocr: auto`).
+    cut_short: bool,
+    /// Collect modal dialogs met inside windows (first pass only).
+    find_dialogs: bool,
+    dialogs: Vec<(WindowInfo, UIElement)>,
+}
+
+impl Walk {
+    fn new(options: StateOptions, find_dialogs: bool) -> Self {
+        Self {
+            options,
+            next_id: 0,
+            rows: Vec::new(),
+            skipped: 0,
+            listed: Vec::new(),
+            app_control: false,
+            cut_short: false,
+            find_dialogs,
+            dialogs: Vec::new(),
         }
     }
 }
 
-fn truncate(value: &str, limit: usize) -> String {
-    let cleaned = value.replace(['\n', '\r'], " ");
-    if cleaned.chars().count() <= limit {
-        return cleaned;
-    }
-    cleaned.chars().take(limit).collect::<String>() + "…"
+/// Whether an element is a control of the app itself, for `ocr: auto`: an
+/// enabled control with a label (text inputs need none). Static text and bare
+/// groups or panes do not count, and the caller leaves out the title bar's
+/// own buttons.
+fn is_app_control(control_type: &str, name: &str, enabled: bool) -> bool {
+    enabled
+        && match control_type {
+            "Edit" | "Document" => true,
+            "Button" | "CheckBox" | "ComboBox" | "DataItem" | "Hyperlink" | "ListItem" | "MenuItem"
+            | "RadioButton" | "Slider" | "Spinner" | "SplitButton" | "TabItem" | "TreeItem" => {
+                !name.trim().is_empty()
+            }
+            _ => false,
+        }
 }
 
 /// What one `press_key` call sends, before it becomes `SendInput` records.
@@ -766,49 +1171,123 @@ impl Desktop for WindowsDesktop {
         apps::resolve_pid(app)
     }
 
-    fn get_app_state(&mut self, app: &str, max_depth: usize, max_elements: usize) -> Result<String> {
+    fn get_app_state(&mut self, app: &str, options: &StateOptions) -> Result<String> {
         // Ids are per-snapshot, so previous handles must not resolve — clear
         // before resolve_pid so a failed lookup cannot leave stale ids.
         self.registry.clear();
         let pid = apps::resolve_pid(app)?;
-        let windows = Self::top_level_windows(pid);
-        if windows.is_empty() {
+        let all = Self::top_level_windows(pid);
+        if all.is_empty() {
             return Err(DesktopError::new(format!(
                 "{app} (pid {pid}) has no visible window"
             )));
         }
 
-        let mut next_id = 0u32;
-        let mut lines = vec![format!("{app} (pid {pid}), {} window(s)", windows.len())];
-        // One shared element budget across every window — recreating the walk
-        // buffer per window would let multi-window apps emit
-        // windows.len() * max_elements rows.
-        let mut element_lines = Vec::new();
+        // A modal dialog blocks the window that owns it: list only the dialog,
+        // since nothing behind it takes input until it is dismissed.
+        let blocking = Self::blocking_dialogs(&all);
+        let mut scoped = !blocking.is_empty();
+        let windows: Vec<WindowInfo> = if scoped { blocking } else { all.clone() }
+            .into_iter()
+            .enumerate()
+            .map(|(index, hwnd)| WindowInfo {
+                hwnd,
+                index,
+                title: String::new(),
+                minimized: unsafe { IsIconic(hwnd) }.as_bool(),
+            })
+            .collect();
 
-        for (index, window) in windows.iter().enumerate() {
-            let element = match self
-                .automation
-                .element_from_handle(Handle::from(window.0 as isize))
-            {
-                Ok(element) => element,
-                Err(_) => continue,
-            };
-            let title = element.get_name().unwrap_or_default();
-            lines.push(String::new());
-            lines.push(format!("── window {index}: \"{title}\""));
-            let window_start = element_lines.len();
-            self.walk(
-                &element,
-                0,
-                max_depth,
-                max_elements,
-                &mut next_id,
-                &mut element_lines,
-            );
-            lines.extend(element_lines[window_start..].iter().cloned());
+        // One shared walk across every window: its element budget caps the
+        // whole outline, not each window.
+        let mut walk = Walk::new(*options, !scoped);
+        let mut sections: Vec<(String, usize)> = Vec::new();
+        for window in &windows {
+            let Some(root) = self.window_node(window.hwnd) else { continue };
+            let window = WindowInfo { title: root.name.clone(), ..window.clone() };
+            sections.push((format!("── window {}: \"{}\"", window.index, window.title), walk.rows.len()));
+            self.walk_root(&mut walk, &root, &window);
         }
 
-        if next_id == 0 {
+        // A dialog inside a window (a XAML ContentDialog, a modal web dialog)
+        // blocks it the same way. Start again, listing only the dialogs.
+        let mut ocr_window = scoped.then(|| windows[0].hwnd);
+        let mut ocr_clip: Option<Bounds> = None;
+        if !walk.dialogs.is_empty() {
+            let dialogs = std::mem::take(&mut walk.dialogs);
+            self.registry.clear();
+            walk = Walk::new(*options, false);
+            sections.clear();
+            scoped = true;
+            for (window, dialog) in dialogs {
+                let root = match &self.batch {
+                    Some(batch) => dialog.build_updated_cache(&batch.request).map(Node::cached).unwrap_or_else(|_| Node::live(dialog)),
+                    None => Node::live(dialog),
+                };
+                if ocr_window.is_none() {
+                    ocr_window = Some(window.hwnd);
+                    ocr_clip = root.bounds.filter(Bounds::has_area);
+                }
+                sections.push((
+                    format!("── window {}: \"{}\" — dialog \"{}\"", window.index, window.title, truncate(&root.name, 120)),
+                    walk.rows.len(),
+                ));
+                self.walk_root(&mut walk, &root, &window);
+            }
+        }
+
+        let mut notes = Vec::new();
+        if scoped {
+            notes.push(outline::DIALOG_NOTE.to_string());
+        }
+        let mut ocr_rows = Vec::new();
+        let run_ocr = match options.ocr {
+            OcrMode::Always => true,
+            OcrMode::Never => false,
+            OcrMode::Auto => !walk.app_control && !walk.cut_short,
+        };
+        if run_ocr {
+            // Any of the app's windows identifies the pid for the covered check.
+            let ocr_target = ocr_window.unwrap_or(all[0]);
+            match Self::read_text(pid, ocr_window) {
+                Ok(found) => {
+                    let found = found
+                        .into_iter()
+                        .filter(|line| {
+                            let (x, y) = line.bounds.center();
+                            ocr_clip.is_none_or(|clip| clip.contains(x, y))
+                        })
+                        .collect();
+                    for line in outline::dedupe_ocr(found, &walk.listed) {
+                        walk.next_id += 1;
+                        self.registry.insert(walk.next_id, Entry::Ocr { center: line.bounds.center(), window: ocr_target });
+                        ocr_rows.push(outline::ocr_row(walk.next_id, &line.text));
+                    }
+                }
+                Err(reason) if options.ocr == OcrMode::Always => notes.push(outline::ocr_unavailable_note(&reason)),
+                // Under auto, OCR is a bonus: say nothing when it cannot run.
+                Err(_) => {}
+            }
+        }
+
+        let mut lines = vec![format!("{app} (pid {pid}), {} window(s)", all.len())];
+        lines.extend(notes);
+        for (index, (header, start)) in sections.iter().enumerate() {
+            let end = sections.get(index + 1).map_or(walk.rows.len(), |next| next.1);
+            lines.push(String::new());
+            lines.push(header.clone());
+            lines.extend(walk.rows[*start..end].iter().cloned());
+        }
+        if walk.skipped > 0 {
+            lines.push(outline::offscreen_line(walk.skipped));
+        }
+        if !ocr_rows.is_empty() {
+            lines.push(String::new());
+            lines.push(outline::OCR_HEADER.to_string());
+            lines.extend(ocr_rows);
+        }
+
+        if walk.next_id == 0 {
             lines.push(String::new());
             lines.push(
                 "no interactive elements found — the app may render its own UI, so use screenshot \
@@ -842,26 +1321,25 @@ impl Desktop for WindowsDesktop {
     }
 
     fn click(&mut self, target: Point, click_count: u32) -> Result<String> {
-        // An element press goes through the control's own Invoke handler, which
-        // is far more reliable than a synthetic click landing on the right pixel.
-        // Remote control skips it: the viewer is aiming at a pixel they can see,
-        // and an Invoke would fire a different control than the one under them.
-        if let Point::Element(id) = target
-            && !identity::remote_control()
-            && click_count == 1
-            && let Ok(element) = self.element(id)
-            && let Ok(invoke) = element.get_pattern::<UIInvokePattern>()
-        {
-            // Wait for the agent pointer to land before invoking, matching Mac.
-            if let Ok((x, y)) = Self::center(element) {
-                AgentCursor::shared().press(x, y);
+        let (x, y) = match target {
+            Point::Screen(x, y) => (x, y),
+            Point::Element(id) => {
+                let resolved = self.resolve(id)?;
+                // An element press goes through the control's own Invoke
+                // handler, which is far more reliable than a synthetic click
+                // landing on the right pixel. Remote control skips it: the
+                // viewer is aiming at a pixel they can see, and an Invoke would
+                // fire a different control than the one under them.
+                if let Target::Element { element, minimized, .. } = &resolved
+                    && !identity::remote_control()
+                    && click_count == 1
+                    && let Some(done) = Self::press_through_patterns(id, element, *minimized)
+                {
+                    return Ok(done);
+                }
+                Self::target_point(id, &resolved)?
             }
-            if invoke.invoke().is_ok() {
-                return Ok(format!("pressed e{id}"));
-            }
-        }
-
-        let (x, y) = self.point_coordinates(target)?;
+        };
         AgentCursor::shared().press(x, y);
         // Prefer window-message delivery so the user's cursor stays put --
         // unless this is remote control, where moving the cursor is the point.
@@ -940,14 +1418,28 @@ impl Desktop for WindowsDesktop {
 
     fn type_text(&mut self, text: &str, element: Option<u32>) -> Result<String> {
         if let Some(id) = element {
-            let target = self.element(id)?;
-            if Self::refuses_secure_input(target) {
-                let _ = target.set_focus();
-                return Ok(super::secure_field_handback(id));
+            match self.resolve(id)? {
+                // OCR text has no focus to take: click it, as a person would.
+                ocr @ Target::Ocr { .. } => {
+                    let (x, y) = Self::target_point(id, &ocr)?;
+                    self.click(Point::Screen(x, y), 1)?;
+                    std::thread::sleep(std::time::Duration::from_millis(60));
+                }
+                Target::Element { element: target, minimized, .. } => {
+                    if Self::refuses_secure_input(&target) {
+                        let _ = target.set_focus();
+                        return Ok(super::secure_field_handback(id));
+                    }
+                    // Keystrokes go to the foreground window, which a
+                    // minimized one is not.
+                    if minimized {
+                        return Err(outline::minimized_error(id));
+                    }
+                    target
+                        .set_focus()
+                        .map_err(|error| DesktopError::new(format!("could not focus e{id}: {error}")))?;
+                }
             }
-            target
-                .set_focus()
-                .map_err(|error| DesktopError::new(format!("could not focus e{id}: {error}")))?;
         }
         Keyboard::default()
             .send_text(text)
@@ -974,21 +1466,29 @@ impl Desktop for WindowsDesktop {
         let (horizontal, vertical) = direction.deltas(amount);
         let label = format!("scrolled {direction:?} by {amount}").to_lowercase();
         if let Some(id) = element {
-            let target = self.element(id)?.clone();
-            let (x, y) = Self::center(&target)?;
-            AgentCursor::shared().show(x, y);
+            let resolved = self.resolve(id)?;
+            let point = Self::target_point(id, &resolved);
+            if let Ok((x, y)) = point {
+                AgentCursor::shared().show(x, y);
+            }
             // Neither of these touches the user's cursor: the control's own
-            // ScrollPattern first, then wheel messages posted to its window.
+            // ScrollPattern first (which works in a minimized window too), then
+            // wheel messages posted to its window.
             if !identity::remote_control() {
-                if self.uia_scroll(&target, horizontal, vertical) {
+                if let Target::Element { element: target, .. } = &resolved
+                    && self.uia_scroll(target, horizontal, vertical)
+                {
                     return Ok(format!("{label} in background (UI Automation)"));
                 }
-                if Self::post_wheel(x, y, horizontal, vertical) {
+                if let Ok((x, y)) = point
+                    && Self::post_wheel(x, y, horizontal, vertical)
+                {
                     return Ok(format!("{label} in background"));
                 }
             }
             // Last resort: the wheel goes to whatever is under the real
             // pointer, so the pointer has to move there.
+            let (x, y) = point?;
             Self::jump_cursor(x, y)?;
             if horizontal != 0 {
                 Self::scroll_wheel(true, horizontal)?;
@@ -1009,8 +1509,10 @@ impl Desktop for WindowsDesktop {
     }
 
     fn set_value(&mut self, element: u32, value: &str) -> Result<String> {
-        let target = self.element(element)?;
-        if Self::refuses_secure_input(target) {
+        let Target::Element { element: target, .. } = self.resolve(element)? else {
+            return Err(outline::ocr_id_error(element));
+        };
+        if Self::refuses_secure_input(&target) {
             let _ = target.set_focus();
             return Ok(super::secure_field_handback(element));
         }
@@ -1026,7 +1528,9 @@ impl Desktop for WindowsDesktop {
     }
 
     fn select_text(&mut self, element: u32, start: usize, length: Option<usize>) -> Result<String> {
-        let target = self.element(element)?;
+        let Target::Element { element: target, .. } = self.resolve(element)? else {
+            return Err(outline::ocr_id_error(element));
+        };
         let pattern = target.get_pattern::<UITextPattern>().map_err(|_| {
             DesktopError::new(format!("e{element} does not expose selectable text"))
         })?;
@@ -1062,7 +1566,7 @@ impl Desktop for WindowsDesktop {
 
 #[cfg(test)]
 mod tests {
-    use super::{KeyPlan, Stroke, key_plan, truncate};
+    use super::{KeyPlan, Stroke, is_app_control, key_plan, truncate};
 
     /// A US layout stand-in so the tests do not depend on the machine's layout.
     fn us(character: char) -> Option<(u16, Vec<u16>)> {
@@ -1147,6 +1651,20 @@ mod tests {
         assert!(error.0.contains("unsupported modifier"));
         assert!(error.0.contains("ctl"));
         assert!(key_plan("pagedwn", &[], us).is_err());
+    }
+
+    #[test]
+    fn only_labelled_enabled_controls_keep_ocr_away() {
+        assert!(is_app_control("Button", "Play", true));
+        // Unlabelled buttons and disabled ones say nothing about the app.
+        assert!(!is_app_control("Button", "  ", true));
+        assert!(!is_app_control("Button", "Play", false));
+        // Text inputs need no label.
+        assert!(is_app_control("Edit", "", true));
+        // Static text, groups and panes are not controls.
+        assert!(!is_app_control("Text", "Now playing", true));
+        assert!(!is_app_control("Group", "Sidebar", true));
+        assert!(!is_app_control("Pane", "Main", true));
     }
 
     #[test]

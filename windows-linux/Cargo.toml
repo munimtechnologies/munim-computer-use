@@ -39,6 +39,13 @@ windows = { version = "0.62.2", features = [
   "Win32_Graphics_Dxgi",
   "Win32_Graphics_Dxgi_Common",
   "Win32_UI_HiDpi",
+  # return_state settles on the app's WinEvents (settle.rs).
+  "Win32_UI_Accessibility",
+  # On-screen text for apps that expose little to UI Automation (platform/ocr.rs).
+  "Foundation",
+  "Graphics_Imaging",
+  "Media_Ocr",
+  "Storage_Streams",
 ] }
 
 [target.'cfg(any(windows, target_os = "linux"))'.dependencies]

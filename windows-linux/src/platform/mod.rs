@@ -14,6 +14,11 @@ pub mod linux;
 #[cfg(any(windows, target_os = "linux"))]
 pub mod agent_cursor;
 #[cfg(windows)]
+mod ocr;
+// OCR exists only on Windows; Linux uses the rest, macOS builds only test it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub mod outline;
+#[cfg(windows)]
 pub mod windows;
 
 /// A tool failure that is worth showing the model verbatim.
@@ -181,13 +186,23 @@ pub fn secure_field_handback(id: u32) -> String {
     )
 }
 
+/// How `get_app_state` reads an app, from the tool's arguments.
+#[derive(Clone, Copy, Debug)]
+pub struct StateOptions {
+    pub max_depth: usize,
+    pub max_elements: usize,
+    /// List elements scrolled out of view too (the old full walk).
+    pub offscreen: bool,
+    pub ocr: outline::OcrMode,
+}
+
 /// The operations every backend must provide.
 ///
 /// `&mut self` throughout because `get_app_state` refreshes the element
 /// registry that later calls resolve ids against.
 pub trait Desktop {
     fn list_apps(&mut self) -> Result<String>;
-    fn get_app_state(&mut self, app: &str, max_depth: usize, max_elements: usize) -> Result<String>;
+    fn get_app_state(&mut self, app: &str, options: &StateOptions) -> Result<String>;
     fn activate_app(&mut self, app: &str) -> Result<String>;
     fn click(&mut self, target: Point, click_count: u32) -> Result<String>;
     fn right_click(&mut self, target: Point) -> Result<String>;
