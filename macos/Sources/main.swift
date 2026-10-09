@@ -112,8 +112,35 @@ func elementCenter(_ el: AXUIElement) -> CGPoint? {
 // Snapshots hand out short ids ("e12") that later calls reference, so the model
 // clicks a named element instead of guessing pixel coordinates.
 
+/// What an element was when it was listed: an action rechecks it, so an id
+/// whose element was replaced (a list re-sorted, a dialog swapped its buttons)
+/// fails instead of pressing whatever now sits there.
+struct Fingerprint: Equatable {
+    let role: String
+    /// Title or description. Not the value, which typing legitimately changes.
+    let name: String?
+
+    var described: String {
+        role.replacingOccurrences(of: "AX", with: "") + (name.map { " \"\(truncate($0, 60))\"" } ?? "")
+    }
+}
+
+/// Text read by OCR. Its place is kept relative to its window, so it still
+/// lands right after the window moves (parked for background control and back).
+struct OCRText {
+    let text: String
+    let pid: pid_t
+    let windowID: UInt32
+    let offset: CGRect
+}
+
+enum Registered {
+    case element(AXUIElement, Fingerprint?)
+    case text(OCRText)
+}
+
 final class Registry {
-    static var map: [String: AXUIElement] = [:]
+    static var map: [String: Registered] = [:]
     static var counter = 0
     /// App most recently inspected. Subsequent input is delivered to this
     /// process by default, so interaction stays in the background.
@@ -125,14 +152,92 @@ final class Registry {
         targetPid = nil
     }
 
-    static func add(_ el: AXUIElement) -> String {
+    private static func next() -> String {
         counter += 1
-        let id = "e\(counter)"
-        map[id] = el
+        return "e\(counter)"
+    }
+
+    static func add(_ el: AXUIElement, _ facts: AXFacts? = nil) -> String {
+        let id = next()
+        map[id] = .element(el, facts.map { Fingerprint(role: $0.role, name: $0.title ?? $0.description) })
         return id
     }
 
-    static func get(_ id: String) -> AXUIElement? { map[id] }
+    static func add(_ text: OCRText) -> String {
+        let id = next()
+        map[id] = .text(text)
+        return id
+    }
+
+    /// The element behind an id, without rechecking it.
+    static func get(_ id: String) -> AXUIElement? {
+        if case .element(let el, _) = map[id] { return el }
+        return nil
+    }
+
+    /// The element behind an id, rechecked against what was listed.
+    static func fresh(_ id: String) -> Result<AXUIElement, String> {
+        switch map[id] {
+        case nil:
+            return .failure("error: unknown element_id \(id) — call get_app_state again to refresh ids")
+        case .text:
+            return .failure("error: \(id) is text read by OCR — click it, then use type_text")
+        case .element(let el, let listed):
+            var role: AnyObject?
+            let err = AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &role)
+            if err == .invalidUIElement {
+                return .failure("error: \(id) no longer exists — the app changed; call get_app_state again")
+            }
+            // A busy app may not answer in time; that says nothing about the element.
+            guard err == .success, let listed else { return .success(el) }
+            let now = Fingerprint(
+                role: (role as? String) ?? "AXUnknown",
+                name: axString(el, kAXTitleAttribute as String) ?? axString(el, kAXDescriptionAttribute as String))
+            if now != listed {
+                return .failure(
+                    "error: \(id) changed since get_app_state (was \(listed.described), now \(now.described)); "
+                        + "call get_app_state again")
+            }
+            return .success(el)
+        }
+    }
+
+    /// The screen point an id stands for: an element's visible centre, or the
+    /// middle of OCR text in its window as it is now.
+    static func point(_ id: String) -> Result<CGPoint, String> {
+        // Pointer input reaches a minimized window or hidden app only once it
+        // is parked where it renders, which also moves it: park, then measure.
+        if case .text(let text) = map[id] {
+            if let refusal = WindowParking.shared.reach(pid: text.pid, window: nil) {
+                return .failure("error: cannot use \(id): \(refusal)")
+            }
+            guard let frame = ocrScreenFrame(text) else {
+                return .failure("error: the window \(id) was read from is gone — call get_app_state again")
+            }
+            return .success(CGPoint(x: frame.midX, y: frame.midY))
+        }
+        switch fresh(id) {
+        case .failure(let message):
+            return .failure(message)
+        case .success(let el):
+            if let pid = pidOf(el),
+               let refusal = WindowParking.shared.reach(pid: pid, window: axElement(el, kAXWindowAttribute as String))
+            {
+                return .failure("error: cannot use \(id): \(refusal)")
+            }
+            guard let point = visibleCenter(of: el) else {
+                return .failure(
+                    "error: \(id) is not visible in its window — scroll it into view and call get_app_state again")
+            }
+            return .success(point)
+        }
+    }
+
+    /// The OCR text behind an id, if that is what it is.
+    static func text(_ id: String) -> OCRText? {
+        if case .text(let text) = map[id] { return text }
+        return nil
+    }
 }
 
 // MARK: - App resolution
@@ -206,47 +311,6 @@ let interactiveRoles: Set<String> = [
 func truncate(_ s: String, _ n: Int) -> String {
     let flat = s.replacingOccurrences(of: "\n", with: " ")
     return flat.count <= n ? flat : String(flat.prefix(n)) + "…"
-}
-
-func walk(_ el: AXUIElement, depth: Int, lines: inout [String], budget: inout Int, maxDepth: Int) {
-    guard budget > 0, depth <= maxDepth else { return }
-
-    let role = axString(el, kAXRoleAttribute as String) ?? "AXUnknown"
-    let title = axString(el, kAXTitleAttribute as String)
-    let desc = axString(el, kAXDescriptionAttribute as String)
-    let value = axString(el, kAXValueAttribute as String)
-    let actions = axActions(el).filter { $0 != "AXShowMenu" }
-    let isInteractive = interactiveRoles.contains(role) || !actions.isEmpty
-    let label = title ?? desc ?? value
-
-    // Emit a node only if it carries information: something actionable, or text.
-    // Pure layout containers are traversed but not printed, which keeps the
-    // outline small enough to be worth putting in a prompt.
-    if isInteractive || label != nil {
-        var parts = ["\(String(repeating: "  ", count: depth))"]
-        if isInteractive {
-            parts.append("[\(Registry.add(el))] ")
-        } else {
-            parts.append("     ")
-        }
-        parts.append(role.replacingOccurrences(of: "AX", with: ""))
-        if let l = label { parts.append(" \"\(truncate(l, 120))\"") }
-        // Show the current contents whenever they are not already the label.
-        // Fields commonly label themselves with AXDescription ("Address and
-        // search bar") and keep the typed text in AXValue, so gating this on
-        // AXTitle hid what the field actually contains.
-        if let v = value, v != label {
-            parts.append(" value=\"\(truncate(v, 80))\"")
-        }
-        if axBool(el, kAXEnabledAttribute as String) == false { parts.append(" (disabled)") }
-        if axBool(el, kAXFocusedAttribute as String) == true { parts.append(" (focused)") }
-        lines.append(parts.joined())
-        budget -= 1
-    }
-
-    for child in axChildren(el) {
-        walk(child, depth: depth + 1, lines: &lines, budget: &budget, maxDepth: maxDepth)
-    }
 }
 
 // MARK: - Input synthesis
@@ -960,6 +1024,8 @@ func toolGetAppState(_ args: [String: Any]) -> String {
     guard let query = args["app"] as? String else { return "error: missing required argument 'app'" }
     guard let resolved = resolveApp(query) else { return "error: no running app matching \(query)" }
     if let refusal = PolicyStore.checkApp(resolved.app) { return refusal }
+    let ocrMode = ((args["ocr"] as? String) ?? "auto").lowercased()
+    guard ["auto", "always", "never"].contains(ocrMode) else { return "error: ocr must be auto, always or never" }
     var remembered = args
     remembered["app"] = String(resolved.app.processIdentifier)
     remembered["query"] = nil
@@ -969,32 +1035,43 @@ func toolGetAppState(_ args: [String: Any]) -> String {
     // Same bounds as the Rust server: a huge depth or budget can walk an
     // Electron app's tree for minutes and blow the client's context.
     let maxDepth = min(max((args["max_depth"] as? Int) ?? 18, 1), 60)
-    var budget = min(max((args["max_elements"] as? Int) ?? 800, 1), 5000)
+    let budget = min(max((args["max_elements"] as? Int) ?? 800, 1), 5000)
 
     Registry.reset()
     Registry.targetPid = app.processIdentifier
+    // An Electron app builds its tree only once asked (see FullTreeRequest).
+    let justAsked = FullTreeRequest.ask(app.processIdentifier)
     let ax = AXUIElementCreateApplication(app.processIdentifier)
-    var windows = (axCopy(ax, kAXWindowsAttribute as String) as? [AXUIElement]) ?? []
+    let all = (axCopy(ax, kAXWindowsAttribute as String) as? [AXUIElement]) ?? []
+    var windows = Array(all.enumerated())
 
-    var header = "\(app.localizedName ?? "?") [\(app.bundleIdentifier ?? "-")] pid=\(app.processIdentifier) frontmost=\(app.isActive) windows=\(windows.count)"
+    var header = "\(app.localizedName ?? "?") [\(app.bundleIdentifier ?? "-")] pid=\(app.processIdentifier) frontmost=\(app.isActive) windows=\(all.count)"
     if let note = resolved.note { header += "\nnote: \(note)" }
 
     // Narrow to one window. "agent" is the Chrome window this server owns, which
     // keeps the tree (and any clicks derived from it) off the user's own tabs.
+    var dialogOpen = false
     if let scope = args["window"] {
         if let name = scope as? String, name == "agent" {
             guard let agent = Chrome.agentAXWindow() else {
                 return header + "\n\n(no agent window yet — call browser_open_tab first)"
             }
-            windows = [agent.element]
+            windows = [(0, agent.element)]
             Registry.targetPid = agent.pid
             header += "\nscope: agent window only"
         } else if let index = scope as? Int {
-            guard index >= 0, index < windows.count else {
+            guard index >= 0, index < all.count else {
                 return header + "\n\n(window \(index) is out of range)"
             }
-            windows = [windows[index]]
+            windows = [(index, all[index])]
             header += "\nscope: window \(index) only"
+        }
+    } else {
+        // An alert or modal window blocks every other window of the app.
+        let blocking = blockingWindows(ax, all)
+        if !blocking.isEmpty, blocking.count < all.count {
+            windows = windows.filter { entry in blocking.contains { CFEqual($0, entry.element) } }
+            dialogOpen = true
         }
     }
 
@@ -1002,23 +1079,86 @@ func toolGetAppState(_ args: [String: Any]) -> String {
         return header + "\n\n(this process has no accessibility windows — if you expected one, another instance of the same app may own it; check list_apps)"
     }
 
-    var lines: [String] = []
-    for (i, w) in windows.enumerated() {
-        let title = axString(w, kAXTitleAttribute as String) ?? "<untitled>"
-        lines.append("── window \(i): \"\(title)\"")
-        walk(w, depth: 1, lines: &lines, budget: &budget, maxDepth: maxDepth)
+    func read() -> (OutlineWalk, Bool) {
+        // Each read starts the ids over; only the last one's ids are handed out.
+        let target = Registry.targetPid
+        Registry.reset()
+        Registry.targetPid = target
+        let walk = OutlineWalk(maxDepth: maxDepth, budget: budget, offscreen: (args["offscreen"] as? Bool) ?? false)
+        var narrowed = false
+        for (i, w) in windows {
+            let title = axString(w, kAXTitleAttribute as String) ?? "<untitled>"
+            let minimized = axBool(w, kAXMinimizedAttribute as String) == true
+            walk.lines.append("── window \(i): \"\(title)\"" + (minimized ? " (minimized)" : ""))
+            let start = walk.lines.count
+            walk.walk(w, depth: 1, clip: nil)
+            if walk.narrowToDialogs(from: start) { narrowed = true }
+        }
+        return (walk, narrowed)
     }
-    if budget <= 0 {
+    var (walk, narrowed) = read()
+    // A background Electron window can take seconds to build its tree. Look
+    // again briefly; if it is still building, say so rather than block, and
+    // do not mistake the empty window for an app that needs OCR.
+    var stillBuilding = false
+    if walk.appControls == 0, FullTreeRequest.mayStillBeBuilding(app.processIdentifier) {
+        let deadline = Date().addingTimeInterval(justAsked ? 1.5 : 0.5)
+        while walk.appControls == 0, Date() < deadline {
+            usleep(300_000)
+            (walk, narrowed) = read()
+        }
+        stillBuilding = walk.appControls == 0
+    }
+    if narrowed { dialogOpen = true }
+    AXEventMonitor.shared.watchWebAreas(walk.webAreas, pid: app.processIdentifier)
+    var lines = walk.lines
+    if walk.budget <= 0 {
         lines.append("… element budget reached; raise max_elements for more")
     }
+    if walk.skipped > 0 {
+        lines.append("… \(walk.skipped) off-screen elements skipped; scroll, or pass offscreen=true to list them")
+    }
+    if stillBuilding {
+        header += "\nnote: this app builds its accessibility tree on request and is still doing so; call get_app_state again in a few seconds"
+    }
+    if dialogOpen {
+        header += "\nnote: a dialog is open — only its controls are listed; dismiss it (for example with Escape) to reach the window behind"
+    }
+
+    // Apps that describe themselves poorly (Spotify, games, canvases) get their
+    // on-screen text read with OCR, listed with ids like any element.
+    lastReadUsedOCR = false
+    if ocrMode == "always" || (ocrMode == "auto" && walk.appControls == 0 && !walk.depthLimited && !stillBuilding) {
+        let focused = axElement(ax, kAXFocusedWindowAttribute as String)
+        let window = windows.first { entry in focused.map { CFEqual($0, entry.element) } == true }?.element
+            ?? windows[0].element
+        switch ScreenText.read(pid: app.processIdentifier, window: window, labelled: walk.labelled,
+                               limit: min(max(walk.budget, 0), 400)) {
+        case .success(let found):
+            lastReadUsedOCR = true
+            if !found.isEmpty {
+                lines.append("── on-screen text (OCR)")
+                lines += found
+            }
+        case .failure(let reason):
+            if reason == ScreenText.preparingMessage {
+                header += "\nnote: \(reason)"
+            } else if ocrMode == "always" {
+                header += "\nnote: OCR unavailable: \(reason)"
+            }
+        }
+    }
+
     // A filtered outline keeps the same ids: every element was registered while
-    // walking, only the printout is narrowed. Window headers stay for context.
+    // walking, only the printout is narrowed. Section headers stay for context.
     if let query = (args["query"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
        !query.isEmpty
     {
         let needle = query.lowercased()
-        let matching = lines.filter { $0.hasPrefix("── window") || $0.lowercased().contains(needle) }
-        let count = matching.filter { !$0.hasPrefix("── window") }.count
+        let matching = lines.filter {
+            $0.hasPrefix("── ") || $0.hasPrefix("… ") || $0.lowercased().contains(needle)
+        }
+        let count = matching.filter { !$0.hasPrefix("── ") && !$0.hasPrefix("… ") }.count
         header += "\nfilter: \"\(query)\" — \(count) matching element\(count == 1 ? "" : "s")"
         if count == 0 {
             return header + "\n\n(no elements match; drop the query or scroll the content into view)"
@@ -1027,6 +1167,10 @@ func toolGetAppState(_ args: [String: Any]) -> String {
     }
     return header + "\n\n" + lines.joined(separator: "\n")
 }
+
+/// Whether the last get_app_state read text with OCR. Such an app may change
+/// only its pixels, so settling after an action also watches the window image.
+var lastReadUsedOCR = false
 
 /// Which process should receive synthetic input.
 ///
@@ -1052,8 +1196,13 @@ func toolClick(_ args: [String: Any]) -> String {
     }
 
     if let id = args["element_id"] as? String {
-        guard let el = Registry.get(id) else {
-            return "error: unknown element_id \(id) — call get_app_state again to refresh ids"
+        if let text = Registry.text(id) { return clickText(id, text, clickCount: clickCount) }
+        let el: AXUIElement
+        switch Registry.fresh(id) {
+        case .failure(let message):
+            return message
+        case .success(let fresh):
+            el = fresh
         }
         // Prefer the semantic action; it works even when the element is scrolled
         // out of view or overlapped, where a synthetic click would hit the wrong thing.
@@ -1064,7 +1213,6 @@ func toolClick(_ args: [String: Any]) -> String {
         // Show the pointer before acting, not after: AXPress returns early, so
         // placing this later meant the overlay never appeared for the common
         // case of pressing a button.
-        let elementCenter = visibleCenter(of: el)
         // Point the overlay at the element's own frame, not its visible rect:
         // visibleCenter is nil whenever the window is occluded, which is the
         // normal case for background control and meant the pointer never showed.
@@ -1074,8 +1222,6 @@ func toolClick(_ args: [String: Any]) -> String {
             AgentCursor.shared.press(
                 at: CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height / 2)
             )
-        } else if let elementCenter {
-            AgentCursor.shared.press(at: elementCenter)
         }
         if axActions(el).contains(kAXPressAction as String), clickCount == 1, !isInWebContent(el) {
             if AXUIElementPerformAction(el, kAXPressAction as CFString) == .success {
@@ -1083,8 +1229,14 @@ func toolClick(_ args: [String: Any]) -> String {
                 return "pressed \(id) \"\(label)\" via AXPress"
             }
         }
-        // Coordinate fallback: see MOUSE_TARGETING.
-        guard let center = elementCenter else {
+        // Coordinate fallback: see MOUSE_TARGETING. A minimized or hidden
+        // window takes no clicks until it is parked where it renders.
+        if let pid = pidOf(el),
+           let refusal = WindowParking.shared.reach(pid: pid, window: axElement(el, kAXWindowAttribute as String))
+        {
+            return "error: cannot click \(id): \(refusal)"
+        }
+        guard let center = visibleCenter(of: el) else {
             return "error: \(id) is not visible in its window — scroll it into view and call get_app_state again"
         }
         if let target = windowTarget(for: el), backgroundClick(target, at: center, clickCount: clickCount) {
@@ -1142,6 +1294,24 @@ func toolClick(_ args: [String: Any]) -> String {
     return "error: provide either element_id, or both x and y"
 }
 
+/// Click text read by OCR, in its window as it is now.
+func clickText(_ id: String, _ text: OCRText, clickCount: Int) -> String {
+    if let refusal = WindowParking.shared.reach(pid: text.pid, window: nil) {
+        return "error: cannot click \(id): \(refusal)"
+    }
+    guard let target = ocrWindowTarget(text), let frame = ocrScreenFrame(text) else {
+        return "error: the window \(id) was read from is gone — call get_app_state again"
+    }
+    let center = CGPoint(x: frame.midX, y: frame.midY)
+    AgentCursor.shared.press(at: center)
+    let where_ = "\(id) \"\(truncate(text.text, 60))\" at (\(Int(center.x)), \(Int(center.y)))"
+    if backgroundClick(target, at: center, clickCount: clickCount) {
+        return "clicked \(where_) in background"
+    }
+    postClick(at: center, clickCount: clickCount, pid: text.pid)
+    return "clicked \(where_) by posting to its app"
+}
+
 func toolTypeText(_ args: [String: Any]) -> String {
     guard let text = args["text"] as? String else { return "error: missing required argument 'text'" }
     // Remote control types into whatever the machine has focused, which is
@@ -1151,17 +1321,36 @@ func toolTypeText(_ args: [String: Any]) -> String {
         return "typed \(text.count) characters"
     }
     var element: AXUIElement?
-    if let id = args["element_id"] as? String {
-        guard let el = Registry.get(id) else { return "error: unknown element_id \(id)" }
+    var textPid: pid_t?
+    if let id = args["element_id"] as? String, let text = Registry.text(id) {
+        // Text read by OCR has no field to focus: click it, as a person would.
+        let clicked = clickText(id, text, clickCount: 1)
+        if clicked.hasPrefix("error:") { return clicked }
+        textPid = text.pid
+        usleep(100_000)
+    } else if let id = args["element_id"] as? String {
+        let el: AXUIElement
+        switch Registry.fresh(id) {
+        case .failure(let message):
+            return message
+        case .success(let fresh):
+            el = fresh
+        }
         if let refusal = refuseSecureFieldInput(el, id) { return refusal }
         element = el
+        // A minimized window takes keys only once parked; park before focusing.
+        if let owner = pidOf(el), let refusal = WindowParking.shared.reach(
+            pid: owner, window: axElement(el, kAXWindowAttribute as String))
+        {
+            return "error: cannot type: \(refusal)"
+        }
         // Focus the field within its own app rather than raising the app, so a
         // background window still receives the text.
         AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
         usleep(60_000)
     }
     let pid: pid_t
-    switch resolveTargetPid(args, element: element) {
+    switch textPid.map({ Result<pid_t?, String>.success($0) }) ?? resolveTargetPid(args, element: element) {
     case .failure(let message):
         return message
     case .success(let resolved):
@@ -1174,6 +1363,12 @@ func toolTypeText(_ args: [String: Any]) -> String {
             return "error: no target app to type into — call get_app_state (or pass `app`) first. Refusing to send keystrokes through the global input tap, which would type into whatever window the user is working in."
         }
         pid = resolved
+    }
+    // Keys reach a minimized window or hidden app only once it is parked.
+    if let refusal = WindowParking.shared.reach(
+        pid: pid, window: element.flatMap { axElement($0, kAXWindowAttribute as String) })
+    {
+        return "error: cannot type: \(refusal)"
     }
     typeText(text, pid: pid)
     return "typed \(text.count) characters"
@@ -1201,8 +1396,19 @@ func toolPressKey(_ args: [String: Any]) -> String {
         }
         pid = resolved
     }
+    let chord = mods.isEmpty ? key : mods.joined(separator: "+") + "+" + key
+    // A background app ignores posted menu key equivalents; run its menu item,
+    // which needs no window, so a minimized or hidden app is not parked for it.
+    if NSRunningApplication(processIdentifier: pid)?.isActive == false,
+       let path = MenuShortcut.press(pid: pid, key: key, modifiers: mods)
+    {
+        return "pressed \(chord) through the app's menu (\(path))"
+    }
+    if let refusal = WindowParking.shared.reach(pid: pid, window: nil) {
+        return "error: cannot press \(key): \(refusal)"
+    }
     if let err = pressKey(key, modifiers: mods, pid: pid) { return "error: \(err)" }
-    return "pressed \(mods.isEmpty ? key : mods.joined(separator: "+") + "+" + key)"
+    return "pressed \(chord)"
 }
 
 /// Scroll through accessibility when events cannot be routed: step the scroll
@@ -1259,13 +1465,36 @@ func toolScroll(_ args: [String: Any]) -> String {
         RemoteControl.scroll(at: point, dx: dx, dy: dy, steps: amount)
         return "scrolled \(direction) by \(amount)"
     }
-    if let elementID = args["element_id"] as? String, Registry.get(elementID) == nil {
-        return "error: unknown element_id \(elementID) — call get_app_state again to refresh ids"
+    var element: AXUIElement?
+    var textPoint: CGPoint?
+    if let elementID = args["element_id"] as? String {
+        if Registry.text(elementID) != nil {
+            switch Registry.point(elementID) {
+            case .failure(let message):
+                return message
+            case .success(let point):
+                textPoint = point
+            }
+        } else {
+            switch Registry.fresh(elementID) {
+            case .failure(let message):
+                return message
+            case .success(let fresh):
+                element = fresh
+            }
+        }
     }
-    let element = (args["element_id"] as? String).flatMap { Registry.get($0) }
     let target: WindowTarget?
     let pid: pid_t?
-    if let element {
+    if let elementID = args["element_id"] as? String, let text = Registry.text(elementID) {
+        target = ocrWindowTarget(text)
+        pid = text.pid
+    } else if let element {
+        if let owner = pidOf(element), let refusal = WindowParking.shared.reach(
+            pid: owner, window: axElement(element, kAXWindowAttribute as String))
+        {
+            return "error: cannot scroll: \(refusal)"
+        }
         target = windowTarget(for: element)
         pid = pidOf(element)
     } else {
@@ -1273,6 +1502,9 @@ func toolScroll(_ args: [String: Any]) -> String {
         case .failure(let message):
             return message
         case .success(let resolved):
+            if let resolved, let refusal = WindowParking.shared.reach(pid: resolved, window: nil) {
+                return "error: cannot scroll: \(refusal)"
+            }
             target = resolved.flatMap { windowTarget(forPid: $0) }
             pid = resolved
         }
@@ -1280,7 +1512,7 @@ func toolScroll(_ args: [String: Any]) -> String {
 
     // Scroll follows the pointer, so aim at the element when given one and
     // otherwise at the middle of the window.
-    let point = element.flatMap { visibleCenter(of: $0) }
+    let point = textPoint ?? element.flatMap { visibleCenter(of: $0) }
         ?? target.map { CGPoint(x: $0.frame.midX, y: $0.frame.midY) }
     if let target, let point, backgroundScroll(target, at: point, dx: dx, dy: dy, steps: amount) {
         return "scrolled \(direction) by \(amount) in background"
@@ -1416,10 +1648,12 @@ final class DisplayCache: @unchecked Sendable {
     }
 
     func current(fresh: Bool = false) async throws -> [SCDisplay] {
+        // The invisible display minimized windows are parked on is nobody's screen.
+        let parking = WindowParking.shared.displayID
         if !fresh, let cached = lock.withLock({
             -fetchedAt.timeIntervalSinceNow < Self.lifetime ? displays : nil
         }) {
-            return cached
+            return cached.filter { $0.displayID != parking }
         }
         let content = try await SCShareableContent.excludingDesktopWindows(
             false, onScreenWindowsOnly: true)
@@ -1427,7 +1661,7 @@ final class DisplayCache: @unchecked Sendable {
             displays = content.displays
             fetchedAt = Date()
         }
-        return content.displays
+        return content.displays.filter { $0.displayID != parking }
     }
 }
 
@@ -1684,15 +1918,7 @@ func postDrag(from start: CGPoint, to end: CGPoint, pid: pid_t) {
 
 func resolvePoint(_ args: [String: Any], xKey: String, yKey: String, idKey: String) -> Result<CGPoint, String> {
     if let id = args[idKey] as? String {
-        guard let el = Registry.get(id) else {
-            return .failure("error: unknown element_id \(id) — call get_app_state again to refresh ids")
-        }
-        guard let point = visibleCenter(of: el) else {
-            return .failure(
-                "error: \(id) is not visible in its window — scroll it into view and call get_app_state again"
-            )
-        }
-        return .success(point)
+        return Registry.point(id)
     }
     if let x = args[xKey] as? Double, let y = args[yKey] as? Double {
         guard x.isFinite, y.isFinite,
@@ -1923,7 +2149,13 @@ func refuseSecureFieldInput(_ element: AXUIElement, _ id: String) -> String? {
 func toolSetValue(_ args: [String: Any]) -> String {
     guard let id = args["element_id"] as? String else { return "error: missing required argument 'element_id'" }
     guard let value = args["value"] as? String else { return "error: missing required argument 'value'" }
-    guard let el = Registry.get(id) else { return "error: unknown element_id \(id)" }
+    let el: AXUIElement
+    switch Registry.fresh(id) {
+    case .failure(let message):
+        return message
+    case .success(let fresh):
+        el = fresh
+    }
     if let refusal = refuseSecureFieldInput(el, id) { return refusal }
     // Setting AXValue replaces field contents atomically, which is far more
     // reliable than select-all-then-type for long strings.
@@ -1936,7 +2168,13 @@ func toolSetValue(_ args: [String: Any]) -> String {
 
 func toolSelectText(_ args: [String: Any]) -> String {
     guard let id = args["element_id"] as? String else { return "error: missing required argument 'element_id'" }
-    guard let el = Registry.get(id) else { return "error: unknown element_id \(id)" }
+    let el: AXUIElement
+    switch Registry.fresh(id) {
+    case .failure(let message):
+        return message
+    case .success(let fresh):
+        el = fresh
+    }
 
     let text = axString(el, kAXValueAttribute as String) ?? ""
     let start = (args["start"] as? Int) ?? 0
@@ -2933,7 +3171,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "get_app_state",
-        "description": "Read an app's accessibility tree as an indented outline in which interactive elements carry ids like [e12] that click, type_text, set_value, scroll, hover and select_text accept. Use it instead of screenshot whenever you intend to act: it is far cheaper in tokens and gives exact targets. Call it before interacting and again after the UI changes, because ids are per-snapshot and a stale id fails. Read-only; it describes the app's visible windows and does not change focus.",
+        "description": "Read an app's accessibility tree as an indented outline in which interactive elements carry ids like [e12] that click, type_text, set_value, scroll, hover and select_text accept. Use it instead of screenshot whenever you intend to act: it is far cheaper in tokens and gives exact targets. Call it before interacting and again after the UI changes, because ids are per-snapshot. Each id is rechecked before an action: one whose element is gone or has changed fails instead of acting on something else. The outline lists what is on screen: rows of long lists and content scrolled out of view are skipped (scroll, or pass offscreen), and while a dialog, sheet or popover blocks a window only its controls are listed. When an app exposes little to accessibility, its on-screen text is read with OCR and listed with ids too. Read-only; it does not change focus.",
         "inputSchema": [
             "type": "object",
             "properties": [
@@ -2956,6 +3194,15 @@ let toolDefs: [[String: Any]] = [
                 "query": [
                     "type": "string",
                     "description": "Only list elements whose role, label or value contains this text (case-insensitive). Ids stay valid. Use it instead of raising max_elements when you know what you are looking for.",
+                ],
+                "offscreen": [
+                    "type": "boolean",
+                    "description": "Also list elements scrolled out of view, such as every row of a long list (default false). Prefer scrolling or `query`: this can make the outline far larger.",
+                ],
+                "ocr": [
+                    "type": "string",
+                    "enum": ["auto", "always", "never"],
+                    "description": "Read on-screen text with OCR and list it with ids that click, hover, right_click and drag accept: auto (default) only when the app exposes no labelled controls to accessibility, always, or never. macOS and Windows; macOS needs Screen Recording permission.",
                 ],
             ],
             "required": ["app"],
@@ -2992,7 +3239,7 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "return_state": [
                     "type": "boolean",
-                    "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
+                    "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
                 ],
                 "state_query": [
                     "type": "string",
@@ -3024,7 +3271,7 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "return_state": [
                     "type": "boolean",
-                    "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
+                    "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
                 ],
                 "state_query": [
                     "type": "string",
@@ -3060,7 +3307,7 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "return_state": [
                     "type": "boolean",
-                    "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
+                    "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
                 ],
                 "state_query": [
                     "type": "string",
@@ -3106,7 +3353,7 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "return_state": [
                     "type": "boolean",
-                    "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
+                    "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
                 ],
                 "state_query": [
                     "type": "string",
@@ -3217,7 +3464,7 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "return_state": [
                     "type": "boolean",
-                    "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
+                    "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
                 ],
                 "state_query": [
                     "type": "string",
@@ -3265,7 +3512,7 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "return_state": [
                     "type": "boolean",
-                    "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
+                    "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
                 ],
                 "state_query": [
                     "type": "string",
@@ -3297,7 +3544,7 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "return_state": [
                     "type": "boolean",
-                    "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
+                    "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
                 ],
                 "state_query": [
                     "type": "string",
@@ -3371,7 +3618,7 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "return_state": [
                     "type": "boolean",
-                    "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
+                    "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
                 ],
                 "state_query": [
                     "type": "string",
@@ -3427,7 +3674,7 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "return_state": [
                     "type": "boolean",
-                    "description": "After acting, wait briefly for the UI to settle and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
+                    "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
                 ],
                 "state_query": [
                     "type": "string",
@@ -3775,7 +4022,7 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "return_state": [
                     "type": "boolean",
-                    "description": "Append a current snapshot and readiness status after acting. Without wait_for_selector, only a short pause and bounded navigation wait are used; SPA readiness is not guaranteed. Snapshot indices replace earlier ones. A timeout does not mean the action failed: re-observe with browser_snapshot before repeating it.",
+                    "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
                 ],
                 "wait_for_selector": [
                     "type": "string",
@@ -3822,7 +4069,7 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "return_state": [
                     "type": "boolean",
-                    "description": "Append a current snapshot and readiness status after acting. Without wait_for_selector, only a short pause and bounded navigation wait are used; SPA readiness is not guaranteed. Snapshot indices replace earlier ones. A timeout does not mean the action failed: re-observe with browser_snapshot before repeating it.",
+                    "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
                 ],
                 "wait_for_selector": [
                     "type": "string",
@@ -3924,7 +4171,7 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "return_state": [
                     "type": "boolean",
-                    "description": "Append a current snapshot and readiness status after acting. Without wait_for_selector, only a short pause and bounded navigation wait are used; SPA readiness is not guaranteed. Snapshot indices replace earlier ones. A timeout does not mean the action failed: re-observe with browser_snapshot before repeating it.",
+                    "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
                 ],
                 "wait_for_selector": [
                     "type": "string",
@@ -3993,7 +4240,7 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "return_state": [
                     "type": "boolean",
-                    "description": "Append a current snapshot and readiness status after acting. Without wait_for_selector, only a short pause and bounded navigation wait are used; SPA readiness is not guaranteed. Snapshot indices replace earlier ones. A timeout does not mean the action failed: re-observe with browser_snapshot before repeating it.",
+                    "description": "After acting, wait for the app to finish reacting (up to 2 s) and append a fresh get_app_state of the app you last read, so you can check the result and pick the next target in the same call. Its ids replace every earlier id.",
                 ],
                 "wait_for_selector": [
                     "type": "string",
@@ -4076,19 +4323,31 @@ func toolClipboardWrite(_ args: [String: Any]) -> String {
     return "copied \(text.count) characters to the clipboard, replacing what was there"
 }
 
-/// Pause between an action and the snapshot `return_state` takes, so the app
-/// has handled the input and redrawn before it is read.
+/// Pause between an action and the snapshot `return_state` takes, when the
+/// app's accessibility notifications cannot be watched (see Settle.swift).
 let returnStateSettle: useconds_t = 300_000
 
 func dispatch(_ name: String, _ args: [String: Any]) -> String {
+    let wantsState = statefulActions.contains(name) && args["return_state"] as? Bool == true
+    // Count the app's notifications from before the action, so the wait after
+    // it sees the app react and then go quiet.
+    var settle: (() -> Settled)?
+    if wantsState, let raw = lastAppStateArgs?["app"] as? String, let pid = pid_t(raw) {
+        let monitor = AXEventMonitor.shared
+        if monitor.watch(pid) {
+            let before = monitor.current
+            let look = lastReadUsedOCR ? WindowLook(pid: pid) : nil
+            settle = { waitForQuiet(before: before, probe: { monitor.current }, look: look.map { l in { l.changed() } }) }
+        }
+    }
     let out = dispatchTool(name, args)
-    guard statefulActions.contains(name), args["return_state"] as? Bool == true, !out.hasPrefix("error:") else {
+    guard wantsState, !out.hasPrefix("error:") else {
         return out
     }
     guard var again = lastAppStateArgs else {
         return out + "\n\n(return_state: no app has been read yet — call get_app_state first)"
     }
-    usleep(returnStateSettle)
+    if let settle { _ = settle() } else { usleep(returnStateSettle) }
     if let query = args["state_query"] as? String { again["query"] = query }
     let state = toolGetAppState(again)
     if state.hasPrefix("error:") { return out + "\n\n(return_state: could not read the app again: \(state))" }
@@ -4264,6 +4523,7 @@ BrowserBridge.shared.start()
 /// away so aborted / unfinished Computer Use turns do not leave an empty
 /// "MT Code" / "MT Code" group in the user's tab strip.
 func cleanupAgentBrowserTabsOnExit() {
+    WindowParking.shared.restore()
     guard browserControlEnabled, BrowserBridge.shared.isConnected else { return }
     _ = BrowserBridge.shared.call("close_client_tabs", timeout: 2)
 }
@@ -4428,6 +4688,11 @@ while let line = readLine(strippingNewline: true) {
                     break
                 }
                 let maxWidth = clampedMaxWidth(args)
+                // A minimized window or hidden app has nothing to capture until parked.
+                if let refusal = WindowParking.shared.reach(pid: resolved.app.processIdentifier, window: nil) {
+                    respond(id: id, result: textResult("error: cannot capture: \(refusal)", isError: true))
+                    break
+                }
                 guard let shot = captureWindow(
                     pid: resolved.app.processIdentifier, maxWidth: maxWidth, encoding: encoding)
                 else {
