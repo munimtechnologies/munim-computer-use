@@ -145,8 +145,16 @@ enum ScreenText {
         return smaller > 0 ? (shared.width * shared.height) / smaller : 0
     }
 
+    /// Letters and digits only, with the characters OCR confuses in UI fonts
+    /// made equal, so "Count O" read off a button still matches "Count 0".
     static func normalized(_ text: String) -> String {
-        String(text.lowercased().filter { $0.isLetter || $0.isNumber })
+        String(text.lowercased().filter { $0.isLetter || $0.isNumber }.map { character in
+            switch character {
+            case "o": "0"
+            case "i", "l": "1"
+            default: character
+            }
+        })
     }
 }
 

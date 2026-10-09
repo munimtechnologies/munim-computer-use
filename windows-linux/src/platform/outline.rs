@@ -165,6 +165,12 @@ pub fn minimized_error(id: u32) -> DesktopError {
     ))
 }
 
+pub fn system_prompt_error(id: u32) -> DesktopError {
+    DesktopError::new(format!(
+        "e{id} cannot be clicked while a Windows Security prompt is open: it blocks clicks on every window until it is answered — ask the user to answer it, or use an action that works through accessibility"
+    ))
+}
+
 /// When to read on-screen text with OCR (`get_app_state`'s `ocr`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OcrMode {
@@ -242,6 +248,20 @@ pub fn normalize(text: &str) -> String {
     cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// `normalize`, with the characters OCR confuses in UI fonts made equal, so
+/// "Count O" and "row I" read off a button or a row still match "Count 0" and
+/// "row 1".
+fn ocr_fold(text: &str) -> String {
+    normalize(text)
+        .chars()
+        .map(|character| match character {
+            'o' => '0',
+            'i' | 'l' | '|' => '1',
+            other => other,
+        })
+        .collect()
+}
+
 /// Merge overlapping OCR detections of the same text (IoU at least 0.55), keeping
 /// the longer reading, then drop text the outline already lists: a line centred
 /// inside an element whose name contains it, or whose value it mostly covers,
@@ -272,14 +292,14 @@ pub fn dedupe_ocr(lines: Vec<OcrText>, listed: &[Listed]) -> Vec<OcrText> {
         .map(|element| {
             (
                 element.bounds,
-                normalize(&element.name),
-                normalize(&element.value),
+                ocr_fold(&element.name),
+                ocr_fold(&element.value),
                 element.chrome,
             )
         })
         .collect();
     kept.retain(|line| {
-        let text = normalize(&line.text);
+        let text = ocr_fold(&line.text);
         let (cx, cy) = line.bounds.center();
         !listed.iter().any(|(bounds, name, value, chrome)| {
             bounds.contains(cx, cy)
@@ -534,6 +554,24 @@ mod tests {
         let kept = dedupe_ocr(lines, &listed);
         let texts: Vec<&str> = kept.iter().map(|line| line.text.as_str()).collect();
         assert_eq!(texts, ["Save", "OK", "second line"]);
+
+        // Digits OCR read as letters still match the element's name.
+        let rows = [
+            Listed {
+                bounds: b(0.0, 0.0, 200.0, 20.0),
+                name: "row 1".into(),
+                value: String::new(),
+                chrome: false,
+            },
+            Listed {
+                bounds: b(0.0, 40.0, 200.0, 20.0),
+                name: "Count 10".into(),
+                value: String::new(),
+                chrome: false,
+            },
+        ];
+        let read = vec![line("row I", 5.0, 2.0, 40.0, 16.0), line("Count IO", 5.0, 42.0, 60.0, 16.0)];
+        assert!(dedupe_ocr(read, &rows).is_empty());
 
         // A field whose whole value the OCR line covers is a duplicate.
         let field = [Listed {
