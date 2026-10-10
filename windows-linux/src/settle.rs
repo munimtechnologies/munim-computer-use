@@ -8,9 +8,20 @@
 //! never moves, the action had no visible effect and the wait ends early. This
 //! is the algorithm arc-cua uses (`settling.py`).
 //!
-//! Windows counts WinEvents for the app's process on a dedicated hook thread.
-//! Elsewhere, or when the hook cannot be installed, the old fixed pause stands.
+//! Some apps never go quiet: a ticking clock, a progress spinner or a playing
+//! video raise events all the time. Each event carries the element and kind
+//! that raised it, and a source that was already firing before the action is
+//! background, not the app reacting, so its events are left out of the count.
+//!
+//! Windows counts WinEvents for the app's process on a dedicated hook thread,
+//! hooked from `get_app_state` on, so the time before an action shows which
+//! sources are background. Elsewhere, or when the hook cannot be installed,
+//! the old fixed pause stands.
 
+// Only Windows has an event source; elsewhere the event bookkeeping is unused.
+#![cfg_attr(not(windows), allow(dead_code))]
+
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug)]
@@ -41,6 +52,53 @@ pub struct Settled {
     /// Still changing when the timeout ended the wait.
     pub timed_out: bool,
     pub elapsed: Duration,
+}
+
+/// One event: when, and which element and kind of event raised it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Event {
+    pub at: Instant,
+    pub source: u64,
+}
+
+/// How far back before an action a source must have fired to be background.
+pub const BACKGROUND_WINDOW: Duration = Duration::from_millis(1500);
+
+/// A background source fired in at least this many separate slices of the
+/// window: a ticker or spinner does, while the bursts of a few earlier actions
+/// on the same control do not.
+const BACKGROUND_SLICES: usize = 5;
+const SLICE: Duration = Duration::from_millis(100);
+
+/// Sources that kept firing through the `window` before `action`: they change
+/// on their own, so their events after it say nothing about the action.
+pub fn background(events: &[Event], action: Instant, window: Duration) -> HashSet<u64> {
+    let from = action.checked_sub(window).unwrap_or(action);
+    let mut slices: std::collections::HashMap<u64, HashSet<u128>> = Default::default();
+    for event in events.iter().filter(|e| e.at >= from && e.at <= action) {
+        let slice = event.at.duration_since(from).as_millis() / SLICE.as_millis();
+        slices.entry(event.source).or_default().insert(slice);
+    }
+    slices
+        .into_iter()
+        .filter(|(_, seen)| seen.len() >= BACKGROUND_SLICES)
+        .map(|(source, _)| source)
+        .collect()
+}
+
+/// Events since `action` from sources that are not background. A source that
+/// keeps firing through the wait is background too, for an app read too
+/// recently to have shown it before the action.
+pub fn reactions(events: &[Event], action: Instant, background: &HashSet<u64>) -> u64 {
+    let after = || events.iter().filter(|e| e.at > action && !background.contains(&e.source));
+    let mut slices: std::collections::HashMap<u64, HashSet<u128>> = Default::default();
+    for event in after() {
+        let slice = event.at.duration_since(action).as_millis() / SLICE.as_millis();
+        slices.entry(event.source).or_default().insert(slice);
+    }
+    after()
+        .filter(|e| slices.get(&e.source).is_none_or(|seen| seen.len() < BACKGROUND_SLICES))
+        .count() as u64
 }
 
 /// Time as the wait sees it, so tests can run it on a fake clock.
@@ -106,17 +164,17 @@ pub fn wait_for_quiet(
     }
 }
 
-/// Events counted for one app while an action runs. Dropping it stops counting.
+/// The app's events from the moment an action starts, without background ones.
 pub struct Watch {
-    #[cfg(windows)]
-    inner: winevents::Watch,
+    action: Instant,
+    background: HashSet<u64>,
 }
 
 impl Watch {
     fn count(&self) -> u64 {
         #[cfg(windows)]
         {
-            self.inner.count()
+            winevents::with_events(|events| reactions(events, self.action, &self.background))
         }
         #[cfg(not(windows))]
         {
@@ -132,11 +190,24 @@ impl Watch {
 pub fn watch(pid: u32) -> Option<Watch> {
     #[cfg(windows)]
     {
-        winevents::watch(pid).map(|inner| Watch { inner })
+        winevents::hook(pid)?;
+        let action = Instant::now();
+        let background = winevents::with_events(|events| background(events, action, BACKGROUND_WINDOW));
+        Some(Watch { action, background })
     }
     #[cfg(not(windows))]
     {
         None
+    }
+}
+
+/// Start hooking `pid`'s events when its state is read, so by the time an
+/// action runs, the events before it show which sources are background.
+#[cfg_attr(not(windows), allow(unused_variables))]
+pub fn observe(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = winevents::hook(pid);
     }
 }
 
@@ -146,8 +217,8 @@ pub fn settle(watch: Option<Watch>) -> Option<Settled> {
         std::thread::sleep(FALLBACK);
         return None;
     };
-    // The count started at zero when the watch began, just before the action,
-    // so anything the action raised so far already reads as a reaction.
+    // The count starts from the action, so anything the action raised so far
+    // already reads as a reaction.
     let mut probe = || watch.count();
     Some(wait_for_quiet(
         &mut probe,
@@ -160,12 +231,15 @@ pub fn settle(watch: Option<Watch>) -> Option<Settled> {
 #[cfg(windows)]
 mod winevents {
     //! One background thread owns a WinEvent hook and the message loop that
-    //! out-of-context hooks need. It hooks one process at a time, on request.
+    //! out-of-context hooks need. It hooks one process at a time, on request,
+    //! and keeps it hooked until another one is asked for.
 
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::collections::VecDeque;
+    use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
     use std::sync::{Mutex, OnceLock};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -175,11 +249,20 @@ mod winevents {
         PostThreadMessageW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP,
     };
 
-    /// `wParam` carries the pid to hook, or 0 to unhook.
+    use super::Event;
+
+    /// `wParam` carries the pid to hook.
     const WM_WATCH: u32 = WM_APP + 1;
 
-    /// Events seen for the hooked process since it was hooked.
-    static COUNT: AtomicU64 = AtomicU64::new(0);
+    /// Events older than this are no use to a wait, which looks back
+    /// `BACKGROUND_WINDOW` and forward at most its timeout.
+    const KEEP: Duration = Duration::from_secs(4);
+    const MOST: usize = 8192;
+
+    /// Recent events of the hooked process.
+    static EVENTS: Mutex<VecDeque<Event>> = Mutex::new(VecDeque::new());
+    /// The hooked process, or 0.
+    static HOOKED: AtomicU32 = AtomicU32::new(0);
 
     struct HookThread {
         thread_id: u32,
@@ -189,16 +272,35 @@ mod winevents {
 
     static THREAD: OnceLock<Option<HookThread>> = OnceLock::new();
 
+    fn events() -> std::sync::MutexGuard<'static, VecDeque<Event>> {
+        EVENTS.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    pub fn with_events<T>(read: impl FnOnce(&[Event]) -> T) -> T {
+        let mut events = events();
+        read(events.make_contiguous())
+    }
+
     unsafe extern "system" fn on_event(
         _: HWINEVENTHOOK,
-        _: u32,
-        _: HWND,
-        _: i32,
-        _: i32,
+        event: u32,
+        hwnd: HWND,
+        object: i32,
+        child: i32,
         _: u32,
         _: u32,
     ) {
-        COUNT.fetch_add(1, Ordering::Relaxed);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (event, hwnd.0 as usize, object, child).hash(&mut hasher);
+        let at = Instant::now();
+        let mut events = events();
+        while events
+            .front()
+            .is_some_and(|e| at.duration_since(e.at) > KEEP || events.len() >= MOST)
+        {
+            events.pop_front();
+        }
+        events.push_back(Event { at, source: hasher.finish() });
     }
 
     fn run(ready: SyncSender<u32>, replies: SyncSender<bool>) {
@@ -216,21 +318,20 @@ mod winevents {
                     if let Some(old) = hook.take() {
                         let _ = UnhookWinEvent(old);
                     }
+                    events().clear();
                     let pid = message.wParam.0 as u32;
-                    if pid != 0 {
-                        COUNT.store(0, Ordering::SeqCst);
-                        let handle = SetWinEventHook(
-                            EVENT_MIN,
-                            EVENT_MAX,
-                            None,
-                            Some(on_event),
-                            pid,
-                            0,
-                            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-                        );
-                        hook = (!handle.is_invalid()).then_some(handle);
-                        let _ = replies.send(hook.is_some());
-                    }
+                    let handle = SetWinEventHook(
+                        EVENT_MIN,
+                        EVENT_MAX,
+                        None,
+                        Some(on_event),
+                        pid,
+                        0,
+                        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                    );
+                    hook = (!handle.is_invalid()).then_some(handle);
+                    HOOKED.store(if hook.is_some() { pid } else { 0 }, Ordering::SeqCst);
+                    let _ = replies.send(hook.is_some());
                     continue;
                 }
                 // Out-of-context WinEvents arrive through this dispatch.
@@ -257,27 +358,13 @@ mod winevents {
             .as_ref()
     }
 
-    pub struct Watch {
-        thread_id: u32,
-    }
-
-    impl Watch {
-        pub fn count(&self) -> u64 {
-            COUNT.load(Ordering::SeqCst)
-        }
-    }
-
-    impl Drop for Watch {
-        fn drop(&mut self) {
-            unsafe {
-                let _ = PostThreadMessageW(self.thread_id, WM_WATCH, WPARAM(0), LPARAM(0));
-            }
-        }
-    }
-
-    pub fn watch(pid: u32) -> Option<Watch> {
+    /// Hook `pid`, unless it already is. `None` when it cannot be hooked.
+    pub fn hook(pid: u32) -> Option<()> {
         if pid == 0 {
             return None;
+        }
+        if HOOKED.load(Ordering::SeqCst) == pid {
+            return Some(());
         }
         let thread = thread()?;
         let replies = thread
@@ -289,9 +376,7 @@ mod winevents {
         unsafe { PostThreadMessageW(thread.thread_id, WM_WATCH, WPARAM(pid as usize), LPARAM(0)) }
             .ok()?;
         match replies.recv_timeout(Duration::from_millis(250)) {
-            Ok(true) => Some(Watch {
-                thread_id: thread.thread_id,
-            }),
+            Ok(true) => Some(()),
             _ => None,
         }
     }
@@ -299,8 +384,8 @@ mod winevents {
 
 #[cfg(test)]
 mod tests {
-    use super::{Clock, Timing, wait_for_quiet};
-    use std::time::Duration;
+    use super::{BACKGROUND_WINDOW, Clock, Event, Timing, background, reactions, wait_for_quiet};
+    use std::time::{Duration, Instant};
 
     /// Time only moves when the wait sleeps.
     struct FakeClock(Duration);
@@ -383,5 +468,48 @@ mod tests {
             Duration::from_millis(180),
             "first seen at the 20 ms poll"
         );
+    }
+
+    fn at(base: Instant, ms: i64, source: u64) -> Event {
+        let offset = Duration::from_millis(ms.unsigned_abs());
+        Event {
+            at: if ms < 0 { base - offset } else { base + offset },
+            source,
+        }
+    }
+
+    #[test]
+    fn a_source_firing_before_the_action_is_background() {
+        let action = Instant::now() + Duration::from_secs(5);
+        // Source 1 ticks every 50 ms; source 2 fired once; source 3 fired
+        // often, but long before the window; source 5 is a button two earlier
+        // clicks changed, each with a short burst.
+        let mut events: Vec<Event> = (1..=30).map(|i| at(action, -50 * i, 1)).collect();
+        events.push(at(action, -200, 2));
+        events.extend((0..10).map(|i| at(action, -3000 + 50 * i, 3)));
+        events.extend([-1400, -1390, -1370, -700, -690, -660].map(|ms| at(action, ms, 5)));
+        events.sort_by_key(|e| e.at);
+        let quiet = background(&events, action, BACKGROUND_WINDOW);
+        assert_eq!(quiet, [1].into_iter().collect());
+
+        // Right after the action the tick keeps going and the button reacts once.
+        events.extend((1..=3).map(|i| at(action, 50 * i, 1)));
+        events.push(at(action, 30, 2));
+        events.push(at(action, 40, 4));
+        assert_eq!(reactions(&events, action, &quiet), 2, "the tick is not counted");
+        assert_eq!(reactions(&events, action, &Default::default()), 5, "unless nothing was known before");
+    }
+
+    #[test]
+    fn a_source_that_keeps_firing_after_the_action_stops_counting() {
+        let action = Instant::now();
+        // Nothing before the action (the app was only just read); a tick
+        // every 50 ms after it, and one real reaction.
+        let mut events: Vec<Event> = (1..=6).map(|i| at(action, 50 * i, 1)).collect();
+        events.push(at(action, 20, 2));
+        let none = Default::default();
+        assert_eq!(reactions(&events, action, &none), 7, "four slices: still counted");
+        events.extend((7..=12).map(|i| at(action, 50 * i, 1)));
+        assert_eq!(reactions(&events, action, &none), 1, "seven slices: only the reaction");
     }
 }

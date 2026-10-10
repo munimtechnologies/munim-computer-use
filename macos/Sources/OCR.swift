@@ -17,6 +17,8 @@ enum ScreenText {
         guard CGPreflightScreenCaptureAccess() else {
             return .failure("Screen Recording permission is not granted")
         }
+        // The outline was read where the window was; parking may move it.
+        let readAt = axPoint(window, kAXPositionAttribute as String)
         // A minimized window or a hidden app has no pixels until it is shown
         // somewhere; background control parks it on an invisible display.
         if let refusal = WindowParking.shared.reach(pid: pid, window: window) { return .failure(refusal) }
@@ -31,7 +33,9 @@ enum ScreenText {
         case .success(let pieces):
             found = pieces
         }
-        let kept = readingOrder(dedupe(found, against: labelled)).prefix(limit)
+        let shift = readAt.map { CGPoint(x: frame.minX - $0.x, y: frame.minY - $0.y) } ?? .zero
+        let moved = labelled.map { (frame: $0.frame.offsetBy(dx: shift.x, dy: shift.y), text: $0.text) }
+        let kept = readingOrder(dedupe(found, against: moved)).prefix(limit)
         return .success(kept.map { piece in
             let id = Registry.add(OCRText(
                 text: piece.text, pid: pid, windowID: wid,
@@ -209,6 +213,10 @@ func captureWindowImage(windowID: UInt32) -> (CGImage, CGRect)? {
         let scale = min(2.0, 2000 / max(1.0, window.frame.width))
         config.width = Int(window.frame.width * scale)
         config.height = Int(window.frame.height * scale)
+        // On a 1x display the window has fewer pixels than asked for, and
+        // without this it fills only a corner of the image, which puts every
+        // piece of text at the wrong place.
+        config.scalesToFit = true
         config.showsCursor = false
         guard let image = try? await SCScreenshotManager.captureImage(
             contentFilter: SCContentFilter(desktopIndependentWindow: window), configuration: config)
