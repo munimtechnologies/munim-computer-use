@@ -670,7 +670,6 @@ impl LinuxDesktop {
         walk.visited += 1;
 
         let has = |flag: State| state.is_some_and(|state| state.contains(flag));
-        let bounds = if depth > 0 { self.extents(element, CoordType::Window) } else { None };
         let iconified = iconified || has(State::Iconified);
         let floats = matches!(
             role,
@@ -681,6 +680,14 @@ impl LinuxDesktop {
         // nothing either way.
         let not_showing = state.is_some() && !has(State::Showing);
         let row = matches!(role, Role::ListItem | Role::TreeItem | Role::TableRow | Role::TableCell);
+        // The rectangle costs a round trip. A showing leaf that is not a row
+        // goes without: its container was already checked against the view,
+        // and leaves are most of a tree.
+        let bounds = if depth > 0 && (!children.is_empty() || row || floats || not_showing) {
+            self.extents(element, CoordType::Window)
+        } else {
+            None
+        };
         if depth > 0 && !limits.offscreen && !iconified && outline::is_off_screen(bounds, clip, not_showing, floats, row) {
             walk.skipped += 1;
             return Visit::Skipped;

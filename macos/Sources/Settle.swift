@@ -8,10 +8,29 @@ import ApplicationServices
 // a page loading. An app announces its changes through accessibility
 // notifications within milliseconds of reacting and goes quiet once it is
 // idle, so the wait follows those instead, without any screen capture.
+//
+// Some apps never go quiet: a ticking clock, a progress spinner or a playing
+// video post notifications all the time. Each one names the element and kind
+// that posted it, and a source that was already posting before the action is
+// background, not the app reacting, so it is left out of the count. The app is
+// watched from get_app_state on, so the time before an action shows which.
 
-/// Counts the accessibility notifications one app posts, on a thread of its own
+/// Records the accessibility notifications one app posts, on a thread of its own
 /// whose run loop delivers them.
 final class AXEventMonitor: @unchecked Sendable {
+    struct Event {
+        let at: TimeInterval
+        /// The element and the kind of notification.
+        let source: Int
+    }
+
+    /// Notifications older than this are no use to a wait, which looks back
+    /// `backgroundWindow` and forward at most its timeout.
+    static let keep: TimeInterval = 4
+    static let most = 8192
+    /// How far back before an action a source must have posted to be background.
+    static let backgroundWindow: TimeInterval = 1.5
+
     static let shared = AXEventMonitor()
 
     static let appNotifications = [
@@ -27,7 +46,7 @@ final class AXEventMonitor: @unchecked Sendable {
     ]
 
     private let lock = NSLock()
-    private var count = 0
+    private var events: [Event] = []
     private var watched: pid_t?
     private var observer: AXObserver?
     private var webAreas: [AXUIElement] = []
@@ -36,8 +55,47 @@ final class AXEventMonitor: @unchecked Sendable {
 
     private init() {}
 
-    /// The number of notifications seen so far for the watched app.
-    var current: Int { lock.withLock { count } }
+    /// Sources that kept posting through the `backgroundWindow` before now.
+    func background() -> Set<Int> {
+        let now = ProcessInfo.processInfo.systemUptime
+        return lock.withLock { Self.background(events, before: now, window: Self.backgroundWindow) }
+    }
+
+    /// Notifications since `since` from sources that are not background. A
+    /// source that keeps posting through the wait is background too, for an app
+    /// read too recently to have shown it before the action.
+    func reactions(since: TimeInterval, excluding background: Set<Int>) -> Int {
+        let after = lock.withLock { events.filter { $0.at > since && !background.contains($0.source) } }
+        var slices: [Int: Set<Int>] = [:]
+        for event in after { slices[event.source, default: []].insert(Int((event.at - since) / 0.1)) }
+        return after.filter { (slices[$0.source]?.count ?? 0) < Self.backgroundSlices }.count
+    }
+
+    /// A background source posted in at least this many separate 100 ms
+    /// slices of the window: a ticker or spinner does, while the bursts of a
+    /// few earlier actions on the same control do not.
+    static let backgroundSlices = 5
+
+    static func background(_ events: [Event], before: TimeInterval, window: TimeInterval) -> Set<Int> {
+        var slices: [Int: Set<Int>] = [:]
+        for event in events where event.at >= before - window && event.at <= before {
+            slices[event.source, default: []].insert(Int((event.at - (before - window)) / 0.1))
+        }
+        return Set(slices.filter { $0.value.count >= backgroundSlices }.keys)
+    }
+
+    private func record(_ element: AXUIElement, _ notification: CFString) {
+        var hasher = Hasher()
+        hasher.combine(Int(bitPattern: CFHash(element)))
+        hasher.combine(notification as String)
+        let event = Event(at: ProcessInfo.processInfo.systemUptime, source: hasher.finalize())
+        lock.withLock {
+            let stale = events.firstIndex { event.at - $0.at <= Self.keep } ?? events.count
+            if stale > 0 { events.removeFirst(stale) }
+            if events.count >= Self.most { events.removeFirst(events.count - Self.most + 1) }
+            events.append(event)
+        }
+    }
 
     /// Watch `pid`. Returns false when its notifications cannot be observed, in
     /// which case the caller falls back to a fixed pause.
@@ -92,12 +150,14 @@ final class AXEventMonitor: @unchecked Sendable {
         }
         observer = nil
         webAreas = []
-        lock.withLock { watched = pid }
+        lock.withLock {
+            watched = pid
+            events = []
+        }
         var created: AXObserver?
-        let callback: AXObserverCallback = { _, _, _, refcon in
+        let callback: AXObserverCallback = { _, element, notification, refcon in
             guard let refcon else { return }
-            let monitor = Unmanaged<AXEventMonitor>.fromOpaque(refcon).takeUnretainedValue()
-            monitor.lock.withLock { monitor.count += 1 }
+            Unmanaged<AXEventMonitor>.fromOpaque(refcon).takeUnretainedValue().record(element, notification)
         }
         guard AXObserverCreate(pid, callback, &created) == .success, let created else { return false }
         let app = AXUIElementCreateApplication(pid)

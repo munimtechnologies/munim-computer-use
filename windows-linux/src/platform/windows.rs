@@ -1185,6 +1185,8 @@ impl Desktop for WindowsDesktop {
         // before resolve_pid so a failed lookup cannot leave stale ids.
         self.registry.clear();
         let pid = apps::resolve_pid(app)?;
+        // Hooked from here on, so return_state can tell background events apart.
+        crate::settle::observe(pid);
         let all = Self::top_level_windows(pid);
         if all.is_empty() {
             return Err(DesktopError::new(format!(

@@ -183,7 +183,7 @@ final class OutlineWalk {
     /// Enabled, labelled, actionable controls of the app itself. Zero means the
     /// app describes itself poorly, and its text is worth reading with OCR.
     var appControls = 0
-    /// Labels and frames of listed elements, so OCR does not repeat them.
+    /// Labels, values and frames of listed elements, so OCR does not repeat them.
     var labelled: [(frame: CGRect, text: String)] = []
     /// The walk stopped at `maxDepth` somewhere, so a missing control may just
     /// be deeper than it looked.
@@ -243,7 +243,9 @@ final class OutlineWalk {
             if facts.focused == true { parts.append(" (focused)") }
             lines.append(parts.joined())
             budget -= 1
-            if let frame = facts.frame, let label { labelled.append((frame, label)) }
+            if let frame = facts.frame {
+                for text in [label, facts.value].compactMap({ $0 }) { labelled.append((frame, text)) }
+            }
         }
         if controlRoles.contains(role), facts.enabled != false,
            !(facts.subrole.map { windowControlSubroles.contains($0) } ?? false),

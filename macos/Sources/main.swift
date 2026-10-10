@@ -1076,6 +1076,11 @@ func toolGetAppState(_ args: [String: Any]) -> String {
     }
 
     if windows.isEmpty {
+        // A hidden app (Cmd+H) can list no windows for a moment, such as
+        // right after it was hidden mid-animation.
+        if app.isHidden {
+            return header + "\n\n(\(app.localizedName ?? "the app") is hidden and lists no windows right now; call get_app_state again in a moment, or activate_app to show it in front of the user)"
+        }
         return header + "\n\n(this process has no accessibility windows — if you expected one, another instance of the same app may own it; check list_apps)"
     }
 
@@ -1110,6 +1115,8 @@ func toolGetAppState(_ args: [String: Any]) -> String {
         stillBuilding = walk.appControls == 0
     }
     if narrowed { dialogOpen = true }
+    // Watched from here on, so return_state can tell background notifications apart.
+    _ = AXEventMonitor.shared.watch(app.processIdentifier)
     AXEventMonitor.shared.watchWebAreas(walk.webAreas, pid: app.processIdentifier)
     var lines = walk.lines
     if walk.budget <= 0 {
@@ -4329,15 +4336,19 @@ let returnStateSettle: useconds_t = 300_000
 
 func dispatch(_ name: String, _ args: [String: Any]) -> String {
     let wantsState = statefulActions.contains(name) && args["return_state"] as? Bool == true
-    // Count the app's notifications from before the action, so the wait after
-    // it sees the app react and then go quiet.
+    // Note which sources were posting before the action, so the wait after it
+    // sees the app react and then go quiet, past any background ticking.
     var settle: (() -> Settled)?
     if wantsState, let raw = lastAppStateArgs?["app"] as? String, let pid = pid_t(raw) {
         let monitor = AXEventMonitor.shared
         if monitor.watch(pid) {
-            let before = monitor.current
+            let background = monitor.background()
+            let action = ProcessInfo.processInfo.systemUptime
             let look = lastReadUsedOCR ? WindowLook(pid: pid) : nil
-            settle = { waitForQuiet(before: before, probe: { monitor.current }, look: look.map { l in { l.changed() } }) }
+            settle = {
+                waitForQuiet(before: 0, probe: { monitor.reactions(since: action, excluding: background) },
+                             look: look.map { l in { l.changed() } })
+            }
         }
     }
     let out = dispatchTool(name, args)
