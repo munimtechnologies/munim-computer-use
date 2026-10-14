@@ -32,7 +32,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     ChildWindowFromPointEx, CWP_SKIPDISABLED, CWP_SKIPINVISIBLE, EnumWindows, GW_OWNER, GetClassNameW,
     GA_ROOT, GetAncestor, GetWindow, GetWindowLongW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
-    GetForegroundWindow, PostMessageW, SW_RESTORE,
+    GetForegroundWindow, MSG, PM_NOREMOVE, PeekMessageW, PostMessageW, SW_RESTORE,
     SetForegroundWindow, ShowWindow, WindowFromPoint, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, GWL_STYLE,
 };
@@ -401,7 +401,7 @@ impl WindowsDesktop {
         if window == previous {
             return Ok(false);
         }
-        if !bring_forward(window) {
+        if !self.activate(window) {
             return Err(DesktopError::new(
                 "Windows would not bring the target window forward, and typing now would land in \
                  the window the user is working in — call activate_app, then try again",
@@ -410,6 +410,31 @@ impl WindowsDesktop {
         // Let the window finish activating so the first keys reach its focused control.
         std::thread::sleep(std::time::Duration::from_millis(40));
         Ok(true)
+    }
+
+    /// `bring_forward`, then UI Automation's focus as a fallback: UIA can
+    /// activate a window when the foreground lock refuses this process.
+    fn activate(&self, window: HWND) -> bool {
+        if bring_forward(window) {
+            return true;
+        }
+        if let Ok(element) = self.automation.element_from_handle(Handle::from(window.0 as isize)) {
+            let _ = element.set_focus();
+        }
+        unsafe { GetForegroundWindow() == window }
+    }
+
+    /// Return the foreground to the window the user had, once the keystrokes
+    /// have been routed. Input is routed to whichever window is in front when
+    /// it is processed, not when it is sent, so switching back at once could
+    /// deliver the tail of the burst to the user's window.
+    fn give_foreground_back(&self, previous: HWND, keys: usize) {
+        if previous.0.is_null() || !unsafe { IsWindow(Some(previous)) }.as_bool() {
+            return;
+        }
+        let settle = (40 + keys as u64 / 4).min(1500);
+        std::thread::sleep(std::time::Duration::from_millis(settle));
+        let _ = self.activate(previous);
     }
 
     /// Deliver a left/right click via posted mouse messages so the system
@@ -1299,25 +1324,16 @@ fn bring_forward(window: HWND) -> bool {
         let foreground = GetForegroundWindow();
         let theirs = GetWindowThreadProcessId(foreground, None);
         let ours = GetCurrentThreadId();
+        // AttachThreadInput fails for a thread with no message queue, and this
+        // server's thread has none until it peeks.
+        let mut message = MSG::default();
+        let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
         if theirs != 0 && theirs != ours && AttachThreadInput(ours, theirs, true).as_bool() {
             let _ = SetForegroundWindow(window);
             let _ = AttachThreadInput(ours, theirs, false);
         }
         GetForegroundWindow() == window
     }
-}
-
-/// Return the foreground to the window the user had, once the keystrokes have
-/// been routed. Input is routed to whichever window is in front when it is
-/// processed, not when it is sent, so switching back at once could deliver the
-/// tail of the burst to the user's window.
-fn give_foreground_back(previous: HWND, keys: usize) {
-    if previous.0.is_null() || !unsafe { IsWindow(Some(previous)) }.as_bool() {
-        return;
-    }
-    let settle = (40 + keys as u64 / 4).min(1500);
-    std::thread::sleep(std::time::Duration::from_millis(settle));
-    let _ = bring_forward(previous);
 }
 
 impl Desktop for WindowsDesktop {
@@ -1636,7 +1652,7 @@ impl Desktop for WindowsDesktop {
         let borrowed = self.borrow_foreground(window, previous)?;
         let sent = send_inputs(&text_inputs(text));
         if borrowed {
-            give_foreground_back(previous, text.chars().count());
+            self.give_foreground_back(previous, text.chars().count());
         }
         sent?;
         Ok(format!("typed {} characters", text.chars().count()))
@@ -1652,7 +1668,7 @@ impl Desktop for WindowsDesktop {
             let borrowed = self.borrow_foreground(self.input_window.map(|raw| HWND(raw as *mut _)), previous)?;
             let sent = send_key_plan(&plan);
             if borrowed {
-                give_foreground_back(previous, 1);
+                self.give_foreground_back(previous, 1);
             }
             sent?;
         }
