@@ -1776,8 +1776,7 @@ mod tests {
 
     #[test]
     fn text_inputs_are_literal_and_break_lines_with_return() {
-        let keys: Vec<(u16, u16, bool)> = text_inputs("f(x){}
-ok	z")
+        let keys: Vec<(u16, u16, bool)> = text_inputs("f(x){}\r\nok\tz")
             .iter()
             .map(|input| {
                 let ki = unsafe { input.Anonymous.ki };
@@ -1792,8 +1791,7 @@ ok	z")
             .map(|(_, unit, _)| char::from_u32(u32::from(*unit)).unwrap())
             .collect();
         assert_eq!(typed, "f(x){}okz");
-        // "
-" is a single Return, and the tab is the Tab key.
+        // "\r\n" is a single Return, and the tab is the Tab key.
         let named: Vec<u16> = keys.iter().filter(|(vk, ..)| *vk != 0).map(|(vk, ..)| *vk).collect();
         assert_eq!(named, vec![0x0D, 0x0D, 0x09, 0x09]);
         assert_eq!(keys.len(), 2 * 9 + 4);
