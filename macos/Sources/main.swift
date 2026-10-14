@@ -3264,7 +3264,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "type_text",
-        "description": "Type literal text as keystrokes into the field that currently has focus, optionally focusing element_id first. Use it for short entries and for fields that reject set_value; use set_value to replace a long value in one step, and press_key for shortcuts or keys such as return and tab. Text is inserted at the caret without clearing what is already there. Typing into password fields is refused by default (see COMPUTER_USE_ALLOW_SECURE_FIELD_INPUT).",
+        "description": "Type literal text as keystrokes into the field that currently has focus, optionally focusing element_id first. Use it for short entries and for fields that reject set_value; use set_value to replace a long value in one step, and press_key for shortcuts or keys such as return and tab. Text is inserted at the caret without clearing what is already there. It does not take over the user's keyboard: on macOS and Windows the text goes to the app you are working in, not the window the user is typing in, so do not call activate_app first. Typing into password fields is refused by default (see COMPUTER_USE_ALLOW_SECURE_FIELD_INPUT).",
         "inputSchema": [
             "type": "object",
             "properties": [
@@ -3297,7 +3297,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "press_key",
-        "description": "Press one named key, optionally with modifiers held, e.g. key='s' modifiers=['cmd'] to save or key='return' to submit. Use it for shortcuts and navigation keys; use type_text for literal text and browser_press_key inside the agent's Chrome tabs. The key goes to the focused app, so call activate_app or click first when focus is uncertain. Shortcuts can close windows or delete content, so confirm the target before pressing.",
+        "description": "Press one named key, optionally with modifiers held, e.g. key='s' modifiers=['cmd'] to save or key='return' to submit. Use it for shortcuts and navigation keys; use type_text for literal text and browser_press_key inside the agent's Chrome tabs. The key goes to the app you are working in (the one you last clicked or focused); on macOS and Windows the user can keep typing elsewhere meanwhile, so call activate_app only when nothing has targeted the app yet. Shortcuts can close windows or delete content, so confirm the target before pressing.",
         "inputSchema": [
             "type": "object",
             "properties": [
@@ -3378,7 +3378,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "activate_app",
-        "description": "Bring an app's windows to the foreground and give it keyboard focus. Call it before press_key or type_text when the target app is not frontmost; element-id actions such as click and set_value do not need it. Side effect: the window the user was working in loses focus.",
+        "description": "Bring an app's windows to the foreground and give it keyboard focus. type_text, press_key and element-id actions such as click and set_value do not need it; use it only when the app itself must be in front. Side effect: the window the user was working in loses focus.",
         "inputSchema": [
             "type": "object",
             "properties": [
