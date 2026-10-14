@@ -387,6 +387,7 @@ enum SkyLight {
     typealias PostEventRecordFn = @convention(c) (UnsafeMutableRawPointer, UnsafeMutablePointer<UInt8>) -> Int32
     typealias GetFrontProcessFn = @convention(c) (UnsafeMutableRawPointer) -> Int32
     typealias GetProcessForPIDFn = @convention(c) (pid_t, UnsafeMutablePointer<ProcessSerialNumber>) -> OSStatus
+    typealias GetProcessPIDFn = @convention(c) (UnsafeRawPointer, UnsafeMutablePointer<pid_t>) -> OSStatus
     typealias AXGetWindowFn = @convention(c) (AXUIElement, UnsafeMutablePointer<UInt32>) -> AXError
 
     static let skyHandle = dlopen(
@@ -401,6 +402,7 @@ enum SkyLight {
     static let postEventRecord: PostEventRecordFn? = load("SLPSPostEventRecordTo", skyHandle)
     static let getFrontProcess: GetFrontProcessFn? = load("_SLPSGetFrontProcess", skyHandle)
     static let getProcessForPID: GetProcessForPIDFn? = load("GetProcessForPID", appServices)
+    static let getProcessPID: GetProcessPIDFn? = load("GetProcessPID", appServices)
     static let axGetWindow: AXGetWindowFn? = load("_AXUIElementGetWindow", appServices)
 
     static func load<T>(_ name: String, _ handle: UnsafeMutableRawPointer?) -> T? {
@@ -443,6 +445,14 @@ enum SkyLight {
         guard forPID(pid, &psn) == 0 else { return false }
         withUnsafeBytes(of: &psn) { raw in for i in 0..<8 { target[i] = raw[i] } }
 
+        // defocus the outgoing front process, then focus the target
+        let defocused = postFocusRecord(post, psn: &previous, wid: wid, focus: false)
+        let focused = postFocusRecord(post, psn: &target, wid: wid, focus: true)
+        return defocused && focused
+    }
+
+    /// One focus-change event record: 0x01 focuses `wid` in the process, 0x02 defocuses it.
+    static func postFocusRecord(_ post: PostEventRecordFn, psn: inout [UInt8], wid: UInt32, focus: Bool) -> Bool {
         var record = [UInt8](repeating: 0, count: 0xF8)
         record[0x04] = 0xF8
         record[0x08] = 0x0D
@@ -450,21 +460,97 @@ enum SkyLight {
         record[0x3D] = UInt8((wid >> 8) & 0xFF)
         record[0x3E] = UInt8((wid >> 16) & 0xFF)
         record[0x3F] = UInt8((wid >> 24) & 0xFF)
-
-        record[0x8A] = 0x02  // defocus the outgoing front process
-        let defocused = previous.withUnsafeMutableBufferPointer { p in
+        record[0x8A] = focus ? 0x01 : 0x02
+        return psn.withUnsafeMutableBufferPointer { p in
             record.withUnsafeMutableBufferPointer { r in
                 post(UnsafeMutableRawPointer(p.baseAddress!), r.baseAddress!) == 0
             }
         }
-        record[0x8A] = 0x01  // focus the target
-        let focused = target.withUnsafeMutableBufferPointer { p in
-            record.withUnsafeMutableBufferPointer { r in
-                post(UnsafeMutableRawPointer(p.baseAddress!), r.baseAddress!) == 0
-            }
-        }
-        return defocused && focused
     }
+
+    /// The window that has the user's keyboard: the front process and its
+    /// focused window.
+    static func userFocus() -> (psn: [UInt8], pid: pid_t, wid: UInt32)? {
+        guard let front = getFrontProcess, let pidOfPSN = getProcessPID else { return nil }
+        var psn = [UInt8](repeating: 0, count: 8)
+        let got = psn.withUnsafeMutableBufferPointer { front(UnsafeMutableRawPointer($0.baseAddress!)) == 0 }
+        guard got else { return nil }
+        var pid: pid_t = 0
+        let resolved = psn.withUnsafeBufferPointer { pidOfPSN(UnsafeRawPointer($0.baseAddress!), &pid) == noErr }
+        guard resolved, pid > 0,
+              let window = axElement(AXUIElementCreateApplication(pid), kAXFocusedWindowAttribute as String),
+              let wid = windowID(window)
+        else { return nil }
+        return (psn, pid, wid)
+    }
+
+    /// `activateWithoutRaise` for the length of one action. Routed input needs
+    /// the target focused, but that focus takes the user's keyboard with it, so
+    /// this waits for a pause in their typing first and the returned loan hands
+    /// their window its focus back. Nil when the target cannot be activated.
+    static func borrowFocus(pid: pid_t, wid: UInt32) -> FocusLoan? {
+        waitForUserPause()
+        let user = userFocus()
+        guard activateWithoutRaise(pid: pid, wid: wid) else { return nil }
+        return FocusLoan(pid: pid, wid: wid, user: user)
+    }
+}
+
+/// Focus lent to the agent's window by `SkyLight.borrowFocus`.
+struct FocusLoan {
+    let pid: pid_t
+    let wid: UInt32
+    let user: (psn: [UInt8], pid: pid_t, wid: UInt32)?
+
+    /// Give the user's window its keyboard focus back, once the target has
+    /// taken the routed events. Kept with the agent when there was nothing to
+    /// return to, when the user was in that very window, or when the action
+    /// opened a menu: an app closes its menus as soon as it loses focus.
+    func giveBack(afterKeys keys: Int = 0) {
+        guard let user, user.wid != wid, let post = SkyLight.postEventRecord,
+              let forPID = SkyLight.getProcessForPID
+        else { return }
+        // Posted keys are handled after they are posted; let the app finish
+        // them while it still has focus.
+        usleep(useconds_t(min(60 + keys * 2, 1500)) * 1000)
+        if menuOpen(in: pid) { return }
+        var psn = ProcessSerialNumber()
+        guard forPID(pid, &psn) == 0 else { return }
+        var target = [UInt8](repeating: 0, count: 8)
+        withUnsafeBytes(of: &psn) { raw in for i in 0..<8 { target[i] = raw[i] } }
+        var theirs = user.psn
+        _ = SkyLight.postFocusRecord(post, psn: &target, wid: wid, focus: false)
+        _ = SkyLight.postFocusRecord(post, psn: &theirs, wid: user.wid, focus: true)
+    }
+}
+
+/// Whether the app has a menu open (a context, pop-up or menu-bar menu).
+func menuOpen(in pid: pid_t) -> Bool {
+    let app = AXUIElementCreateApplication(pid)
+    if let focused = axElement(app, kAXFocusedUIElementAttribute as String),
+       let role = axCopy(focused, kAXRoleAttribute as String) as? String,
+       role == "AXMenu" || role == "AXMenuItem" {
+        return true
+    }
+    let children = (axCopy(app, kAXChildrenAttribute as String) as? [AXUIElement]) ?? []
+    return children.contains { (axCopy($0, kAXRoleAttribute as String) as? String) == "AXMenu" }
+}
+
+/// Wait until the user has stopped typing (no modifier held, no key for
+/// 0.3 s, up to 10 s), so lending focus to the agent cannot catch their
+/// keystrokes. Reads the hardware state, which the agent's own posted events
+/// never reach.
+func waitForUserPause() {
+    let deadline = Date().addingTimeInterval(10)
+    let held: CGEventFlags = [.maskShift, .maskControl, .maskAlternate, .maskCommand]
+    while Date() < deadline {
+        let idle = CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .keyDown)
+        if idle >= 0.3 && CGEventSource.flagsState(.hidSystemState).isDisjoint(with: held) { return }
+        usleep(25_000)
+    }
+}
+
+extension SkyLight {
 
     /// Stamp the window-routing fields and deliver down both paths.
     static func postMouse(
@@ -614,7 +700,8 @@ var clickGroupCounter: Int64 = 0x4000
 func backgroundClick(_ target: WindowTarget, at point: CGPoint, clickCount: Int) -> Bool {
     guard SkyLight.available else { return false }
     CursorOverlay.shared.press(at: point)
-    guard SkyLight.activateWithoutRaise(pid: target.pid, wid: target.wid) else { return false }
+    guard let loan = SkyLight.borrowFocus(pid: target.pid, wid: target.wid) else { return false }
+    defer { loan.giveBack() }
     usleep(80_000)
 
     clickGroupCounter += 1
@@ -652,7 +739,8 @@ func backgroundScroll(_ target: WindowTarget, at point: CGPoint, dx: Int32, dy: 
           let setWindowLocation = SkyLight.setWindowLocation
     else { return false }
     CursorOverlay.shared.show(at: point)
-    guard SkyLight.activateWithoutRaise(pid: target.pid, wid: target.wid) else { return false }
+    guard let loan = SkyLight.borrowFocus(pid: target.pid, wid: target.wid) else { return false }
+    defer { loan.giveBack() }
     usleep(80_000)
     clickGroupCounter += 1
     let group = clickGroupCounter
@@ -695,7 +783,8 @@ func backgroundScroll(_ target: WindowTarget, at point: CGPoint, dx: Int32, dy: 
 func backgroundRightClick(_ target: WindowTarget, at point: CGPoint) -> Bool {
     guard SkyLight.available else { return false }
     CursorOverlay.shared.press(at: point)
-    guard SkyLight.activateWithoutRaise(pid: target.pid, wid: target.wid) else { return false }
+    guard let loan = SkyLight.borrowFocus(pid: target.pid, wid: target.wid) else { return false }
+    defer { loan.giveBack() }
     usleep(80_000)
     clickGroupCounter += 1
     let group = clickGroupCounter
@@ -733,7 +822,8 @@ func backgroundDrag(_ target: WindowTarget, from start: CGPoint, to end: CGPoint
         }
     }
     CursorOverlay.shared.press(at: start)
-    guard SkyLight.activateWithoutRaise(pid: target.pid, wid: target.wid) else { return false }
+    guard let loan = SkyLight.borrowFocus(pid: target.pid, wid: target.wid) else { return false }
+    defer { loan.giveBack() }
     usleep(80_000)
     clickGroupCounter += 1
     let group = clickGroupCounter
@@ -800,6 +890,25 @@ func synthesizeTypedText(_ text: String, deliver: (CGEvent?) -> Void) {
         deliver(up)
         usleep(8_000)
     }
+}
+
+/// Keys posted to a process reach its key window, which it only has while it
+/// is focused. Lend it focus for the keystrokes and hand it back after, so the
+/// user's own typing keeps going to their window. Without the private focus
+/// calls the keys are posted as before.
+func withKeyboardFocus(pid: pid_t, window: AXUIElement?, keys: Int, _ body: () -> Void) {
+    let app = AXUIElementCreateApplication(pid)
+    let target = window ?? axElement(app, kAXFocusedWindowAttribute as String)
+        ?? (axCopy(app, kAXWindowsAttribute as String) as? [AXUIElement])?.first
+    guard SkyLight.available, let target, let wid = SkyLight.windowID(target),
+          let loan = SkyLight.borrowFocus(pid: pid, wid: wid)
+    else {
+        body()
+        return
+    }
+    usleep(40_000)
+    body()
+    loan.giveBack(afterKeys: keys)
 }
 
 func typeText(_ text: String, pid: pid_t) {
@@ -1377,7 +1486,10 @@ func toolTypeText(_ args: [String: Any]) -> String {
     {
         return "error: cannot type: \(refusal)"
     }
-    typeText(text, pid: pid)
+    withKeyboardFocus(pid: pid, window: element.flatMap { axElement($0, kAXWindowAttribute as String) },
+                      keys: text.count) {
+        typeText(text, pid: pid)
+    }
     return "typed \(text.count) characters"
 }
 
@@ -1414,7 +1526,9 @@ func toolPressKey(_ args: [String: Any]) -> String {
     if let refusal = WindowParking.shared.reach(pid: pid, window: nil) {
         return "error: cannot press \(key): \(refusal)"
     }
-    if let err = pressKey(key, modifiers: mods, pid: pid) { return "error: \(err)" }
+    var err: String?
+    withKeyboardFocus(pid: pid, window: nil, keys: 1) { err = pressKey(key, modifiers: mods, pid: pid) }
+    if let err { return "error: \(err)" }
     return "pressed \(chord)"
 }
 
@@ -1986,7 +2100,8 @@ func toolRightClick(_ args: [String: Any]) -> String {
 func backgroundHover(_ target: WindowTarget, at point: CGPoint) -> Bool {
     guard SkyLight.available else { return false }
     CursorOverlay.shared.show(at: point)
-    guard SkyLight.activateWithoutRaise(pid: target.pid, wid: target.wid) else { return false }
+    guard let loan = SkyLight.borrowFocus(pid: target.pid, wid: target.wid) else { return false }
+    defer { loan.giveBack() }
     usleep(60_000)
     clickGroupCounter += 1
     let src = agentEventSource()
