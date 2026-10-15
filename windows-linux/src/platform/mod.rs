@@ -19,6 +19,8 @@ mod ocr;
 #[cfg_attr(not(windows), allow(dead_code))]
 pub mod outline;
 #[cfg(windows)]
+mod user_keys;
+#[cfg(windows)]
 pub mod windows;
 
 /// A tool failure that is worth showing the model verbatim.

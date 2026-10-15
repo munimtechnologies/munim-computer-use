@@ -20,11 +20,9 @@ use uiautomation::variants::Variant;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::core::BOOL;
 use windows::Win32::Graphics::Gdi::ScreenToClient;
-use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetLastInputInfo, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
-    KEYBD_EVENT_FLAGS, KEYBDINPUT, LASTINPUTINFO,
+    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
     IsWindowEnabled, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC,
     MOUSE_EVENT_FLAGS, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_WHEEL,
     MOUSEINPUT, MapVirtualKeyW, SendInput, VIRTUAL_KEY, VkKeyScanW,
@@ -32,7 +30,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     ChildWindowFromPointEx, CWP_SKIPDISABLED, CWP_SKIPINVISIBLE, EnumWindows, GW_OWNER, GetClassNameW,
     GA_ROOT, GetAncestor, GetWindow, GetWindowLongW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
-    GetForegroundWindow, MSG, PM_NOREMOVE, PeekMessageW, PostMessageW, SW_RESTORE,
+    GetForegroundWindow, MSG, PM_NOREMOVE, PeekMessageW, PostMessageW, SMTO_ABORTIFHUNG, SW_RESTORE,
+    SendMessageTimeoutW, WM_NULL,
     SetForegroundWindow, ShowWindow, WindowFromPoint, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, GWL_STYLE,
 };
@@ -75,6 +74,13 @@ pub struct WindowsDesktop {
     /// delivered in the background and leave the user's window in front, so
     /// keystrokes that follow are steered here instead of to the foreground.
     input_window: Option<isize>,
+}
+
+/// The foreground, lent to the agent's window by `borrow_foreground`.
+struct Lent {
+    previous: HWND,
+    /// Dropped once the foreground is back, which replays the user's keys.
+    _held: Option<super::user_keys::Hold>,
 }
 
 struct Batch {
@@ -389,27 +395,37 @@ impl WindowsDesktop {
         (!root.0.is_null() && pid != std::process::id()).then_some(root)
     }
 
-    /// Put `window` in front for a keystroke. Returns whether the foreground
-    /// was taken from another window, and so has to be given back. With no
-    /// known target the keys go wherever focus already is, as before.
-    fn borrow_foreground(&mut self, window: Option<HWND>, previous: HWND) -> Result<bool> {
-        let Some(window) = window else { return Ok(false) };
+    /// Put `window` in front for a keystroke. Returns the loan when the
+    /// foreground was taken from another window, and so has to be given back;
+    /// the user's keys are held until then. With no known target the keys go
+    /// wherever focus already is, as before.
+    fn borrow_foreground(&mut self, window: Option<HWND>, previous: HWND) -> Result<Option<Lent>> {
+        let Some(window) = window else { return Ok(None) };
         if !unsafe { IsWindow(Some(window)) }.as_bool() {
             self.input_window = None;
-            return Ok(false);
+            return Ok(None);
         }
         if window == previous {
-            return Ok(false);
+            return Ok(None);
         }
-        if !self.activate(window) {
-            return Err(DesktopError::new(
-                "Windows would not bring the target window forward, and typing now would land in \
-                 the window the user is working in — call activate_app, then try again",
-            ));
+        // Keys reaching the target from here on would be the user's, so hold
+        // them until their window is back.
+        let mut held = super::user_keys::hold();
+        if !bring_forward(window) {
+            // The UI Automation fallback can take seconds; do not keep the
+            // user's typing back that long.
+            drop(held.take());
+            if !self.activate(window) {
+                return Err(DesktopError::new(
+                    "Windows would not bring the target window forward, and typing now would land \
+                     in the window the user is working in — call activate_app, then try again",
+                ));
+            }
+            held = super::user_keys::hold();
         }
         // Let the window finish activating so the first keys reach its focused control.
-        std::thread::sleep(std::time::Duration::from_millis(40));
-        Ok(true)
+        settle_activation(window, 20);
+        Ok(Some(Lent { previous, _held: held }))
     }
 
     /// `bring_forward`, then UI Automation's focus as a fallback: UIA can
@@ -428,13 +444,18 @@ impl WindowsDesktop {
     /// have been routed. Input is routed to whichever window is in front when
     /// it is processed, not when it is sent, so switching back at once could
     /// deliver the tail of the burst to the user's window.
-    fn give_foreground_back(&self, previous: HWND, keys: usize) {
-        if previous.0.is_null() || !unsafe { IsWindow(Some(previous)) }.as_bool() {
-            return;
-        }
+    /// The user's keys held meanwhile are replayed after, into their window.
+    fn give_foreground_back(&self, lent: Lent, keys: usize) {
         let settle = (40 + keys as u64 / 4).min(1500);
         std::thread::sleep(std::time::Duration::from_millis(settle));
-        let _ = self.activate(previous);
+        if !lent.previous.0.is_null() && unsafe { IsWindow(Some(lent.previous)) }.as_bool() {
+            if self.activate(lent.previous) {
+                // Keys that reach a window before it has handled its
+                // activation can be lost or land before its caret is restored;
+                // keep holding the user's until it has.
+                settle_activation(lent.previous, 80);
+            }
+        }
     }
 
     /// Deliver a left/right click via posted mouse messages so the system
@@ -1189,7 +1210,7 @@ fn keyboard_input(vk: u16, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
                 wScan: scan,
                 dwFlags: flags,
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: super::user_keys::AGENT_INPUT,
             },
         },
     }
@@ -1283,36 +1304,25 @@ fn send_inputs(inputs: &[INPUT]) -> Result<()> {
     Ok(())
 }
 
-/// How long the user must have been still before the agent types, and how
-/// long it waits for that before typing anyway.
-const USER_PAUSE_MS: u32 = 300;
-const USER_PAUSE_LIMIT_MS: u64 = 10_000;
-
-/// Wait until the user has stopped typing (no key held, no input for
-/// USER_PAUSE_MS), so the agent's burst never lands between their keystrokes
-/// and a held Shift or Ctrl of theirs cannot change the agent's keys.
-fn wait_for_user_pause() {
-    let start = std::time::Instant::now();
-    while start.elapsed() < std::time::Duration::from_millis(USER_PAUSE_LIMIT_MS) {
-        let mut info = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
-        let idle = if unsafe { GetLastInputInfo(&mut info) }.as_bool() {
-            unsafe { GetTickCount() }.wrapping_sub(info.dwTime)
-        } else {
-            u32::MAX
-        };
-        // 0x07 and below are mouse buttons and cancel, not keys.
-        let key_held = (0x08..=0xFE).any(|vk| unsafe { GetAsyncKeyState(vk) } < 0);
-        if idle >= USER_PAUSE_MS && !key_held {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
+/// Wait until `window`'s thread has handled the messages its activation sent
+/// it (a WM_NULL round trip is answered after them), plus a little time for
+/// the focus and caret changes those post.
+fn settle_activation(window: HWND, ms: u64) {
+    unsafe {
+        let _ = SendMessageTimeoutW(window, WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, 250, None);
     }
+    std::thread::sleep(std::time::Duration::from_millis(ms));
 }
 
+/// An unassigned virtual key. Sending it makes this process the source of the
+/// last input event, which lets it take the foreground, and no app acts on it
+/// (UI Automation's SetFocus sends the same key for the same reason).
+pub(super) const UNLOCK_VK: u16 = 0xB9;
+
 /// Make `window` the foreground window. Windows refuses that to a process
-/// that does not own the foreground, so on refusal this briefly attaches to
-/// the foreground thread's input, which lifts the lock (AutoHotkey's
-/// WinActivate does the same).
+/// that does not own the foreground, so on refusal this sends `UNLOCK_VK` and
+/// tries again, then briefly attaches to the foreground thread's input, which
+/// also lifts the lock (AutoHotkey's WinActivate does the same).
 fn bring_forward(window: HWND) -> bool {
     unsafe {
         if GetForegroundWindow() == window {
@@ -1320,6 +1330,15 @@ fn bring_forward(window: HWND) -> bool {
         }
         if SetForegroundWindow(window).as_bool() && GetForegroundWindow() == window {
             return true;
+        }
+        let unlock = [vk_input(UNLOCK_VK, false, false), vk_input(UNLOCK_VK, false, true)];
+        if SendInput(&unlock, std::mem::size_of::<INPUT>() as i32) == 2 {
+            for _ in 0..5 {
+                if SetForegroundWindow(window).as_bool() && GetForegroundWindow() == window {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
         }
         let foreground = GetForegroundWindow();
         let theirs = GetWindowThreadProcessId(foreground, None);
@@ -1493,6 +1512,7 @@ impl Desktop for WindowsDesktop {
                  after interacting with the desktop"
             )));
         }
+        self.input_window = Some(window.0 as isize);
         Ok(format!("activated {app} (pid {pid})"))
     }
 
@@ -1550,6 +1570,9 @@ impl Desktop for WindowsDesktop {
 
     fn right_click(&mut self, target: Point) -> Result<String> {
         let (x, y) = self.point_coordinates(target)?;
+        // Keys that follow (arrows and Return through the menu) belong to the
+        // window that owns it.
+        self.input_window = Self::root_at(x, y).map(|root| root.0 as isize);
         AgentCursor::shared().press(x, y);
         if !identity::remote_control() && Self::background_click(x, y, true) {
             return Ok(format!("right-clicked at ({x:.0}, {y:.0}) in background"));
@@ -1619,7 +1642,7 @@ impl Desktop for WindowsDesktop {
         // one the user is typing in. So: wait for a pause in their typing,
         // bring the target forward, type in one uninterrupted burst, and hand
         // the foreground straight back.
-        wait_for_user_pause();
+        super::user_keys::wait_for_pause();
         let previous = unsafe { GetForegroundWindow() };
         let mut window = self.input_window.map(|raw| HWND(raw as *mut _));
         if let Some(id) = element {
@@ -1649,10 +1672,10 @@ impl Desktop for WindowsDesktop {
                 }
             }
         }
-        let borrowed = self.borrow_foreground(window, previous)?;
+        let lent = self.borrow_foreground(window, previous)?;
         let sent = send_inputs(&text_inputs(text));
-        if borrowed {
-            self.give_foreground_back(previous, text.chars().count());
+        if let Some(lent) = lent {
+            self.give_foreground_back(lent, text.chars().count());
         }
         sent?;
         Ok(format!("typed {} characters", text.chars().count()))
@@ -1663,12 +1686,12 @@ impl Desktop for WindowsDesktop {
         if identity::remote_control() {
             send_key_plan(&plan)?;
         } else {
-            wait_for_user_pause();
+            super::user_keys::wait_for_pause();
             let previous = unsafe { GetForegroundWindow() };
-            let borrowed = self.borrow_foreground(self.input_window.map(|raw| HWND(raw as *mut _)), previous)?;
+            let lent = self.borrow_foreground(self.input_window.map(|raw| HWND(raw as *mut _)), previous)?;
             let sent = send_key_plan(&plan);
-            if borrowed {
-                self.give_foreground_back(previous, 1);
+            if let Some(lent) = lent {
+                self.give_foreground_back(lent, 1);
             }
             sent?;
         }
@@ -1750,12 +1773,14 @@ impl Desktop for WindowsDesktop {
     }
 
     fn select_text(&mut self, element: u32, start: usize, length: Option<usize>) -> Result<String> {
-        let Target::Element { element: target, .. } = self.resolve(element)? else {
+        let Target::Element { element: target, window, .. } = self.resolve(element)? else {
             return Err(outline::ocr_id_error(element));
         };
         let pattern = target.get_pattern::<UITextPattern>().map_err(|_| {
             DesktopError::new(format!("e{element} does not expose selectable text"))
         })?;
+        // type_text that replaces the selection has to reach this window.
+        self.input_window = Some(window.0 as isize);
         let document = pattern
             .get_document_range()
             .map_err(|error| DesktopError::new(format!("could not read e{element}: {error}")))?;
