@@ -18,6 +18,7 @@ mod capture;
 mod clipboard;
 mod cursor;
 mod history;
+mod host_check;
 mod identity;
 mod install;
 // Only the Windows and Linux backends press keys; macOS builds compile this for tests.
@@ -96,6 +97,11 @@ fn main() {
         std::process::exit(install::run(&args[2..]));
     }
 
+    // Retrace Chrome's host lookup and launch, for "host not found" reports.
+    if mode == Some("check-native-host") {
+        std::process::exit(host_check::run(&args[2..]));
+    }
+
     // Print the resolved identity (paths, names) as JSON, for embedders to check.
     if mode == Some("identity") {
         println!("{:#}", identity::get().describe());
@@ -134,6 +140,11 @@ fn main() {
             None
         }
     };
+    // Said once up front for whoever reads the log; the tools repeat it on
+    // the results it explains.
+    if let Some(warning) = platform::desktop_access_warning() {
+        eprintln!("munim-computer-use: warning: {warning}");
+    }
     let mut browser = if tools::browser_control_enabled() {
         browser::BrowserBridge::new()
     } else {
@@ -390,7 +401,7 @@ fn call_tool(
             };
             match live::frame(&request) {
                 Ok(live::LiveFrame::Changed { capture, seq }) => {
-                    let text = capture::mapping_text(&capture, &format!("display {index}"));
+                    let text = capture::caption(&capture, &format!("display {index}"));
                     let mut result = image_result(capture.bytes, format.mime_type(), text);
                     if let Some(content) = result.get_mut("content").and_then(Value::as_array_mut) {
                         content.push(json!({ "type": "text", "text": live::live_line(seq, true) }));
@@ -409,7 +420,7 @@ fn call_tool(
         return match usize::try_from(display) {
             Ok(index) => match capture::capture_display(index, max_width, format) {
                 Ok(capture) => {
-                    let text = capture::mapping_text(&capture, &format!("display {index}"));
+                    let text = capture::caption(&capture, &format!("display {index}"));
                     with_cursor(image_result(capture.bytes, format.mime_type(), text), &args)
                 }
                 Err(error) => text_result(format!("error: {error}"), true),
@@ -487,7 +498,7 @@ fn zoom_region(args: &Value) -> Result<Value, DesktopError> {
         .clamp(0, 8000) as u32;
     let format = capture::CaptureFormat::parse(arg_str(args, "format"), arg_i64(args, "quality"))?;
     let capture = capture::capture_region(x0, y0, x1, y1, max_width, format)?;
-    let text = capture::mapping_text(&capture, "zoomed region");
+    let text = capture::caption(&capture, "zoomed region");
     Ok(image_result(capture.bytes, format.mime_type(), text))
 }
 
@@ -753,7 +764,7 @@ fn run_desktop_tool(
                     DesktopError::new("display index must be zero or greater")
                 })?;
                 let capture = capture::capture_display(index, max_width, format)?;
-                let text = capture::mapping_text(&capture, &format!("display {index}"));
+                let text = capture::caption(&capture, &format!("display {index}"));
                 return Ok(with_cursor(image_result(capture.bytes, format.mime_type(), text), args));
             }
             let app = arg_str(args, "app").ok_or_else(|| {
@@ -763,7 +774,7 @@ fn run_desktop_tool(
             check_app_policy(desktop, &app)?;
             let pid = desktop.resolve_pid(&app)?;
             let (capture, title) = capture::capture_app_window(pid, max_width, format)?;
-            let text = capture::mapping_text(&capture, &format!("window of {app} \"{title}\""));
+            let text = capture::caption(&capture, &format!("window of {app} \"{title}\""));
             return Ok(image_result(capture.bytes, format.mime_type(), text));
         }
         other => {

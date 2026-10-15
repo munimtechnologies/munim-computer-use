@@ -1484,11 +1484,15 @@ impl Desktop for WindowsDesktop {
 
         if walk.next_id == 0 {
             lines.push(String::new());
-            lines.push(
-                "no interactive elements found — the app may render its own UI, so use screenshot \
-                 and click with coordinates"
+            // A sandboxed or other-desktop process gets this same empty tree
+            // for every app; say why instead of suggesting a screenshot that
+            // will come back black too.
+            lines.push(match super::desktop_access_warning() {
+                Some(warning) => format!("no interactive elements found — {warning}"),
+                None => "no interactive elements found — the app may render its own UI, so use screenshot \
+                         and click with coordinates"
                     .to_string(),
-            );
+            });
         }
         Ok(lines.join("\n"))
     }
@@ -1502,18 +1506,33 @@ impl Desktop for WindowsDesktop {
         unsafe {
             let _ = ShowWindow(*window, SW_RESTORE);
         }
-        let raised = unsafe { SetForegroundWindow(*window) };
-        if !raised.as_bool() {
+        // Judged by what is in front afterwards, not by SetForegroundWindow's
+        // return value: a process that cannot reach the user's desktop is told
+        // yes and changes nothing. The app's own popup coming forward (an
+        // owned dialog taking activation) still counts.
+        let raised = self.activate(*window) || {
+            let mut front = 0u32;
+            unsafe { GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut front)) };
+            front == pid
+        };
+        let warning = super::desktop_access_warning();
+        if !raised {
             // Windows refuses foreground changes from background processes in
             // some states; say so rather than claim a success the model can see
             // is false in the next screenshot.
-            return Err(DesktopError::new(format!(
-                "Windows refused to bring {app} forward — click its taskbar button, or try again \
-                 after interacting with the desktop"
-            )));
+            return Err(DesktopError::new(match warning {
+                Some(warning) => format!("{app} did not come forward — {warning}"),
+                None => format!(
+                    "Windows refused to bring {app} forward — click its taskbar button, or try again \
+                     after interacting with the desktop"
+                ),
+            }));
         }
         self.input_window = Some(window.0 as isize);
-        Ok(format!("activated {app} (pid {pid})"))
+        Ok(match warning {
+            Some(warning) => format!("activated {app} (pid {pid}), but {warning}"),
+            None => format!("activated {app} (pid {pid})"),
+        })
     }
 
     fn click(&mut self, target: Point, click_count: u32) -> Result<String> {

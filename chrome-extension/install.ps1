@@ -27,6 +27,13 @@ if ($LASTEXITCODE -ne 0) {
   Write-Error 'install-native-host failed'
 }
 
+# Writing the keys is not the same as Chrome finding them: retrace Chrome's
+# lookup and start the host the way Chrome would.
+& $binary check-native-host
+if ($LASTEXITCODE -ne 0) {
+  Write-Warning 'Chrome would not reach the host yet; see the FAIL / WARN lines above'
+}
+
 Write-Host ''
 Write-Host 'Next, load the extension once:'
 Write-Host '  1. open  chrome://extensions'

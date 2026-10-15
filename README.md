@@ -338,7 +338,13 @@ node scripts/e2e-browser.mjs --server <munim-computer-use binary> --chrome <Chro
 1. `chrome://extensions` → Developer mode → **Load unpacked** → select `chrome-extension/`.
 2. Register the native messaging host: `munim-computer-use install-native-host` (for example `npx -y munim-computer-use install-native-host`), or from a checkout `sh chrome-extension/install.sh` (macOS/Linux) / `powershell -File chrome-extension/install.ps1` (Windows), which find the build and run the same command. Point `COMPUTER_USE_PATH` at the binary if it is not in the default build location.
 
+If the extension still gets `Specified native messaging host not found.`, or the browser tools say the extension is not connected, run `munim-computer-use check-native-host` in an ordinary terminal. It looks the host up the way Chrome does (on Windows: registry views and policies; everywhere: the manifest's encoding, name, type and allowed origins), starts it with Chrome's command line, and names the step that would fail. Two Windows causes look fine from the inside. An installer run by an MSIX-packaged app (some agent desktop apps are packaged) writes to a private, virtualised copy of HKCU and `%LOCALAPPDATA%` that Chrome never reads. One run by a sandbox with its own Windows account writes to that account's HKCU. The check detects both; run `install-native-host` again from your own terminal. `install-native-host` reports the same findings under `problems`.
+
 The standalone server's host is `com.munimtech.computer_use.desktop`; MT Code, which bundles this server, registers `com.munim.mtcode.desktop`. The extension connects to every host it knows at once and answers each on its own connection, so MT Code and a standalone server (npx, Claude Code, Cursor, a checkout) can both drive Chrome at the same time, each in its own tab groups.
+
+### Sandboxed agents (Windows)
+
+Some agents run their commands in a sandbox: a restricted or low-integrity token, a separate Windows account, or another desktop. A server started there can still list windows and their titles, but other apps' UI Automation refuses it and captures come back black, without any error. When that happens the server says so: `get_app_state` explains an empty tree, `screenshot` and `zoom` flag a capture that is one flat colour, and `activate_app` checks that the window really came forward. Each names the cause it found (for example "runs at low integrity" or "runs as another account"). Retrying from the same context will not help; configure the agent to start the MCP server in your own, unsandboxed context.
 
 ## Environment flags
 

@@ -43,6 +43,12 @@ pub fn run(args: &[String]) -> i32 {
         Ok(report) => {
             let registered = report["registered"].as_array().map_or(0, Vec::len);
             println!("{report}");
+            for problem in report["problems"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                eprintln!("munim-computer-use: warning: {problem}");
+            }
+            if report["problems"].as_array().is_some_and(|problems| !problems.is_empty()) {
+                eprintln!("munim-computer-use: run `munim-computer-use check-native-host` for the full lookup");
+            }
             if registered == 0 {
                 eprintln!("munim-computer-use: no Chrome or Chromium profile found to register with");
                 1
@@ -93,12 +99,20 @@ fn install(identity: &Identity, binary: &Path) -> Result<Value, String> {
 
     let mut skipped: Vec<String> = Vec::new();
     let registered = register(identity, &support, &wrapper, &manifest_for, &mut skipped)?;
+    // Writing the keys is not the same as Chrome finding them: read them back
+    // the way Chrome does, without starting anything, so an app that installs
+    // on every launch stays quick.
+    let problems = match identity.extension_ids.first() {
+        Some(extension_id) if !registered.is_empty() => crate::host_check::check(identity, extension_id, false).problems,
+        _ => Vec::new(),
+    };
     Ok(json!({
         "wrapper": wrapper.to_string_lossy(),
         "profile": profile.map(|p| p.to_string_lossy().into_owned()),
         "hostNames": identity.native_host_names,
         "registered": registered,
         "skipped": skipped,
+        "problems": problems,
     }))
 }
 
@@ -247,17 +261,49 @@ fn register(
 /// The manifest path a host key's default value points at, if any.
 #[cfg(windows)]
 fn registered_manifest(key: &str) -> Option<PathBuf> {
+    registry_default(key, None).map(PathBuf::from)
+}
+
+/// A key's default string value, read through `view` ("32" or "64") when
+/// given, as Chrome reads host keys.
+#[cfg(windows)]
+pub(crate) fn registry_default(key: &str, view: Option<&str>) -> Option<String> {
+    let view = view.map(|view| format!("/reg:{view}"));
+    let mut args = vec!["query", key, "/ve"];
+    args.extend(view.as_deref());
+    reg_query(&args)?
+        .lines()
+        .find_map(|line| line.split_once("REG_SZ").map(|(_, value)| value.trim().to_string()))
+        .filter(|value| !value.is_empty())
+}
+
+/// Every value directly under `key`, as (name, data) with data as `reg` prints
+/// it (DWORDs as `0x1`). Empty when the key does not exist.
+#[cfg(windows)]
+pub(crate) fn registry_values(key: &str) -> Vec<(String, String)> {
+    let Some(text) = reg_query(&["query", key]) else { return Vec::new() };
+    text.lines()
+        .filter_map(|line| {
+            // "    name    REG_TYPE    data"; names and data may hold spaces.
+            let (name, rest) = line.split_once("    REG_")?;
+            let data = rest.split_once("    ").map_or("", |(_, data)| data);
+            Some((name.trim().to_string(), data.trim().to_string()))
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn reg_query(args: &[&str]) -> Option<String> {
+    use std::os::windows::process::CommandExt;
     let output = std::process::Command::new("reg")
-        .args(["query", key, "/ve"])
+        .args(args)
         .stderr(std::process::Stdio::null())
+        // No console window when an embedding GUI app calls the installer.
+        .creation_flags(0x0800_0000)
         .output()
         .ok()
         .filter(|output| output.status.success())?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
-        .find_map(|line| line.split_once("REG_SZ").map(|(_, value)| value.trim().to_string()))
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 #[cfg(all(test, unix))]

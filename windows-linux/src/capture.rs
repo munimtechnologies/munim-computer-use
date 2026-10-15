@@ -155,6 +155,45 @@ pub struct Capture {
     pub frame: CaptureFrame,
     pub pixel_width: u32,
     pub pixel_height: u32,
+    /// The one colour every pixel has, when the capture is a single flat fill.
+    pub solid: Option<[u8; 3]>,
+}
+
+/// The text every screenshot/zoom result carries: the mapping line, after a
+/// warning when the capture has nothing in it.
+pub fn caption(capture: &Capture, label: &str) -> String {
+    let mapping = mapping_text(capture, label);
+    match solid_note(capture) {
+        Some(note) => format!("{note}
+
+{mapping}"),
+        None => mapping,
+    }
+}
+
+/// A window or display that really is one flat colour is rare; a capture the
+/// OS withheld (a sandboxed process, another desktop, a locked screen, a
+/// window protected from capture) comes back exactly like this, without an
+/// error, and looks to the model like an app that failed to draw.
+fn solid_note(capture: &Capture) -> Option<String> {
+    let [r, g, b] = capture.solid?;
+    let colour = if [r, g, b] == [0, 0, 0] {
+        "entirely black".to_string()
+    } else {
+        format!("a single flat colour (#{r:02x}{g:02x}{b:02x})")
+    };
+    let why = crate::platform::desktop_access_warning().unwrap_or_else(|| {
+        "the window may be protected from capture (DRM video, some password managers) or not drawn yet,          or the screen may be locked or asleep. Use get_app_state to read it instead"
+            .to_string()
+    });
+    Some(format!("warning: this capture is {colour}, which usually means the pixels were withheld, not drawn: {why}"))
+}
+
+fn solid_colour(image: &RgbaImage) -> Option<[u8; 3]> {
+    let mut pixels = image.pixels();
+    let first = pixels.next()?;
+    let colour = [first[0], first[1], first[2]];
+    pixels.all(|pixel| pixel.0[..3] == colour).then_some(colour)
 }
 
 /// The mapping line every screenshot/zoom result carries. Screen coordinates on
@@ -183,7 +222,8 @@ pub(crate) fn finish(image: RgbaImage, frame: CaptureFrame, max_width: u32, form
         image
     };
     let (pixel_width, pixel_height) = (image.width(), image.height());
-    Ok(Capture { bytes: encode_image(image, 0, format)?, frame, pixel_width, pixel_height })
+    let solid = solid_colour(&image);
+    Ok(Capture { bytes: encode_image(image, 0, format)?, frame, pixel_width, pixel_height, solid })
 }
 
 pub fn capture_display(index: usize, max_width: u32, format: CaptureFormat) -> Result<Capture> {
@@ -385,11 +425,31 @@ mod tests {
             frame: super::CaptureFrame { x: 100.0, y: 50.0, width: 800.0, height: 600.0 },
             pixel_width: 400,
             pixel_height: 300,
+            solid: None,
         };
         let text = super::mapping_text(&capture, "window");
         assert!(text.contains("screen origin (100, 50)"), "{text}");
         assert!(text.contains("0.500 px per screen unit"), "{text}");
         assert!(text.contains("x = 100 + px / 0.500"), "{text}");
+    }
+
+    #[test]
+    fn a_flat_capture_is_flagged_and_a_drawn_one_is_not() {
+        let black = super::finish(RgbaImage::new(40, 30), frame(), 0, CaptureFormat::Png).expect("captures");
+        assert_eq!(black.solid, Some([0, 0, 0]));
+        let text = super::caption(&black, "window");
+        assert!(text.starts_with("warning: this capture is entirely black"), "{text}");
+        assert!(text.contains("screen origin (0, 0)"), "{text}");
+
+        let mut drawn = RgbaImage::new(40, 30);
+        drawn.put_pixel(7, 9, image::Rgba([255, 255, 255, 255]));
+        let drawn = super::finish(drawn, frame(), 0, CaptureFormat::Png).expect("captures");
+        assert_eq!(drawn.solid, None);
+        assert!(!super::caption(&drawn, "window").contains("warning"));
+    }
+
+    fn frame() -> super::CaptureFrame {
+        super::CaptureFrame { x: 0.0, y: 0.0, width: 40.0, height: 30.0 }
     }
 
     #[test]

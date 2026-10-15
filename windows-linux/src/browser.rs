@@ -289,7 +289,8 @@ impl BrowserBridge {
         if !self.connected() {
             return Err(format!(
                 "browser_{command} needs the MT Desktop MCP Chrome extension, which is not connected. \
-                 Install it from chrome-extension, or use the desktop tools instead: \
+                 Install it from chrome-extension; if it is installed, `munim-computer-use check-native-host` \
+                 in the user's own terminal shows which step Chrome fails at. Or use the desktop tools instead: \
                  get_app_state on the browser window, then click"
             ));
         }

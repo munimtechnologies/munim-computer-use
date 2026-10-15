@@ -19,6 +19,8 @@ mod ocr;
 #[cfg_attr(not(windows), allow(dead_code))]
 pub mod outline;
 #[cfg(windows)]
+pub mod session;
+#[cfg(windows)]
 mod user_keys;
 #[cfg(windows)]
 pub mod windows;
@@ -46,6 +48,19 @@ impl DesktopError {
 }
 
 pub type Result<T> = std::result::Result<T, DesktopError>;
+
+/// Why this process may not see the signed-in user's desktop, when its token
+/// or desktop says so; attached to results that came back empty or black.
+pub fn desktop_access_warning() -> Option<String> {
+    #[cfg(windows)]
+    {
+        session::desktop_warning()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
 
 /// Where a pointer action should land.
 #[derive(Debug, Clone, Copy)]
