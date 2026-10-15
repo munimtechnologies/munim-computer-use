@@ -513,7 +513,11 @@ struct FocusLoan {
         // Posted keys are handled after they are posted; let the app finish
         // them while it still has focus.
         usleep(useconds_t(min(60 + keys * 2, 1500)) * 1000)
-        if menuOpen(in: pid) { return }
+        // A click's menu opens a moment after the click, so look a few times.
+        for attempt in 0..<(keys == 0 ? 8 : 1) {
+            if attempt > 0 { usleep(15_000) }
+            if menuOpen(in: pid) { return }
+        }
         var psn = ProcessSerialNumber()
         guard forPID(pid, &psn) == 0 else { return }
         var target = [UInt8](repeating: 0, count: 8)
@@ -524,16 +528,15 @@ struct FocusLoan {
     }
 }
 
-/// Whether the app has a menu open (a context, pop-up or menu-bar menu).
+/// Whether the app has a menu open. Context, pop-up and menu-bar menus are
+/// all windows at the pop-up menu level, whichever element owns them (a
+/// context menu sits under the text area it was opened on, for one).
 func menuOpen(in pid: pid_t) -> Bool {
-    let app = AXUIElementCreateApplication(pid)
-    if let focused = axElement(app, kAXFocusedUIElementAttribute as String),
-       let role = axCopy(focused, kAXRoleAttribute as String) as? String,
-       role == "AXMenu" || role == "AXMenuItem" {
-        return true
+    let menuLevel = Int(CGWindowLevelForKey(.popUpMenuWindow))
+    let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+    return windows.contains {
+        ($0[kCGWindowOwnerPID as String] as? pid_t) == pid && ($0[kCGWindowLayer as String] as? Int) == menuLevel
     }
-    let children = (axCopy(app, kAXChildrenAttribute as String) as? [AXUIElement]) ?? []
-    return children.contains { (axCopy($0, kAXRoleAttribute as String) as? String) == "AXMenu" }
 }
 
 /// Wait until the user has stopped typing (no modifier held, no key for
