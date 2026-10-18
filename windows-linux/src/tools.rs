@@ -275,6 +275,10 @@ fn all_tool_defs() -> Value {
                     "app": {
                         "type": "string",
                         "description": "App name, bundle id, or pid exactly as reported by list_apps"
+                    },
+                    "window_id": {
+                        "type": "integer",
+                        "description": "Windows only: bring this one window forward instead of the app's frontmost window, for an app with several windows such as Chrome. Use the window_id from a get_app_state window line; it must belong to app. The result names the window in front afterwards."
                     }
                 },
                 "required": ["app"]

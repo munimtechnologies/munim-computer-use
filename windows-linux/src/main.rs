@@ -83,6 +83,10 @@ fn main() {
     // (server, native host, history recorder) runs under the same identity.
     let args = identity::init_from_args(std::env::args().collect());
     let mode = args.get(1).map(String::as_str);
+    // Before any window exists: screenshots and clicks must share one
+    // coordinate space at every display scale.
+    #[cfg(windows)]
+    platform::windows::use_physical_pixels();
 
     // Chrome spawns this same binary as its native messaging host; in that mode
     // the process is a relay, not a server.
@@ -723,7 +727,15 @@ fn run_desktop_tool(
                 .ok_or_else(|| DesktopError::new("missing required argument 'app'"))?;
             let app = resolve_app_query(app)?;
             check_app_policy(desktop, &app)?;
-            desktop.activate_app(&app)?
+            match args.get("window_id").filter(|value| !value.is_null()) {
+                None => desktop.activate_app(&app)?,
+                Some(value) => {
+                    let id = value.as_u64().ok_or_else(|| {
+                        DesktopError::new("window_id must be the number after window_id= on a get_app_state window line")
+                    })?;
+                    desktop.activate_window(&app, id)?
+                }
+            }
         }
         "click" => {
             let count = arg_i64(args, "click_count").unwrap_or(1).clamp(1, 3) as u32;
@@ -897,6 +909,20 @@ mod tests {
         assert!(filtered.contains("[e2] Text \"Get Lucky\""), "{filtered}");
         assert!(filtered.contains("1 matching element"), "{filtered}");
         assert!(!filtered.contains("[e1]") && !filtered.contains("[e3]"), "{filtered}");
+    }
+
+    // #33: window_id routes to activate_window, which only Windows implements.
+    #[test]
+    fn activate_app_with_a_window_id_targets_that_window() {
+        let mut desktop = FakeDesktop::default();
+        let error = super::run_desktop_tool("activate_app", &json!({ "app": "Fake", "window_id": "front" }), &mut desktop)
+            .unwrap_err();
+        assert!(error.0.contains("window_id must be the number"), "{}", error.0);
+        let error = super::run_desktop_tool("activate_app", &json!({ "app": "Fake", "window_id": 4242 }), &mut desktop)
+            .unwrap_err();
+        assert!(error.0.contains("Windows only"), "the trait default answers here: {}", error.0);
+        let plain = super::run_desktop_tool("activate_app", &json!({ "app": "Fake", "window_id": null }), &mut desktop).unwrap();
+        assert_eq!(text_of(&plain), "activated");
     }
 
     #[test]

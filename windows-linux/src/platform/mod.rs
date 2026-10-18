@@ -67,7 +67,8 @@ pub fn desktop_access_warning() -> Option<String> {
 pub enum Point {
     /// An element from the most recent `get_app_state` snapshot.
     Element(u32),
-    /// Absolute screen coordinates in logical pixels.
+    /// Absolute screen coordinates: physical pixels on Windows and X11, the
+    /// space screenshot and zoom report their frames in.
     Screen(f64, f64),
 }
 
@@ -252,6 +253,14 @@ pub trait Desktop {
     fn list_apps(&mut self) -> Result<String>;
     fn get_app_state(&mut self, app: &str, options: &StateOptions) -> Result<String>;
     fn activate_app(&mut self, app: &str) -> Result<String>;
+    /// Bring one specific window of `app` forward: `activate_app` with a
+    /// `window_id` from get_app_state. Only Windows lists window ids.
+    fn activate_window(&mut self, app: &str, window_id: u64) -> Result<String> {
+        let _ = (app, window_id);
+        Err(DesktopError::new(
+            "window_id is supported on Windows only — call activate_app with just the app",
+        ))
+    }
     fn click(&mut self, target: Point, click_count: u32) -> Result<String>;
     fn right_click(&mut self, target: Point) -> Result<String>;
     /// Park the pointer on a target without pressing, for hover-revealed UI.

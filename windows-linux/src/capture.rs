@@ -197,8 +197,9 @@ fn solid_colour(image: &RgbaImage) -> Option<[u8; 3]> {
 }
 
 /// The mapping line every screenshot/zoom result carries. Screen coordinates on
-/// Windows and X11 are the physical pixels `xcap` captures, so a full-size
-/// capture maps 1:1 and only downscaling changes the ratio.
+/// Windows and X11 are the physical pixels `xcap` captures (on Windows because
+/// the process is per-monitor DPI aware, see `use_physical_pixels`), so a
+/// full-size capture maps 1:1 and only downscaling changes the ratio.
 pub fn mapping_text(capture: &Capture, label: &str) -> String {
     let sx = f64::from(capture.pixel_width) / capture.frame.width.max(1.0);
     let sy = f64::from(capture.pixel_height) / capture.frame.height.max(1.0);

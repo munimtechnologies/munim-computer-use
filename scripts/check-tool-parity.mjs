@@ -11,6 +11,8 @@
 // Deliberate differences, and the only ones allowed:
 //   * get_app_state.window  — macOS only (scope to one window or the agent's
 //     Chrome window).
+//   * activate_app.window_id — Windows/Linux list only (Windows window handles,
+//     as listed on get_app_state's window lines).
 //
 // Usage: node scripts/check-tool-parity.mjs   (exit 1 on any mismatch)
 import { readFileSync } from "node:fs";
@@ -23,7 +25,7 @@ const rustPath = path.join(root, "windows-linux/src/tools.rs");
 
 const ALLOWED_EXTRAS = {
   swift: [["get_app_state", "window"]],
-  rust: [],
+  rust: [["activate_app", "window_id"]],
 };
 
 // ---------------------------------------------------------------- tokenizer

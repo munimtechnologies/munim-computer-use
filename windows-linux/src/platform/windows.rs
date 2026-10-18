@@ -17,9 +17,15 @@ use uiautomation::patterns::{
 };
 use uiautomation::types::{Handle, Point as UIPoint, ScrollAmount, TreeScope, UIProperty};
 use uiautomation::variants::Variant;
-use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::core::BOOL;
-use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::Graphics::Gdi::{
+    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, MonitorFromPoint, MonitorFromWindow, ScreenToClient,
+};
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI,
+    SetProcessDpiAwarenessContext,
+};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
@@ -29,7 +35,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     ChildWindowFromPointEx, CWP_SKIPDISABLED, CWP_SKIPINVISIBLE, EnumWindows, GW_OWNER, GetClassNameW,
-    GA_ROOT, GetAncestor, GetWindow, GetWindowLongW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
+    GA_ROOT, GA_ROOTOWNER, GetAncestor, GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindow,
+    IsWindowVisible,
     GetForegroundWindow, MSG, PM_NOREMOVE, PeekMessageW, PostMessageW, SMTO_ABORTIFHUNG, SW_RESTORE,
     SendMessageTimeoutW, WM_NULL,
     SetForegroundWindow, ShowWindow, WindowFromPoint, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL,
@@ -181,11 +189,34 @@ impl WindowsDesktop {
             Target::Element { minimized: true, .. } => return Err(outline::minimized_error(id)),
             Target::Element { element, window, .. } => {
                 let (x, y) = Self::center(element)?;
+                Self::check_on_screen(id, *window, x, y)?;
                 (x, y, *window)
             }
         };
         Self::check_uncovered(id, window, x, y)?;
         Ok((x, y))
+    }
+
+    /// A control can be listed with bounds far outside its window: an input
+    /// kept off screen on purpose (Google Docs' "Edit document" sits near
+    /// y = -9850), or content scrolled away and listed with offscreen. Pointer
+    /// input aimed there reaches whatever the clamped cursor lands on, so
+    /// refuse instead of reporting a click that never reached the control (#32).
+    fn check_on_screen(id: u32, window: HWND, x: f64, y: f64) -> Result<()> {
+        let mut rect = RECT::default();
+        let in_window = unsafe { GetWindowRect(window, &mut rect) }.is_ok()
+            && point_in_rect(x, y, &rect);
+        if in_window && on_display(x, y) {
+            return Ok(());
+        }
+        Err(DesktopError::new(format!(
+            "e{id} has no on-screen point to click: its centre ({x:.0}, {y:.0}) lies outside its window{}, so \
+             nothing was clicked and keyboard focus did not move. It is scrolled out of view or kept off screen \
+             on purpose (such as a hidden text input behind a canvas). Scroll it into view and call get_app_state \
+             again, click the visible content it belongs to, or reach it through accessibility: type_text or \
+             set_value with element_id focus the control itself",
+            if on_display(x, y) { "" } else { " and off every display" }
+        )))
     }
 
     /// A coordinate action reaches whatever window is on top at the point:
@@ -239,7 +270,10 @@ impl WindowsDesktop {
 
     fn point_coordinates(&self, target: Point) -> Result<(f64, f64)> {
         match target {
-            Point::Screen(x, y) => Ok((x, y)),
+            Point::Screen(x, y) => {
+                check_display_point(x, y)?;
+                Ok((x, y))
+            }
             Point::Element(id) => Self::target_point(id, &self.resolve(id)?),
         }
     }
@@ -474,6 +508,7 @@ impl WindowsDesktop {
         if !unsafe { ScreenToClient(hwnd, &mut client) }.as_bool() {
             return false;
         }
+        let client = message_point(hwnd, client);
         let lp = Self::pack_client_lparam(client.x, client.y);
         // MK_LBUTTON = 0x0001, MK_RBUTTON = 0x0002
         let (down, up, mk) = if right {
@@ -553,6 +588,7 @@ impl WindowsDesktop {
         if !unsafe { ScreenToClient(hwnd, &mut client) }.as_bool() {
             return false;
         }
+        let client = message_point(hwnd, client);
         let lp = Self::pack_client_lparam(client.x, client.y);
         unsafe { PostMessageW(Some(hwnd), WM_MOUSEMOVE, WPARAM(0), lp) }.is_ok()
     }
@@ -572,9 +608,10 @@ impl WindowsDesktop {
         }
         let client = |x: i32, y: i32| {
             let mut point = POINT { x, y };
-            unsafe { ScreenToClient(hwnd, &mut point) }
-                .as_bool()
-                .then(|| Self::pack_client_lparam(point.x, point.y))
+            unsafe { ScreenToClient(hwnd, &mut point) }.as_bool().then(|| {
+                let point = message_point(hwnd, point);
+                Self::pack_client_lparam(point.x, point.y)
+            })
         };
         let (Some(down_at), Some(up_at)) = (client(start.0, start.1), client(end.0, end.1)) else {
             return false;
@@ -1355,6 +1392,131 @@ fn bring_forward(window: HWND) -> bool {
     }
 }
 
+impl WindowsDesktop {
+    /// Bring `window` forward with keyboard focus, and say which window is in
+    /// front afterwards. `requested` is the window_id the caller asked for.
+    fn bring_window_forward(&mut self, app: &str, pid: u32, window: HWND, requested: Option<u64>) -> Result<String> {
+        // Only a minimized window needs restoring; SW_RESTORE on a maximized
+        // one would shrink it back to its normal size.
+        if unsafe { IsIconic(window) }.as_bool() {
+            unsafe {
+                let _ = ShowWindow(window, SW_RESTORE);
+            }
+        }
+        // Judged by what is in front afterwards, not by SetForegroundWindow's
+        // return value: a process that cannot reach the user's desktop is told
+        // yes and changes nothing. The window's own popup coming forward (an
+        // owned dialog taking activation) still counts; without a requested
+        // window, any window of the app does.
+        let raised = self.activate(window) || {
+            let front = unsafe { GetForegroundWindow() };
+            match requested {
+                Some(_) => (unsafe { GetAncestor(front, GA_ROOTOWNER) }) == window,
+                None => {
+                    let mut owner = 0u32;
+                    unsafe { GetWindowThreadProcessId(front, Some(&mut owner)) };
+                    owner == pid
+                }
+            }
+        };
+        let warning = super::desktop_access_warning();
+        if !raised {
+            // Windows refuses foreground changes from background processes in
+            // some states; say so rather than claim a success the model can see
+            // is false in the next screenshot.
+            return Err(DesktopError::new(match warning {
+                Some(warning) => format!("{app} did not come forward — {warning}"),
+                None => format!(
+                    "Windows refused to bring {app} forward — click its taskbar button, or try again \
+                     after interacting with the desktop"
+                ),
+            }));
+        }
+        self.input_window = Some(window.0 as isize);
+        // Name what is in front now, so focus-sensitive work (a global hotkey
+        // reading the foreground window) can be checked before it runs (#33).
+        let front = describe_window(unsafe { GetForegroundWindow() });
+        Ok(match warning {
+            Some(warning) => format!("activated {app} (pid {pid}); in front: {front}, but {warning}"),
+            None => format!("activated {app} (pid {pid}); in front: {front}"),
+        })
+    }
+}
+
+/// See every coordinate in physical pixels (#31). A process that is not DPI
+/// aware gets window, cursor and UI Automation coordinates scaled down by the
+/// display scale, while captures, and the DWM frame bounds xcap reports for
+/// them, stay physical: at 125% a point seen at screenshot pixel (600, 550)
+/// had to be clicked at (480, 440). Per-monitor awareness puts screenshots,
+/// element bounds, clicks and window lookups in one space. Call it before
+/// this process creates a window; it fails harmlessly if a manifest already
+/// set the awareness.
+pub fn use_physical_pixels() {
+    let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+}
+
+/// The point to put in a mouse message posted to `hwnd`, from its physical
+/// client coordinates. A window that is not per-monitor DPI aware reads mouse
+/// messages in its own scaled coordinates, which Windows converts real input
+/// into for it; posted messages are not converted, so do it here.
+fn message_point(hwnd: HWND, client: POINT) -> POINT {
+    let window_dpi = unsafe { GetDpiForWindow(hwnd) };
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let (mut dpi_x, mut dpi_y) = (0u32, 0u32);
+    if unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }.is_err() {
+        return client;
+    }
+    scale_point(client, window_dpi, dpi_x)
+}
+
+/// A window's id as get_app_state lists it and activate_app takes it: its
+/// handle, which stays the same for as long as the window exists.
+fn window_id(window: HWND) -> usize {
+    window.0 as usize
+}
+
+/// `"title" (window_id N)`, for results that say where focus or keys went.
+fn describe_window(window: HWND) -> String {
+    if window.0.is_null() {
+        return "no window".to_string();
+    }
+    let mut buffer = [0u16; 256];
+    let len = unsafe { GetWindowTextW(window, &mut buffer) }.max(0) as usize;
+    let title = String::from_utf16_lossy(&buffer[..len]);
+    format!("\"{}\" (window_id {})", truncate(&title, 80), window_id(window))
+}
+
+/// Whether a screen point is on an attached display. The real cursor is
+/// clamped to the screens, so a point off them would click somewhere else.
+fn on_display(x: f64, y: f64) -> bool {
+    let point = POINT { x: x.round() as i32, y: y.round() as i32 };
+    !unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONULL) }.is_invalid()
+}
+
+fn check_display_point(x: f64, y: f64) -> Result<()> {
+    if on_display(x, y) {
+        return Ok(());
+    }
+    Err(DesktopError::new(format!(
+        "({x:.0}, {y:.0}) is not on any display, so nothing was done. Take coordinates from a screenshot's \
+         mapping line or from list_displays, or act on an element id from get_app_state"
+    )))
+}
+
+/// Whether `(x, y)` lies inside `rect` (right and bottom edges excluded).
+fn point_in_rect(x: f64, y: f64, rect: &RECT) -> bool {
+    x >= f64::from(rect.left) && x < f64::from(rect.right) && y >= f64::from(rect.top) && y < f64::from(rect.bottom)
+}
+
+/// `point` scaled from `from_dpi` to `to_dpi`; unchanged when either is unknown.
+fn scale_point(point: POINT, to_dpi: u32, from_dpi: u32) -> POINT {
+    if to_dpi == 0 || from_dpi == 0 || to_dpi == from_dpi {
+        return point;
+    }
+    let scale = |value: i32| (f64::from(value) * f64::from(to_dpi) / f64::from(from_dpi)).round() as i32;
+    POINT { x: scale(point.x), y: scale(point.y) }
+}
+
 impl Desktop for WindowsDesktop {
     fn list_apps(&mut self) -> Result<String> {
         Ok(format_app_list(apps::list_apps()?))
@@ -1400,7 +1562,10 @@ impl Desktop for WindowsDesktop {
         for window in &windows {
             let Some(root) = self.window_node(window.hwnd) else { continue };
             let window = WindowInfo { title: root.name.clone(), ..window.clone() };
-            sections.push((format!("── window {}: \"{}\"", window.index, window.title), walk.rows.len()));
+            sections.push((
+                format!("── window {}: \"{}\"  window_id={}", window.index, window.title, window_id(window.hwnd)),
+                walk.rows.len(),
+            ));
             self.walk_root(&mut walk, &root, &window);
         }
 
@@ -1424,7 +1589,13 @@ impl Desktop for WindowsDesktop {
                     ocr_clip = root.bounds.filter(Bounds::has_area);
                 }
                 sections.push((
-                    format!("── window {}: \"{}\" — dialog \"{}\"", window.index, window.title, truncate(&root.name, 120)),
+                    format!(
+                        "── window {}: \"{}\"  window_id={} — dialog \"{}\"",
+                        window.index,
+                        window.title,
+                        window_id(window.hwnd),
+                        truncate(&root.name, 120)
+                    ),
                     walk.rows.len(),
                 ));
                 self.walk_root(&mut walk, &root, &window);
@@ -1500,44 +1671,35 @@ impl Desktop for WindowsDesktop {
     fn activate_app(&mut self, app: &str) -> Result<String> {
         let pid = apps::resolve_pid(app)?;
         let windows = Self::top_level_windows(pid);
-        let window = windows.first().ok_or_else(|| {
+        let window = *windows.first().ok_or_else(|| {
             DesktopError::new(format!("{app} (pid {pid}) has no window to activate"))
         })?;
-        unsafe {
-            let _ = ShowWindow(*window, SW_RESTORE);
+        self.bring_window_forward(app, pid, window, None)
+    }
+
+    fn activate_window(&mut self, app: &str, id: u64) -> Result<String> {
+        let pid = apps::resolve_pid(app)?;
+        let window = HWND(id as usize as *mut _);
+        let mut owner = 0u32;
+        let open = unsafe { IsWindow(Some(window)) }.as_bool()
+            && unsafe { IsWindowVisible(window) }.as_bool()
+            && {
+                unsafe { GetWindowThreadProcessId(window, Some(&mut owner)) };
+                owner == pid
+            };
+        if !open {
+            return Err(DesktopError::new(format!(
+                "window_id {id} is not an open window of {app} (pid {pid}) — call get_app_state on {app} to see \
+                 its windows and their window_id"
+            )));
         }
-        // Judged by what is in front afterwards, not by SetForegroundWindow's
-        // return value: a process that cannot reach the user's desktop is told
-        // yes and changes nothing. The app's own popup coming forward (an
-        // owned dialog taking activation) still counts.
-        let raised = self.activate(*window) || {
-            let mut front = 0u32;
-            unsafe { GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut front)) };
-            front == pid
-        };
-        let warning = super::desktop_access_warning();
-        if !raised {
-            // Windows refuses foreground changes from background processes in
-            // some states; say so rather than claim a success the model can see
-            // is false in the next screenshot.
-            return Err(DesktopError::new(match warning {
-                Some(warning) => format!("{app} did not come forward — {warning}"),
-                None => format!(
-                    "Windows refused to bring {app} forward — click its taskbar button, or try again \
-                     after interacting with the desktop"
-                ),
-            }));
-        }
-        self.input_window = Some(window.0 as isize);
-        Ok(match warning {
-            Some(warning) => format!("activated {app} (pid {pid}), but {warning}"),
-            None => format!("activated {app} (pid {pid})"),
-        })
+        self.bring_window_forward(app, pid, window, Some(id))
     }
 
     fn click(&mut self, target: Point, click_count: u32) -> Result<String> {
         let (x, y) = match target {
             Point::Screen(x, y) => {
+                check_display_point(x, y)?;
                 self.input_window = Self::root_at(x, y).map(|root| root.0 as isize);
                 (x, y)
             }
@@ -1692,33 +1854,34 @@ impl Desktop for WindowsDesktop {
             }
         }
         let lent = self.borrow_foreground(window, previous)?;
+        let receiving = unsafe { GetForegroundWindow() };
         let sent = send_inputs(&text_inputs(text));
         if let Some(lent) = lent {
             self.give_foreground_back(lent, text.chars().count());
         }
         sent?;
-        Ok(format!("typed {} characters", text.chars().count()))
+        Ok(format!("typed {} characters into {}", text.chars().count(), describe_window(receiving)))
     }
 
     fn press_key(&mut self, key: &str, modifiers: &[String]) -> Result<String> {
         let plan = key_plan(key, modifiers, layout_vk)?;
-        if identity::remote_control() {
+        let receiving = if identity::remote_control() {
             send_key_plan(&plan)?;
+            unsafe { GetForegroundWindow() }
         } else {
             super::user_keys::wait_for_pause();
             let previous = unsafe { GetForegroundWindow() };
             let lent = self.borrow_foreground(self.input_window.map(|raw| HWND(raw as *mut _)), previous)?;
+            let receiving = unsafe { GetForegroundWindow() };
             let sent = send_key_plan(&plan);
             if let Some(lent) = lent {
                 self.give_foreground_back(lent, 1);
             }
             sent?;
-        }
-        Ok(if modifiers.is_empty() {
-            format!("pressed {key}")
-        } else {
-            format!("pressed {}+{key}", modifiers.join("+"))
-        })
+            receiving
+        };
+        let combo = if modifiers.is_empty() { key.to_string() } else { format!("{}+{key}", modifiers.join("+")) };
+        Ok(format!("pressed {combo} in {}", describe_window(receiving)))
     }
 
     fn scroll(
@@ -1832,7 +1995,29 @@ impl Desktop for WindowsDesktop {
 
 #[cfg(test)]
 mod tests {
-    use super::{KeyPlan, Stroke, is_app_control, key_plan, text_inputs, truncate};
+    use super::{KeyPlan, Stroke, is_app_control, key_plan, on_display, point_in_rect, scale_point, text_inputs, truncate};
+    use windows::Win32::Foundation::{POINT, RECT};
+
+    // #32: the Docs input parked far above its window is not a click target.
+    #[test]
+    fn a_centre_outside_the_window_or_every_display_is_not_clickable() {
+        let window = RECT { left: 0, top: 0, right: 1920, bottom: 1040 };
+        assert!(point_in_rect(592.0, 400.0, &window));
+        assert!(!point_in_rect(592.0, -9850.0, &window));
+        assert!(!point_in_rect(1920.0, 10.0, &window), "the right edge is outside");
+        assert!(!on_display(592.0, -9850.0));
+    }
+
+    // #31: a DPI-unaware window at 125% reads physical (600, 550) as (480, 440).
+    #[test]
+    fn posted_points_follow_the_target_windows_dpi() {
+        let scaled = scale_point(POINT { x: 600, y: 550 }, 96, 120);
+        assert_eq!((scaled.x, scaled.y), (480, 440));
+        let same = scale_point(POINT { x: 600, y: 550 }, 120, 120);
+        assert_eq!((same.x, same.y), (600, 550), "a per-monitor aware window takes physical pixels");
+        let unknown = scale_point(POINT { x: 7, y: 9 }, 0, 120);
+        assert_eq!((unknown.x, unknown.y), (7, 9));
+    }
 
     #[test]
     fn text_inputs_are_literal_and_break_lines_with_return() {
