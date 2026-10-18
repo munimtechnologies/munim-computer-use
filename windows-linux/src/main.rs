@@ -517,11 +517,19 @@ fn wait_seconds(args: &Value) -> Result<String, DesktopError> {
     ))
 }
 
-/// Narrow an accessibility outline to the lines that mention `query`. Element ids
-/// stay valid — the backend registered every element while walking; only the
-/// printout is filtered. Section headers (`── window`, `── on-screen text`) and
-/// the off-screen count are kept for context.
-fn filter_app_state(outline: &str, query: &str) -> String {
+/// How many elements a read with a `query` may walk. The query narrows what is
+/// printed, not what is read: walking only `max_elements` and then filtering
+/// would miss every match past the cap and still report "no match" (#30).
+/// `max_elements` caps the matches printed instead.
+const QUERY_WALK_ELEMENTS: usize = 5000;
+
+/// Narrow an accessibility outline to the lines that mention `query`, printing
+/// at most `limit` of them. Element ids stay valid — the backend registered
+/// every element while walking; only the printout is filtered. Section headers
+/// (`── window`, `── on-screen text`) and the off-screen count are kept for
+/// context. A walk that stopped at its element budget is reported as an
+/// incomplete search, never as a definitive empty result.
+fn filter_app_state(outline: &str, query: &str, limit: usize) -> String {
     let needle = query.trim().to_lowercase();
     if needle.is_empty() {
         return outline.to_string();
@@ -536,24 +544,52 @@ fn filter_app_state(outline: &str, query: &str) -> String {
         header.push(line);
     }
     let body: Vec<&str> = lines.collect();
-    let context = |line: &str| line.starts_with("── ") || line.starts_with("… ");
-    let matching: Vec<&str> = body
-        .iter()
-        .copied()
-        .filter(|line| context(line) || line.to_lowercase().contains(&needle))
-        .collect();
-    let count = matching.iter().filter(|line| !context(line)).count();
+    // The budget marker is indented to the depth the walk stopped at.
+    let budget_marker = |line: &str| line.trim_start().starts_with("… truncated at ");
+    let context = |line: &str| line.starts_with("── ") || (line.starts_with("… ") && !budget_marker(line));
+    let incomplete = body.iter().any(|line| budget_marker(line));
+    let skipped_offscreen = body.iter().any(|line| line.starts_with("… ") && line.contains("off-screen"));
+
+    let mut count = 0;
+    let mut shown: Vec<&str> = Vec::new();
+    for line in body.iter().copied() {
+        if context(line) {
+            shown.push(line);
+        } else if !budget_marker(line) && line.to_lowercase().contains(&needle) {
+            count += 1;
+            if count <= limit {
+                shown.push(line);
+            }
+        }
+    }
+
     let mut out = header.join("\n");
     out.push_str(&format!(
         "\nfilter: \"{}\" — {count} matching element{}",
         query.trim(),
         if count == 1 { "" } else { "s" }
     ));
+    if count > limit {
+        out.push_str(&format!(", showing the first {limit}; raise max_elements to see the rest"));
+    }
+    if incomplete {
+        out.push_str(&format!(
+            "\nnote: the read stopped at {QUERY_WALK_ELEMENTS} elements before the end of the app, so elements past \
+             that point were not searched; read a smaller part of it (a dialog, or after closing other windows) to search the rest"
+        ));
+    }
     if count == 0 {
-        out.push_str("\n\n(no elements match; drop the query or scroll the content into view)");
+        out.push_str(if incomplete {
+            "\n\n(no match among the elements read; the search is incomplete, so this does not mean the control is absent)"
+        } else if skipped_offscreen {
+            "\n\n(no on-screen element matches; off-screen elements were not searched: pass offscreen=true to include them, \
+             or scroll the content into view)"
+        } else {
+            "\n\n(no elements match; drop the query or scroll the content into view)"
+        });
     } else {
         out.push_str("\n\n");
-        out.push_str(&matching.join("\n"));
+        out.push_str(&shown.join("\n"));
     }
     out
 }
@@ -613,12 +649,17 @@ fn read_app_state(
     options: StateOptions,
     query: Option<&str>,
 ) -> Result<String, DesktopError> {
-    let outline = desktop.get_app_state(app, &options)?;
+    let query = query.filter(|query| !query.trim().is_empty());
+    let walk = match query {
+        Some(_) => StateOptions { max_elements: QUERY_WALK_ELEMENTS, ..options },
+        None => options,
+    };
+    let outline = desktop.get_app_state(app, &walk)?;
     *LAST_READ.lock().unwrap_or_else(|poison| poison.into_inner()) =
         Some(LastRead { app: app.to_string(), options });
     Ok(match query {
-        Some(query) if !query.trim().is_empty() => filter_app_state(&outline, query),
-        _ => outline,
+        Some(query) => filter_app_state(&outline, query, options.max_elements),
+        None => outline,
     })
 }
 
@@ -838,7 +879,7 @@ mod tests {
     #[test]
     fn app_state_filter_keeps_header_and_matching_rows() {
         let outline = "Finder [com.apple.finder] pid=1 frontmost=true windows=1\n\n── window 0: \"Docs\"\n  [e1] Button \"Save\"\n  [e2] Button \"Cancel\"\n       StaticText \"hello\"";
-        let filtered = super::filter_app_state(outline, "save");
+        let filtered = super::filter_app_state(outline, "save", 800);
         assert!(filtered.starts_with("Finder [com.apple.finder]"), "{filtered}");
         assert!(filtered.contains("filter: \"save\" — 1 matching element"), "{filtered}");
         assert!(filtered.contains("[e1] Button \"Save\""), "{filtered}");
@@ -849,7 +890,7 @@ mod tests {
     #[test]
     fn app_state_filter_keeps_section_headers_and_the_offscreen_count() {
         let outline = "App (pid 1), 1 window(s)\nnote: a dialog is open — only its controls are listed; dismiss it (for example with Escape) to reach the window behind\n\n── window 0: \"Main\"\n  [e1] Button \"Play\"\n… 12 off-screen elements skipped; scroll, or pass offscreen=true to list them\n\n── on-screen text (OCR)\n  [e2] Text \"Get Lucky\"\n  [e3] Text \"Daft Punk\"";
-        let filtered = super::filter_app_state(outline, "lucky");
+        let filtered = super::filter_app_state(outline, "lucky", 800);
         assert!(filtered.contains("note: a dialog is open"), "{filtered}");
         assert!(filtered.contains("── on-screen text (OCR)"), "{filtered}");
         assert!(filtered.contains("… 12 off-screen elements skipped"), "{filtered}");
@@ -868,9 +909,51 @@ mod tests {
 
     #[test]
     fn app_state_filter_reports_no_matches() {
-        let filtered = super::filter_app_state("App\n\n  [e1] Button \"Go\"", "zzz");
+        let filtered = super::filter_app_state("App\n\n  [e1] Button \"Go\"", "zzz", 800);
         assert!(filtered.contains("0 matching elements"), "{filtered}");
         assert!(filtered.contains("no elements match"), "{filtered}");
+    }
+
+    #[test]
+    fn app_state_filter_prints_at_most_the_limit_and_says_so() {
+        let outline = "App\n\n── window 0: \"Main\"\n  [e1] Button \"Update A\"\n  [e2] Button \"Update B\"\n  [e3] Button \"Update C\"";
+        let filtered = super::filter_app_state(outline, "update", 2);
+        assert!(filtered.contains("3 matching elements, showing the first 2; raise max_elements"), "{filtered}");
+        assert!(filtered.contains("[e1]") && filtered.contains("[e2]") && !filtered.contains("[e3]"), "{filtered}");
+    }
+
+    #[test]
+    fn app_state_filter_never_reports_a_cut_short_walk_as_definitively_empty() {
+        let outline = "App\n\n── window 0: \"Main\"\n  [e1] Button \"Check\"\n      … truncated at 5000 elements — raise max_elements or target a child";
+        let filtered = super::filter_app_state(outline, "failed", 10);
+        assert!(filtered.contains("0 matching elements"), "{filtered}");
+        assert!(filtered.contains("not searched"), "{filtered}");
+        assert!(filtered.contains("does not mean the control is absent"), "{filtered}");
+        assert!(!filtered.contains("raise max_elements or target a child"), "the budget marker is summarised: {filtered}");
+    }
+
+    #[test]
+    fn app_state_filter_points_at_offscreen_when_nothing_on_screen_matches() {
+        let outline = "App\n\n── window 0: \"Main\"\n  [e1] Button \"Play\"\n… 4 off-screen elements skipped; scroll, or pass offscreen=true to list them";
+        let filtered = super::filter_app_state(outline, "restart", 10);
+        assert!(filtered.contains("pass offscreen=true to include them"), "{filtered}");
+    }
+
+    // #30: a query must search past max_elements, which only caps the printout.
+    #[test]
+    fn a_query_reads_past_max_elements_and_caps_only_the_matches() {
+        let mut desktop = FakeDesktop::default();
+        let result = super::run_desktop_tool(
+            "get_app_state",
+            &json!({ "app": "Fake", "query": "save", "max_elements": 15 }),
+            &mut desktop,
+        )
+        .unwrap();
+        assert_eq!(desktop.walked, super::QUERY_WALK_ELEMENTS);
+        assert!(text_of(&result).contains("[e1] Button \"Save\""), "{}", text_of(&result));
+
+        super::run_desktop_tool("get_app_state", &json!({ "app": "Fake", "max_elements": 15 }), &mut desktop).unwrap();
+        assert_eq!(desktop.walked, 15, "an unfiltered read keeps the caller's budget");
     }
 
     #[test]
@@ -904,14 +987,17 @@ mod tests {
     #[derive(Default)]
     struct FakeDesktop {
         reads: usize,
+        /// max_elements of the latest read.
+        walked: usize,
     }
 
     impl crate::platform::Desktop for FakeDesktop {
         fn list_apps(&mut self) -> crate::platform::Result<String> {
             Ok("Fake  [fake]  pid=1  windows=1  FRONTMOST".into())
         }
-        fn get_app_state(&mut self, app: &str, _: &crate::platform::StateOptions) -> crate::platform::Result<String> {
+        fn get_app_state(&mut self, app: &str, options: &crate::platform::StateOptions) -> crate::platform::Result<String> {
             self.reads += 1;
+            self.walked = options.max_elements;
             Ok(format!("{app} [fake] pid=1\n\n── window 0: \"Main\"\n  [e1] Button \"Save\"\n  [e2] Button \"Cancel {}\"", self.reads))
         }
         fn activate_app(&mut self, _: &str) -> crate::platform::Result<String> { Ok("activated".into()) }

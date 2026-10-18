@@ -28,7 +28,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use interprocess::local_socket::{ListenerOptions, SendHalf, Stream};
 #[cfg(unix)]
@@ -133,7 +133,59 @@ fn bridge_pipe_name() -> String {
     crate::identity::get().bridge_pipe_name()
 }
 
-type Waiter = SyncSender<Result<Value, String>>;
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Why a browser call got no answer from the extension.
+#[derive(Debug)]
+enum CallError {
+    /// The extension answered with an error (no such tab, a blocked site, ...).
+    Extension(String),
+    /// Nothing answered in time.
+    Timeout(String),
+    /// A link on the way to Chrome is down.
+    Link(Link),
+}
+
+/// The links a browser call crosses: a peer MCP server ─rpc─▶ the bridge owner
+/// ─local socket─▶ Chrome's native host ─stdio─▶ the extension. Each variant
+/// names the one that failed, so the error can say what to do about it (#28).
+#[derive(Debug, Clone, PartialEq)]
+enum Link {
+    /// This server owns the bridge, but no native host is connected to it.
+    NoHost,
+    /// The native host disconnected while the call was waiting.
+    HostDropped,
+    /// Writing the request failed (to the native host, or to the owner).
+    WriteFailed(String),
+    /// This server is a peer and its connection to the owner closed.
+    OwnerGone,
+    /// This server is a peer and the owner could not reach Chrome: the owner's
+    /// own account, with its pid and version when it is new enough to send them.
+    Owner { kind: String, pid: Option<u64>, version: Option<String>, detail: String },
+}
+
+impl Link {
+    /// Wire name, sent to peers along with an owner's link errors.
+    fn kind(&self) -> &str {
+        match self {
+            Link::NoHost => "no_host",
+            Link::HostDropped => "host_dropped",
+            Link::WriteFailed(_) => "write_failed",
+            Link::OwnerGone => "owner_gone",
+            Link::Owner { kind, .. } => kind,
+        }
+    }
+}
+
+type Waiter = SyncSender<Result<Value, CallError>>;
+
+/// Native host connections an owner has accepted, for error messages.
+#[derive(Default)]
+struct HostHistory {
+    connections: u32,
+    /// When the latest one connected or disconnected.
+    changed_at: Option<Instant>,
+}
 
 /// State shared by the MCP thread and the bridge threads. A process is either
 /// the owner (it holds the native host connection and serves peers over RPC)
@@ -149,6 +201,9 @@ struct Hub {
     rpc: Mutex<Option<SendHalf>>,
     rpc_pending: Mutex<HashMap<u64, Waiter>>,
     next_id: AtomicU64,
+    /// Owner: when this process took the bridge.
+    owned_since: Mutex<Option<Instant>>,
+    host: Mutex<HostHistory>,
 }
 
 impl Hub {
@@ -159,6 +214,8 @@ impl Hub {
             rpc: Mutex::new(None),
             rpc_pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
+            owned_since: Mutex::new(None),
+            host: Mutex::new(HostHistory::default()),
         })
     }
 
@@ -167,18 +224,18 @@ impl Hub {
             || self.extension.lock().is_ok_and(|guard| guard.is_some())
     }
 
-    fn call(&self, command: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+    fn call(&self, command: &str, params: Value, timeout: Duration) -> Result<Value, CallError> {
         if self.rpc.lock().is_ok_and(|guard| guard.is_some()) {
             // The owner applies its own timeout first; wait a little longer so
             // its error, which says what actually went wrong, reaches us.
             return self.send(&self.rpc, &self.rpc_pending, command, params, timeout + Duration::from_secs(5),
-                "disconnected from the desktop browser bridge");
+                Link::OwnerGone);
         }
         self.direct_call(command, params, timeout)
     }
 
-    fn direct_call(&self, command: &str, params: Value, timeout: Duration) -> Result<Value, String> {
-        self.send(&self.extension, &self.pending, command, params, timeout, "the extension disconnected")
+    fn direct_call(&self, command: &str, params: Value, timeout: Duration) -> Result<Value, CallError> {
+        self.send(&self.extension, &self.pending, command, params, timeout, Link::NoHost)
     }
 
     /// Write one request to `writer` and wait for the reply routed to its id.
@@ -191,8 +248,8 @@ impl Hub {
         command: &str,
         params: Value,
         timeout: Duration,
-        gone: &str,
-    ) -> Result<Value, String> {
+        gone: Link,
+    ) -> Result<Value, CallError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (waiter, reply) = sync_channel(1);
         lock(pending).insert(id, waiter);
@@ -200,23 +257,157 @@ impl Hub {
         let written = {
             let mut guard = lock(writer);
             match guard.as_mut() {
-                None => Err(gone.to_string()),
+                None => Err(gone),
                 Some(stream) => writeln!(stream, "{request}")
                     .and_then(|()| stream.flush())
-                    .map_err(|error| format!("could not reach the extension: {error}")),
+                    .map_err(|error| Link::WriteFailed(error.to_string())),
             }
         };
-        if let Err(error) = written {
+        if let Err(link) = written {
             lock(pending).remove(&id);
-            return Err(error);
+            return Err(CallError::Link(link));
         }
         match reply.recv_timeout(timeout) {
             Ok(outcome) => outcome,
             Err(_) => {
                 lock(pending).remove(&id);
-                Err(format!("browser_{command} timed out waiting for the extension"))
+                Err(CallError::Timeout(format!("browser_{command} timed out waiting for the extension")))
             }
         }
+    }
+
+    fn owns_bridge(&self) -> bool {
+        lock(&self.owned_since).is_some()
+    }
+
+    /// What the owner knows about its native host connections.
+    fn host_history(&self) -> String {
+        let since = lock(&self.owned_since).map(|at| ago(at.elapsed())).unwrap_or_else(|| "?".into());
+        let host = lock(&self.host);
+        match (host.connections, host.changed_at) {
+            (0, _) | (_, None) => format!("none has connected since it took the bridge {since} ago"),
+            (count, Some(at)) => format!(
+                "the last one disconnected {} ago, after {count} connection{} since it took the bridge {since} ago",
+                ago(at.elapsed()),
+                if count == 1 { "" } else { "s" }
+            ),
+        }
+    }
+
+    /// An owner's account of a link error, sent to the peer whose call it was.
+    fn owner_detail(&self, link: &Link) -> String {
+        match link {
+            Link::NoHost => format!("Chrome's native host is not connected to it — {}", self.host_history()),
+            Link::HostDropped => "Chrome's native host disconnected from it while the call was waiting".into(),
+            Link::WriteFailed(error) => format!("it could not write to Chrome's native host: {error}"),
+            Link::OwnerGone | Link::Owner { .. } => format!("{link:?}"),
+        }
+    }
+
+    /// The tool error for a failed browser call. Extension errors pass through;
+    /// a link error says which link broke, who holds it, and what to do next.
+    fn explain(&self, command: &str, args: &Value, error: CallError) -> String {
+        let link = match error {
+            CallError::Extension(message) | CallError::Timeout(message) => return message,
+            CallError::Link(link) => link,
+        };
+        let me = std::process::id();
+        let (what, next) = match &link {
+            Link::NoHost if self.owns_bridge() => (
+                format!(
+                    "this MCP server (pid {me}) owns the browser bridge, but Chrome's native host is not connected \
+                     to it — {}",
+                    self.host_history()
+                ),
+                format!(
+                    "if the MT Desktop MCP Chrome extension is installed and enabled, Chrome reconnects within a \
+                     minute on its own, and reloading it at chrome://extensions reconnects at once; if it is not \
+                     installed, install it from chrome-extension. {CHECK_HOST}. {DESKTOP_MEANWHILE}"
+                ),
+            ),
+            Link::NoHost => (
+                format!(
+                    "this MCP server (pid {me}) has not joined the browser bridge yet: another MCP server is taking \
+                     it, or one from an older build holds it without sharing it"
+                ),
+                format!("retry in a few seconds. If it persists, {CHECK_HOST}. {DESKTOP_MEANWHILE}"),
+            ),
+            Link::HostDropped => (
+                format!(
+                    "Chrome's native host disconnected from this MCP server (pid {me}), which owns the browser \
+                     bridge, while the call was waiting (the extension was reloaded or updated, or Chrome stopped \
+                     the host)"
+                ),
+                format!("{RETRY_ONCE}. If it keeps failing, {CHECK_HOST}"),
+            ),
+            Link::WriteFailed(error) => (
+                format!("this MCP server (pid {me}) could not pass the call on toward Chrome: {error}"),
+                format!("{RETRY_ONCE}. If it keeps failing, {CHECK_HOST}"),
+            ),
+            Link::OwnerGone => (
+                format!(
+                    "this MCP server (pid {me}) reaches Chrome through another MCP server that owned the browser \
+                     bridge, and that server exited"
+                ),
+                format!(
+                    "this server takes over the bridge within a couple of seconds and the extension reconnects to \
+                     it within seconds more, so {RETRY_ONCE}"
+                ),
+            ),
+            Link::Owner { kind, pid, version, detail } => {
+                let owner = pid.map_or_else(|| "another MCP server".to_string(), |pid| format!("pid {pid}"));
+                let build = match version {
+                    Some(version) if version != VERSION => {
+                        format!(", munim-computer-use {version} while this server is {VERSION}")
+                    }
+                    _ => String::new(),
+                };
+                let what = format!(
+                    "this MCP server (pid {me}) reaches Chrome through the browser bridge owner ({owner}{build}), \
+                     which reports: {detail}"
+                );
+                let stale = format!(
+                    "the bridge owner has no connection from Chrome. If {owner} is a stale MCP server, one from \
+                     another build, or one running in a sandbox Chrome cannot reach, ending it lets a working \
+                     server take over the bridge; otherwise reload the extension at chrome://extensions. \
+                     {CHECK_HOST}. {DESKTOP_MEANWHILE}"
+                );
+                let next = match kind.as_str() {
+                    "no_host" => stale,
+                    // An owner too old to say which link failed.
+                    "unknown" => format!("retry once. If it fails the same way, {stale}"),
+                    _ => format!("{RETRY_ONCE}. If it keeps failing, {CHECK_HOST}"),
+                };
+                (what, next)
+            }
+        };
+        let mut message = format!("browser_{command} could not reach Chrome: {what}.");
+        if let Some(session) = args.get("session_id").and_then(Value::as_str) {
+            message.push_str(&format!(
+                "\nsession_id \"{session}\" is not the cause: a session only keeps its own tabs, and every session \
+                 of every MCP server on this computer shares the one extension connection."
+            ));
+        }
+        message.push_str(&format!("\nnext: {next}."));
+        message
+    }
+}
+
+const CHECK_HOST: &str =
+    "`munim-computer-use check-native-host` in the user's own terminal shows which step Chrome fails at";
+const DESKTOP_MEANWHILE: &str =
+    "The desktop tools still work meanwhile: get_app_state on the browser window, then click";
+const RETRY_ONCE: &str = "retry once in a few seconds (browser_list_tabs with the same session_id shows the link is \
+     back). The interrupted action may or may not have happened: check with browser_snapshot before repeating \
+     anything that is not safe to repeat";
+
+/// `12s`, `4m`, `3h`: precise enough to tell a fresh disconnect from a stale one.
+fn ago(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    match seconds {
+        0..90 => format!("{seconds}s"),
+        90..5400 => format!("{}m", seconds / 60),
+        _ => format!("{}h", seconds / 3600),
     }
 }
 
@@ -224,29 +415,46 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Hand a reply line to the call waiting on its id.
-fn route(pending: &Mutex<HashMap<u64, Waiter>>, line: &str) {
+/// Hand a reply line to the call waiting on its id. `from_owner` marks replies
+/// from the bridge owner, whose link errors are told apart from the extension's.
+fn route(pending: &Mutex<HashMap<u64, Waiter>>, line: &str, from_owner: bool) {
     let Ok(reply) = serde_json::from_str::<Value>(line) else { return };
     let Some(id) = reply.get("id").and_then(Value::as_u64) else { return };
     let Some(waiter) = lock(pending).remove(&id) else { return };
     let outcome = if reply.get("ok").and_then(Value::as_bool) == Some(true) {
         Ok(reply.get("result").cloned().unwrap_or(json!({})))
     } else {
-        Err(reply
+        let message = reply
             .get("error")
             .and_then(Value::as_str)
             .unwrap_or("the extension reported an error")
-            .to_string())
+            .to_string();
+        match reply.get("link").filter(|_| from_owner) {
+            Some(link) => Err(CallError::Link(Link::Owner {
+                kind: link.get("kind").and_then(Value::as_str).unwrap_or("unknown").to_string(),
+                pid: link.get("pid").and_then(Value::as_u64),
+                version: link.get("version").and_then(Value::as_str).map(str::to_string),
+                detail: message,
+            })),
+            // What owners before 0.7.2 said for every lost or missing host.
+            None if from_owner && message == "the extension disconnected" => Err(CallError::Link(Link::Owner {
+                kind: "unknown".into(),
+                pid: None,
+                version: None,
+                detail: message,
+            })),
+            None => Err(CallError::Extension(message)),
+        }
     };
     let _ = waiter.send(outcome);
 }
 
 /// Clear a dropped connection's writer, then fail everything still waiting on it.
-fn drop_connection(writer: &Mutex<Option<SendHalf>>, pending: &Mutex<HashMap<u64, Waiter>>, message: &str) {
+fn drop_connection(writer: &Mutex<Option<SendHalf>>, pending: &Mutex<HashMap<u64, Waiter>>, link: &Link) {
     *lock(writer) = None;
     let stranded: Vec<Waiter> = lock(pending).drain().map(|(_, waiter)| waiter).collect();
     for waiter in stranded {
-        let _ = waiter.send(Err(message.to_string()));
+        let _ = waiter.send(Err(CallError::Link(link.clone())));
     }
 }
 
@@ -287,12 +495,7 @@ impl BrowserBridge {
             }
         }
         if !self.connected() {
-            return Err(format!(
-                "browser_{command} needs the MT Desktop MCP Chrome extension, which is not connected. \
-                 Install it from chrome-extension; if it is installed, `munim-computer-use check-native-host` \
-                 in the user's own terminal shows which step Chrome fails at. Or use the desktop tools instead: \
-                 get_app_state on the browser window, then click"
-            ));
+            return Err(self.hub.explain(command, args, CallError::Link(Link::NoHost)));
         }
 
         let command = if command == "press_key" { "press" } else { command };
@@ -309,7 +512,9 @@ impl BrowserBridge {
             map.insert("sites".into(), policy.sites_json());
         }
         let timeout = call_timeout(command, args, policy.sites_ask());
-        let result = self.dispatch_with_timeout(command, params, timeout)?;
+        let result = self
+            .dispatch_with_timeout(command, params, timeout)
+            .map_err(|error| self.hub.explain(command, args, error))?;
         Ok(describe(command, &result, args))
     }
 
@@ -339,7 +544,9 @@ impl BrowserBridge {
         if index < 1 {
             return Err("index must be a 1-based tab position from browser_list_tabs".into());
         }
-        let listed = self.dispatch("list_tabs", normalise("list_tabs", &json!({"session_id": args.get("session_id")})))?;
+        let listed = self
+            .dispatch("list_tabs", normalise("list_tabs", &json!({"session_id": args.get("session_id")})))
+            .map_err(|error| self.hub.explain("list_tabs", args, error))?;
         let tabs = listed
             .get("tabs")
             .and_then(Value::as_array)
@@ -355,11 +562,11 @@ impl BrowserBridge {
             })
     }
 
-    fn dispatch(&mut self, command: &str, params: Value) -> Result<Value, String> {
+    fn dispatch(&mut self, command: &str, params: Value) -> Result<Value, CallError> {
         self.dispatch_with_timeout(command, params, CALL_TIMEOUT)
     }
 
-    fn dispatch_with_timeout(&mut self, command: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+    fn dispatch_with_timeout(&mut self, command: &str, params: Value, timeout: Duration) -> Result<Value, CallError> {
         let mut params = params;
         if let Some(map) = params.as_object_mut() {
             map.entry("clientId".to_string())
@@ -501,6 +708,7 @@ fn connect_rpc() -> Option<Stream> {
 fn run_bridge(hub: &Arc<Hub>) {
     loop {
         if let Some((listener, _cleanup)) = bind_bridge() {
+            *lock(&hub.owned_since) = Some(Instant::now());
             match bind_rpc() {
                 Some((rpc_listener, rpc_cleanup)) => {
                     let peers = Arc::clone(hub);
@@ -519,9 +727,9 @@ fn run_bridge(hub: &Arc<Hub>) {
             *lock(&hub.rpc) = Some(send);
             for line in BufReader::new(recv).lines() {
                 let Ok(line) = line else { break };
-                route(&hub.rpc_pending, &line);
+                route(&hub.rpc_pending, &line, true);
             }
-            drop_connection(&hub.rpc, &hub.rpc_pending, "disconnected from the desktop browser bridge");
+            drop_connection(&hub.rpc, &hub.rpc_pending, &Link::OwnerGone);
             // The owner went away. Give another survivor a moment to bind,
             // then take over ourselves if nobody did.
             std::thread::sleep(Duration::from_secs(1));
@@ -559,13 +767,19 @@ fn serve_extension(hub: &Arc<Hub>, listener: &interprocess::local_socket::Listen
     accept_loop(listener, |stream| {
         let (recv, send) = stream.split();
         *lock(&hub.extension) = Some(send);
+        {
+            let mut host = lock(&hub.host);
+            host.connections += 1;
+            host.changed_at = Some(Instant::now());
+        }
         for line in BufReader::new(recv).lines() {
             let Ok(line) = line else { break };
-            route(&hub.pending, &line);
+            route(&hub.pending, &line, false);
         }
         // The host went away; clear the writer so `call` reports honestly, and
         // wake any in-flight call instead of letting it sit until CALL_TIMEOUT.
-        drop_connection(&hub.extension, &hub.pending, "the extension disconnected");
+        drop_connection(&hub.extension, &hub.pending, &Link::HostDropped);
+        lock(&hub.host).changed_at = Some(Instant::now());
     });
 }
 
@@ -606,7 +820,17 @@ fn serve_peer(hub: &Hub, stream: Stream) {
                 client_ids.insert(client_id);
                 match hub.direct_call(command, params, CALL_TIMEOUT) {
                     Ok(result) => json!({ "id": id, "ok": true, "result": result }),
-                    Err(error) => json!({ "id": id, "ok": false, "error": error }),
+                    // Say which link failed and who we are, so the peer can tell
+                    // the user which server to look at (#28).
+                    Err(CallError::Link(link)) => json!({
+                        "id": id,
+                        "ok": false,
+                        "error": hub.owner_detail(&link),
+                        "link": { "kind": link.kind(), "pid": std::process::id(), "version": VERSION },
+                    }),
+                    Err(CallError::Extension(error) | CallError::Timeout(error)) => {
+                        json!({ "id": id, "ok": false, "error": error })
+                    }
                 }
             }
             _ => json!({ "id": -1, "ok": false, "error": "invalid RPC request" }),
@@ -1071,7 +1295,8 @@ pub fn run_native_host() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BrowserBridge, call_timeout, describe, describe_snapshot, describe_tabs, normalise};
+    use super::{BrowserBridge, CallError, Hub, Link, call_timeout, describe, describe_snapshot, describe_tabs, drop_connection, normalise, route};
+    use std::time::Instant;
     use serde_json::json;
     use std::time::Duration;
 
@@ -1182,6 +1407,88 @@ mod tests {
 
         assert!(error.contains("browser_open_tab"), "names the tool: {error}");
         assert!(error.contains("get_app_state"), "offers a path: {error}");
+    }
+
+    // #28: the owner of the bridge says so, and how long Chrome has been away.
+    #[test]
+    fn an_owner_without_a_native_host_says_which_link_is_missing() {
+        let hub = Hub::new();
+        *super::lock(&hub.owned_since) = Some(Instant::now() - Duration::from_secs(300));
+        let error = hub.explain("open_tab", &json!({ "session_id": "acceptance" }), CallError::Link(Link::NoHost));
+        assert!(error.contains(&format!("(pid {}) owns the browser bridge", std::process::id())), "{error}");
+        assert!(error.contains("none has connected since it took the bridge 5m ago"), "{error}");
+        assert!(error.contains("session_id \"acceptance\" is not the cause"), "{error}");
+        assert!(error.contains("check-native-host") && error.contains("chrome://extensions"), "{error}");
+
+        {
+            let mut host = super::lock(&hub.host);
+            host.connections = 2;
+            host.changed_at = Some(Instant::now() - Duration::from_secs(12));
+        }
+        let error = hub.explain("open_tab", &json!({}), CallError::Link(Link::NoHost));
+        assert!(error.contains("the last one disconnected 12s ago, after 2 connections"), "{error}");
+        assert!(!error.contains("session_id"), "no session, no session note: {error}");
+    }
+
+    // #28: the reported case — a peer whose owner has no extension connection.
+    #[test]
+    fn a_peer_names_the_bridge_owner_that_cannot_reach_chrome() {
+        let hub = Hub::new();
+        let (waiter, reply) = std::sync::mpsc::sync_channel(1);
+        super::lock(&hub.rpc_pending).insert(9, waiter);
+        let line = json!({
+            "id": 9,
+            "ok": false,
+            "error": "Chrome's native host is not connected to it — none has connected since it took the bridge 2h ago",
+            "link": { "kind": "no_host", "pid": 4242, "version": "0.6.1" },
+        });
+        route(&hub.rpc_pending, &line.to_string(), true);
+        let error = hub.explain("open_tab", &json!({ "session_id": "s1" }), reply.recv().unwrap().unwrap_err());
+        assert!(error.contains("through the browser bridge owner (pid 4242, munim-computer-use 0.6.1"), "{error}");
+        assert!(error.contains("none has connected since it took the bridge 2h ago"), "{error}");
+        assert!(error.contains("If pid 4242 is a stale MCP server"), "{error}");
+        assert!(error.contains("session_id \"s1\" is not the cause"), "{error}");
+    }
+
+    #[test]
+    fn an_old_owners_bare_disconnect_is_still_read_as_a_link_error() {
+        let hub = Hub::new();
+        let (waiter, reply) = std::sync::mpsc::sync_channel(1);
+        super::lock(&hub.rpc_pending).insert(3, waiter);
+        route(&hub.rpc_pending, r#"{"id":3,"ok":false,"error":"the extension disconnected"}"#, true);
+        let error = hub.explain("open_tab", &json!({}), reply.recv().unwrap().unwrap_err());
+        assert!(error.contains("through the browser bridge owner (another MCP server)"), "{error}");
+        assert!(error.contains("next: retry once. If it fails the same way"), "{error}");
+    }
+
+    #[test]
+    fn extension_errors_pass_through_unchanged() {
+        let hub = Hub::new();
+        let (waiter, reply) = std::sync::mpsc::sync_channel(1);
+        super::lock(&hub.pending).insert(1, waiter);
+        // A link-shaped field from the extension itself is not an owner's report.
+        route(&hub.pending, r#"{"id":1,"ok":false,"error":"no agent tab 5","link":{"kind":"no_host"}}"#, false);
+        let error = hub.explain("close_tab", &json!({}), reply.recv().unwrap().unwrap_err());
+        assert_eq!(error, "no agent tab 5");
+    }
+
+    #[test]
+    fn a_host_lost_mid_call_wakes_the_call_and_says_to_retry_once() {
+        let hub = Hub::new();
+        *super::lock(&hub.owned_since) = Some(Instant::now());
+        let (waiter, reply) = std::sync::mpsc::sync_channel(1);
+        super::lock(&hub.pending).insert(1, waiter);
+        drop_connection(&hub.extension, &hub.pending, &Link::HostDropped);
+        let error = hub.explain("click", &json!({}), reply.recv().unwrap().unwrap_err());
+        assert!(error.contains("disconnected from this MCP server"), "{error}");
+        assert!(error.contains("retry once") && error.contains("browser_snapshot"), "{error}");
+    }
+
+    #[test]
+    fn ages_read_at_a_glance() {
+        assert_eq!(super::ago(Duration::from_secs(12)), "12s");
+        assert_eq!(super::ago(Duration::from_secs(300)), "5m");
+        assert_eq!(super::ago(Duration::from_secs(7200)), "2h");
     }
 
     #[test]

@@ -54,6 +54,38 @@ enum BridgeOutcome {
     case failure(String)
 }
 
+/// The links a browser call crosses: a peer MCP server ─rpc─▶ the bridge owner
+/// ─socket─▶ Chrome's native host ─stdio─▶ the extension. Each case names the
+/// one that failed, so the error can say what to do about it (#28).
+enum BridgeLink {
+    /// This server owns the bridge, but no native host is connected to it.
+    case noHost
+    /// The native host disconnected (or could not be written to) mid-call.
+    case hostDropped
+    /// This server is a peer and its connection to the owner closed.
+    case ownerGone
+    /// This server is a peer and the owner could not reach Chrome: the owner's
+    /// own account, with its pid and version when it is new enough to send them.
+    case owner(kind: String, pid: Int?, version: String?, detail: String)
+
+    /// Wire name, sent to peers along with an owner's link errors.
+    var kind: String {
+        switch self {
+        case .noHost: return "no_host"
+        case .hostDropped: return "host_dropped"
+        case .ownerGone: return "owner_gone"
+        case .owner(let kind, _, _, _): return kind
+        }
+    }
+}
+
+/// A reply that keeps link failures apart from the extension's own errors.
+enum BridgeReply {
+    case success([String: Any])
+    case failure(String)
+    case link(BridgeLink)
+}
+
 // MARK: - Length-prefixed framing (Chrome side)
 
 enum NativeMessaging {
@@ -298,8 +330,13 @@ final class BrowserBridge {
     private let lock = NSLock()
     private var nextID = 0
     private var rpcNextID = 0
-    private var pending: [Int: (BridgeOutcome) -> Void] = [:]
-    private var rpcPending: [Int: (BridgeOutcome) -> Void] = [:]
+    private var pending: [Int: (BridgeReply) -> Void] = [:]
+    private var rpcPending: [Int: (BridgeReply) -> Void] = [:]
+    /// Owner: when this process took the bridge, and its native host history,
+    /// so a link error can say how long Chrome has been away (#28).
+    private var ownedSince: Date?
+    private var hostConnections = 0
+    private var hostChangedAt: Date?
     /// Serializes newline-delimited JSON writes so concurrent `call`s cannot interleave.
     private let writeLock = NSLock()
     private let rpcWriteLock = NSLock()
@@ -384,6 +421,9 @@ final class BrowserBridge {
         }
         listenFD = fd
         ownershipLockFD = lockFd
+        lock.lock()
+        ownedSince = Date()
+        lock.unlock()
         startRpcListener()
 
         spawnBlockingThread("bridge.accept") { [weak self] in
@@ -474,7 +514,7 @@ final class BrowserBridge {
         rpcPending.removeAll()
         lock.unlock()
         for (_, resume) in stranded {
-            resume(.failure("disconnected from the desktop browser bridge"))
+            resume(.link(.ownerGone))
         }
         close(fd)
         // The owner went away. Give any other survivor a moment to bind, then
@@ -494,8 +534,18 @@ final class BrowserBridge {
         guard let resume else { return }
         if object["ok"] as? Bool == true {
             resume(.success(object["result"] as? [String: Any] ?? [:]))
+            return
+        }
+        let message = (object["error"] as? String) ?? "the browser bridge reported an error"
+        if let link = object["link"] as? [String: Any] {
+            resume(.link(.owner(kind: (link["kind"] as? String) ?? "unknown", pid: link["pid"] as? Int,
+                                version: link["version"] as? String, detail: message)))
+        } else if message == "the browser extension disconnected"
+                    || message == "the MT Desktop MCP Chrome extension is not connected" {
+            // What owners before 0.7.2 said for a lost or missing host.
+            resume(.link(.owner(kind: "unknown", pid: nil, version: nil, detail: message)))
         } else {
-            resume(.failure((object["error"] as? String) ?? "the browser bridge reported an error"))
+            resume(.failure(message))
         }
     }
 
@@ -554,6 +604,13 @@ final class BrowserBridge {
             return (try? JSONSerialization.data(withJSONObject: [
                 "id": id, "ok": false, "error": message,
             ])) ?? Data()
+        case .link(let link):
+            // Say which link failed and who we are, so the peer can tell the
+            // user which server to look at (#28).
+            return (try? JSONSerialization.data(withJSONObject: [
+                "id": id, "ok": false, "error": ownerDetail(link),
+                "link": ["kind": link.kind, "pid": Int(getpid()), "version": serverVersion],
+            ])) ?? Data()
         }
     }
 
@@ -561,6 +618,8 @@ final class BrowserBridge {
         lock.lock()
         clientFD = fd
         connectionGeneration += 1
+        hostConnections += 1
+        hostChangedAt = Date()
         lock.unlock()
         var buffer = Data()
         var chunk = [UInt8](repeating: 0, count: 65536)
@@ -579,10 +638,11 @@ final class BrowserBridge {
         // may clear shared pending waiters.
         if clientFD == fd {
             clientFD = -1
+            hostChangedAt = Date()
             let stranded = pending
             pending.removeAll()
             lock.unlock()
-            for (_, resume) in stranded { resume(.failure("the browser extension disconnected")) }
+            for (_, resume) in stranded { resume(.link(.hostDropped)) }
         } else {
             lock.unlock()
         }
@@ -607,6 +667,17 @@ final class BrowserBridge {
     func call(_ command: String, _ params: [String: Any] = [:], timeout: TimeInterval = 20)
         -> BridgeOutcome
     {
+        switch reply(command, params, timeout: timeout) {
+        case .success(let result): return .success(result)
+        case .failure(let message): return .failure(message)
+        case .link(let link): return .failure(explain(command, [:], link))
+        }
+    }
+
+    /// `call`, with a failed link kept apart so the caller can explain it.
+    func reply(_ command: String, _ params: [String: Any] = [:], timeout: TimeInterval = 20)
+        -> BridgeReply
+    {
         var params = params
         if params["clientId"] == nil {
             params["clientId"] = mcpBrowserClientId
@@ -621,11 +692,90 @@ final class BrowserBridge {
         return performDirectCall(command, params, timeout: timeout)
     }
 
+    /// What the owner knows about its native host connections.
+    private func hostHistory() -> String {
+        lock.lock(); defer { lock.unlock() }
+        let since = ownedSince.map { ago($0) } ?? "?"
+        guard hostConnections > 0, let changed = hostChangedAt else {
+            return "none has connected since it took the bridge \(since) ago"
+        }
+        return "the last one disconnected \(ago(changed)) ago, after \(hostConnections) connection"
+            + (hostConnections == 1 ? "" : "s") + " since it took the bridge \(since) ago"
+    }
+
+    /// An owner's account of a link error, sent to the peer whose call it was.
+    private func ownerDetail(_ link: BridgeLink) -> String {
+        switch link {
+        case .noHost: return "Chrome's native host is not connected to it — \(hostHistory())"
+        case .hostDropped: return "Chrome's native host disconnected from it while the call was waiting"
+        case .ownerGone, .owner: return "\(link)"
+        }
+    }
+
+    /// The tool error for a failed link: which link broke, who holds it, and
+    /// what to do next. Worded as the Rust server words it.
+    func explain(_ command: String, _ args: [String: Any], _ link: BridgeLink) -> String {
+        let me = getpid()
+        let reinstall = "if the MT Desktop MCP Chrome extension is installed and enabled, Chrome reconnects within "
+            + "a minute on its own, and reloading it at chrome://extensions reconnects at once; if it is not "
+            + "installed, run chrome-extension/install.sh"
+        let meanwhile = "The desktop tools still work meanwhile: get_app_state on the browser window, then click"
+        let retryOnce = "retry once in a few seconds (browser_list_tabs with the same session_id shows the link is "
+            + "back). The interrupted action may or may not have happened: check with browser_snapshot before "
+            + "repeating anything that is not safe to repeat"
+        lock.lock()
+        let owns = listenFD >= 0
+        lock.unlock()
+        let what: String
+        let next: String
+        switch link {
+        case .noHost where owns:
+            what = "this MCP server (pid \(me)) owns the browser bridge, but Chrome's native host is not connected "
+                + "to it — \(hostHistory())"
+            next = "\(reinstall). \(meanwhile)"
+        case .noHost:
+            what = "this MCP server (pid \(me)) has not joined the browser bridge yet: another MCP server is taking "
+                + "it, or one from an older build holds it without sharing it"
+            next = "retry in a few seconds. If it persists, reload the extension at chrome://extensions, or install "
+                + "it with chrome-extension/install.sh. \(meanwhile)"
+        case .hostDropped:
+            what = "Chrome's native host disconnected from this MCP server (pid \(me)), which owns the browser "
+                + "bridge, while the call was waiting (the extension was reloaded or updated, or Chrome stopped "
+                + "the host)"
+            next = "\(retryOnce). If it keeps failing, reload the extension at chrome://extensions"
+        case .ownerGone:
+            what = "this MCP server (pid \(me)) reaches Chrome through another MCP server that owned the browser "
+                + "bridge, and that server exited"
+            next = "this server takes over the bridge within a couple of seconds and the extension reconnects to "
+                + "it within seconds more, so \(retryOnce)"
+        case .owner(let kind, let pid, let version, let detail):
+            let owner = pid.map { "pid \($0)" } ?? "another MCP server"
+            let build = version.map { $0 == serverVersion ? "" : ", munim-computer-use \($0) while this server is \(serverVersion)" } ?? ""
+            what = "this MCP server (pid \(me)) reaches Chrome through the browser bridge owner (\(owner)\(build)), "
+                + "which reports: \(detail)"
+            let stale = "the bridge owner has no connection from Chrome. If \(owner) is a stale MCP server, one from "
+                + "another build, or one running in a sandbox Chrome cannot reach, ending it lets a working server "
+                + "take over the bridge; otherwise reload the extension at chrome://extensions. \(meanwhile)"
+            switch kind {
+            case "no_host": next = stale
+            // An owner too old to say which link failed.
+            case "unknown": next = "retry once. If it fails the same way, \(stale)"
+            default: next = "\(retryOnce). If it keeps failing, reload the extension at chrome://extensions"
+            }
+        }
+        var message = "browser_\(command) could not reach Chrome: \(what)."
+        if let session = args["session_id"] as? String {
+            message += "\nsession_id \"\(session)\" is not the cause: a session only keeps its own tabs, and every "
+                + "session of every MCP server on this computer shares the one extension connection."
+        }
+        return message + "\nnext: \(next)."
+    }
+
     private func callViaRpc(
         _ fd: Int32, _ command: String, _ params: [String: Any], timeout: TimeInterval
-    ) -> BridgeOutcome {
+    ) -> BridgeReply {
         let semaphore = DispatchSemaphore(value: 0)
-        var outcome: BridgeOutcome = .failure("timed out")
+        var outcome: BridgeReply = .failure("timed out")
         lock.lock()
         rpcNextID += 1
         let id = rpcNextID
@@ -649,13 +799,13 @@ final class BrowserBridge {
         guard stillConnected else {
             rpcWriteLock.unlock()
             lock.lock(); rpcPending.removeValue(forKey: id); lock.unlock()
-            return .failure("disconnected from the desktop browser bridge")
+            return .link(.ownerGone)
         }
         let wrote = writeAll(fd, data, deadline: writeDeadline)
         rpcWriteLock.unlock()
         if !wrote {
             lock.lock(); rpcPending.removeValue(forKey: id); lock.unlock()
-            return .failure("disconnected from the desktop browser bridge")
+            return .link(.ownerGone)
         }
         if semaphore.wait(timeout: writeDeadline) == .timedOut {
             lock.lock(); rpcPending.removeValue(forKey: id); lock.unlock()
@@ -666,18 +816,18 @@ final class BrowserBridge {
 
     private func performDirectCall(
         _ command: String, _ params: [String: Any], timeout: TimeInterval = 20
-    ) -> BridgeOutcome {
+    ) -> BridgeReply {
         var params = params
         if params["clientId"] == nil {
             params["clientId"] = mcpBrowserClientId
         }
         let semaphore = DispatchSemaphore(value: 0)
-        var outcome: BridgeOutcome = .failure("timed out")
+        var outcome: BridgeReply = .failure("timed out")
 
         lock.lock()
         guard clientFD >= 0 else {
             lock.unlock()
-            return .failure("the MT Desktop MCP Chrome extension is not connected")
+            return .link(.noHost)
         }
         nextID += 1
         let id = nextID
@@ -702,7 +852,7 @@ final class BrowserBridge {
             pending.removeValue(forKey: id)
             lock.unlock()
             writeLock.unlock()
-            return .failure("the browser extension disconnected")
+            return .link(.hostDropped)
         }
         lock.unlock()
         let wrote = writeAll(fd, data, deadline: writeDeadline)
@@ -718,13 +868,13 @@ final class BrowserBridge {
                 lock.unlock()
                 _ = Darwin.shutdown(fd, SHUT_RDWR)
                 for (_, resume) in stranded {
-                    resume(.failure("the browser extension disconnected"))
+                    resume(.link(.hostDropped))
                 }
             } else {
                 pending.removeValue(forKey: id)
                 lock.unlock()
             }
-            return .failure("the browser extension disconnected")
+            return .link(.hostDropped)
         }
 
         if semaphore.wait(timeout: writeDeadline) == .timedOut {
@@ -733,4 +883,12 @@ final class BrowserBridge {
         }
         return outcome
     }
+}
+
+/// `12s`, `4m`, `3h`: precise enough to tell a fresh disconnect from a stale one.
+private func ago(_ date: Date) -> String {
+    let seconds = max(0, Int(Date().timeIntervalSince(date)))
+    if seconds < 90 { return "\(seconds)s" }
+    if seconds < 5400 { return "\(seconds / 60)m" }
+    return "\(seconds / 3600)h"
 }

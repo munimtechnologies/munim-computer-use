@@ -57,7 +57,7 @@ fn all_tool_defs() -> Value {
     json!([
         {
             "name": "list_apps",
-            "description": "List running applications with their bundle id, pid, window count, and which one is frontmost. Call it first to learn the exact `app` value that get_app_state, screenshot and activate_app accept. One app can have several running instances and only some own windows, so prefer the instance that has windows. Read-only: no window or input is touched.",
+            "description": "List running applications with their bundle id, pid, window count, and which one is frontmost. Call it first to learn the exact `app` value that get_app_state, screenshot and activate_app accept. One app can have several running instances and only some own windows, so prefer the instance that has windows. Instances that share a name each show their main window title, and a closing note lists their pids: pass the pid to choose one. Read-only: no window or input is touched.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -86,11 +86,11 @@ fn all_tool_defs() -> Value {
                     },
                     "max_elements": {
                         "type": "integer",
-                        "description": "Maximum elements to emit before the outline is truncated (default 800). Prefer `query` over raising this."
+                        "description": "Maximum elements to emit before the outline is truncated (default 800). With `query`, the maximum matches to list instead: a query searches past this cap. Prefer `query` over raising this."
                     },
                     "query": {
                         "type": "string",
-                        "description": "Only list elements whose role, label or value contains this text (case-insensitive). Ids stay valid. Use it instead of raising max_elements when you know what you are looking for."
+                        "description": "Only list elements whose role, label or value contains this text (case-insensitive). Ids stay valid. It searches the whole outline, not just the first max_elements elements, and says when the read stopped early. Use it instead of raising max_elements when you know what you are looking for."
                     },
                     "offscreen": {
                         "type": "boolean",

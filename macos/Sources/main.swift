@@ -1106,12 +1106,35 @@ func toolListApps() -> String {
         .filter { $0.activationPolicy == .regular }
         .sorted { ($0.localizedName ?? "") < ($1.localizedName ?? "") }
 
+    // Several instances of one app (two Chrome profiles, say) share a name and
+    // bundle id: each such row also carries its main window title, and a closing
+    // note says how a name resolves, as the Rust server does (#29).
+    let key = { (app: NSRunningApplication) in app.bundleIdentifier ?? app.localizedName ?? "?" }
+    var instances: [String: [pid_t]] = [:]
+    for app in apps { instances[key(app), default: []].append(app.processIdentifier) }
+
     for app in apps {
         let ax = AXUIElementCreateApplication(app.processIdentifier)
         let windows = (axCopy(ax, kAXWindowsAttribute as String) as? [AXUIElement]) ?? []
         var line = "\(app.localizedName ?? "?")  [\(app.bundleIdentifier ?? "-")]  pid=\(app.processIdentifier)  windows=\(windows.count)"
+        if instances[key(app)]!.count > 1 {
+            let main = axElement(ax, kAXMainWindowAttribute as String) ?? windows.first
+            if let title = main.flatMap({ axString($0, kAXTitleAttribute as String) }), !title.isEmpty {
+                let escaped = truncate(title, 80)
+                    .replacingOccurrences(of: "[", with: "\\[").replacingOccurrences(of: "]", with: "\\]")
+                line += "  window=\"\(escaped)\""
+            }
+        }
         if app.isActive { line += "  FRONTMOST" }
         out.append(line)
+    }
+    var noted: Set<String> = []
+    for app in apps {
+        let pids = instances[key(app)]!
+        guard pids.count > 1, noted.insert(key(app)).inserted else { continue }
+        out.append("note: \(pids.count) instances of \(app.localizedName ?? key(app)) are running (pids "
+            + pids.map(String.init).joined(separator: ", ")
+            + "); by name, get_app_state picks the frontmost one with windows, so pass the pid to choose")
     }
     return out.isEmpty ? "No apps found." : out.joined(separator: "\n")
 }
@@ -1148,6 +1171,11 @@ func toolGetAppState(_ args: [String: Any]) -> String {
     // Electron app's tree for minutes and blow the client's context.
     let maxDepth = min(max((args["max_depth"] as? Int) ?? 18, 1), 60)
     let budget = min(max((args["max_elements"] as? Int) ?? 800, 1), 5000)
+    // A query narrows what is printed, not what is read: walking only
+    // max_elements and then filtering would miss every match past the cap and
+    // still report "no match". max_elements caps the matches printed instead.
+    let filterQuery = ((args["query"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    let walkBudget = filterQuery.isEmpty ? budget : queryWalkElements
 
     Registry.reset()
     Registry.targetPid = app.processIdentifier
@@ -1201,7 +1229,7 @@ func toolGetAppState(_ args: [String: Any]) -> String {
         let target = Registry.targetPid
         Registry.reset()
         Registry.targetPid = target
-        let walk = OutlineWalk(maxDepth: maxDepth, budget: budget, offscreen: (args["offscreen"] as? Bool) ?? false)
+        let walk = OutlineWalk(maxDepth: maxDepth, budget: walkBudget, offscreen: (args["offscreen"] as? Bool) ?? false)
         var narrowed = false
         for (i, w) in windows {
             let title = axString(w, kAXTitleAttribute as String) ?? "<untitled>"
@@ -1270,21 +1298,53 @@ func toolGetAppState(_ args: [String: Any]) -> String {
 
     // A filtered outline keeps the same ids: every element was registered while
     // walking, only the printout is narrowed. Section headers stay for context.
-    if let query = (args["query"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-       !query.isEmpty
-    {
-        let needle = query.lowercased()
-        let matching = lines.filter {
-            $0.hasPrefix("── ") || $0.hasPrefix("… ") || $0.lowercased().contains(needle)
-        }
-        let count = matching.filter { !$0.hasPrefix("── ") && !$0.hasPrefix("… ") }.count
-        header += "\nfilter: \"\(query)\" — \(count) matching element\(count == 1 ? "" : "s")"
-        if count == 0 {
-            return header + "\n\n(no elements match; drop the query or scroll the content into view)"
-        }
-        return header + "\n\n" + matching.joined(separator: "\n")
+    if !filterQuery.isEmpty {
+        return header + filterAppState(lines, query: filterQuery, limit: budget, incomplete: walk.budget <= 0,
+                                       skippedOffscreen: walk.skipped > 0)
     }
     return header + "\n\n" + lines.joined(separator: "\n")
+}
+
+/// How many elements a read with a `query` may walk (the Rust server's
+/// QUERY_WALK_ELEMENTS); `max_elements` caps the matches printed instead.
+let queryWalkElements = 5000
+
+/// The filter line and filtered body of an outline, matching the Rust server's
+/// `filter_app_state`. A walk that ran out of budget is reported as an
+/// incomplete search, never as a definitive empty result.
+func filterAppState(_ lines: [String], query: String, limit: Int, incomplete: Bool, skippedOffscreen: Bool) -> String {
+    let needle = query.lowercased()
+    let budgetMarker = { (line: String) in line.hasPrefix("… element budget reached") }
+    let context = { (line: String) in line.hasPrefix("── ") || (line.hasPrefix("… ") && !budgetMarker(line)) }
+    var count = 0
+    var shown: [String] = []
+    for line in lines {
+        if context(line) {
+            shown.append(line)
+        } else if !budgetMarker(line), line.lowercased().contains(needle) {
+            count += 1
+            if count <= limit { shown.append(line) }
+        }
+    }
+    var out = "\nfilter: \"\(query)\" — \(count) matching element\(count == 1 ? "" : "s")"
+    if count > limit {
+        out += ", showing the first \(limit); raise max_elements to see the rest"
+    }
+    if incomplete {
+        out += "\nnote: the read stopped at \(queryWalkElements) elements before the end of the app, so elements past "
+            + "that point were not searched; read a smaller part of it (a dialog, or one window) to search the rest"
+    }
+    if count == 0 {
+        if incomplete {
+            return out + "\n\n(no match among the elements read; the search is incomplete, so this does not mean the control is absent)"
+        }
+        if skippedOffscreen {
+            return out + "\n\n(no on-screen element matches; off-screen elements were not searched: pass offscreen=true to include them, "
+                + "or scroll the content into view)"
+        }
+        return out + "\n\n(no elements match; drop the query or scroll the content into view)"
+    }
+    return out + "\n\n" + shown.joined(separator: "\n")
 }
 
 /// Whether the last get_app_state read text with OCR. Such an app may change
@@ -2796,7 +2856,12 @@ func browserSessionCall(_ command: String, _ params: [String: Any] = [:], args: 
     let policy = PolicyStore.current()
     if let error = policy.error { return .failure("\(error) — fix it before using the browser") }
     if policy.hasSiteRules { params["sites"] = policy.sitesPayload }
-    return BrowserBridge.shared.call(command, params, timeout: browserCallTimeout(command, args, sitesAsk: policy.sitesAsk))
+    switch BrowserBridge.shared.reply(command, params, timeout: browserCallTimeout(command, args, sitesAsk: policy.sitesAsk)) {
+    case .success(let result): return .success(result)
+    case .failure(let message): return .failure(message)
+    // Say which link to Chrome is down and what to do, not just "disconnected" (#28).
+    case .link(let link): return .failure(BrowserBridge.shared.explain(command, args, link))
+    }
 }
 
 /// Default wait for a user answering browser_request_credentials, and the cap.
@@ -3281,7 +3346,7 @@ func obj(_ d: [String: Any]) -> [String: Any] { d }
 let toolDefs: [[String: Any]] = [
     [
         "name": "list_apps",
-        "description": "List running applications with their bundle id, pid, window count, and which one is frontmost. Call it first to learn the exact `app` value that get_app_state, screenshot and activate_app accept. One app can have several running instances and only some own windows, so prefer the instance that has windows. Read-only: no window or input is touched.",
+        "description": "List running applications with their bundle id, pid, window count, and which one is frontmost. Call it first to learn the exact `app` value that get_app_state, screenshot and activate_app accept. One app can have several running instances and only some own windows, so prefer the instance that has windows. Instances that share a name each show their main window title, and a closing note lists their pids: pass the pid to choose one. Read-only: no window or input is touched.",
         "inputSchema": [
             "type": "object",
             "properties": [:] as [String: Any],
@@ -3310,7 +3375,7 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "max_elements": [
                     "type": "integer",
-                    "description": "Maximum elements to emit before the outline is truncated (default 800). Prefer `query` over raising this.",
+                    "description": "Maximum elements to emit before the outline is truncated (default 800). With `query`, the maximum matches to list instead: a query searches past this cap. Prefer `query` over raising this.",
                 ],
                 "window": [
                     "type": ["integer", "string"],
@@ -3318,7 +3383,7 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "query": [
                     "type": "string",
-                    "description": "Only list elements whose role, label or value contains this text (case-insensitive). Ids stay valid. Use it instead of raising max_elements when you know what you are looking for.",
+                    "description": "Only list elements whose role, label or value contains this text (case-insensitive). Ids stay valid. It searches the whole outline, not just the first max_elements elements, and says when the read stopped early. Use it instead of raising max_elements when you know what you are looking for.",
                 ],
                 "offscreen": [
                     "type": "boolean",
@@ -4497,7 +4562,9 @@ func dispatchTool(_ name: String, _ args: [String: Any]) -> String {
             // The accessibility fallback has one shared window, so it cannot
             // honor task isolation. Never silently route scoped calls there.
             guard BrowserBridge.shared.isConnected else {
-                return "error: isolated browser sessions require the connected Chrome extension"
+                let command = String(name.dropFirst("browser_".count))
+                return "error: isolated browser sessions require the connected Chrome extension. "
+                    + BrowserBridge.shared.explain(command, args, .noHost)
             }
         }
     }

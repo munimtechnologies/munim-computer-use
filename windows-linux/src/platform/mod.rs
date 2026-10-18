@@ -112,6 +112,8 @@ pub struct AppInfo {
     pub pid: u32,
     pub windows: usize,
     pub frontmost: bool,
+    /// Title of the window that best identifies this instance; may be empty.
+    pub title: String,
 }
 
 /// Escape app name/id tokens so `format_app_list` lines stay one line and
@@ -158,15 +160,26 @@ pub fn unescape_app_field(value: &str) -> String {
 
 /// Renders `list_apps` output identically to the macOS server so the model sees
 /// one format everywhere.
+///
+/// Several instances of one app (two Chrome profiles, say) share a name, so the
+/// name alone is ambiguous: each such row also carries its main window title,
+/// and a closing note says to pick by pid (#29). FRONTMOST stays the last token.
 pub fn format_app_list(mut apps: Vec<AppInfo>) -> String {
     if apps.is_empty() {
         return "no running applications with windows".to_string();
     }
     apps.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
-    apps.iter()
+    let instances = |id: &str| apps.iter().filter(|app| app.id == id).count();
+    let mut lines: Vec<String> = apps
+        .iter()
         .map(|app| {
+            let window = if instances(&app.id) > 1 && !app.title.trim().is_empty() {
+                format!("  window=\"{}\"", escape_app_field(&outline::truncate(&app.title, 80)))
+            } else {
+                String::new()
+            };
             format!(
-                "{}  [{}]  pid={}  windows={}{}",
+                "{}  [{}]  pid={}  windows={}{window}{}",
                 escape_app_field(&app.name),
                 escape_app_field(&app.id),
                 app.pid,
@@ -174,8 +187,26 @@ pub fn format_app_list(mut apps: Vec<AppInfo>) -> String {
                 if app.frontmost { "  FRONTMOST" } else { "" }
             )
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    let mut noted: Vec<&str> = Vec::new();
+    for app in &apps {
+        if instances(&app.id) < 2 || noted.contains(&app.id.as_str()) {
+            continue;
+        }
+        noted.push(&app.id);
+        let pids: Vec<String> = apps
+            .iter()
+            .filter(|other| other.id == app.id)
+            .map(|other| other.pid.to_string())
+            .collect();
+        lines.push(format!(
+            "note: {} instances of {} are running (pids {}); its name matches all of them, so pass the pid",
+            pids.len(),
+            escape_app_field(&app.name),
+            pids.join(", ")
+        ));
+    }
+    lines.join("\n")
 }
 
 /// Whether the user opted in to typing into password fields
@@ -287,6 +318,7 @@ mod tests {
                 pid: 2,
                 windows: 1,
                 frontmost: false,
+                title: String::new(),
             },
             AppInfo {
                 name: "Chrome".into(),
@@ -294,12 +326,41 @@ mod tests {
                 pid: 1,
                 windows: 3,
                 frontmost: true,
+                title: "Docs".into(),
             },
         ]);
 
         let lines: Vec<&str> = rendered.lines().collect();
         assert!(lines[0].starts_with("Chrome  [chrome]  pid=1  windows=3  FRONTMOST"));
         assert!(lines[1].starts_with("zed"));
+    }
+
+    // #29: two instances of one app must be told apart in the inventory itself.
+    #[test]
+    fn app_list_tells_instances_of_one_app_apart() {
+        let instance = |pid, title: &str, frontmost| AppInfo {
+            name: "Google Chrome".into(),
+            id: "google-chrome".into(),
+            pid,
+            windows: 1,
+            frontmost,
+            title: title.into(),
+        };
+        let rendered = format_app_list(vec![
+            instance(28400, "New Tab - Google Chrome", true),
+            instance(14756, "GitHub [beta] - Google Chrome", false),
+            AppInfo { name: "Notepad".into(), id: "notepad".into(), pid: 7, windows: 1, frontmost: false, title: "notes.txt".into() },
+        ]);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert!(
+            lines.contains(&"Google Chrome  [google-chrome]  pid=28400  windows=1  window=\"New Tab - Google Chrome\"  FRONTMOST"),
+            "{rendered}"
+        );
+        // Brackets are escaped, so parse_app_line still finds the real `  [id]`.
+        assert!(rendered.contains("pid=14756  windows=1  window=\"GitHub \\[beta\\] - Google Chrome\""), "{rendered}");
+        assert!(lines.contains(&"Notepad  [notepad]  pid=7  windows=1"), "a single instance needs no title: {rendered}");
+        assert!(rendered.contains("note: 2 instances of Google Chrome are running (pids 28400, 14756)"), "{rendered}");
+        assert_eq!(rendered.matches("note: ").count(), 1, "{rendered}");
     }
 
     #[test]
@@ -323,6 +384,7 @@ mod tests {
             pid: 1,
             windows: 1,
             frontmost: false,
+            title: String::new(),
         }]);
         assert!(!rendered.contains('\n') || rendered.lines().count() == 1);
         assert!(rendered.contains("Foo\\nBar"));
