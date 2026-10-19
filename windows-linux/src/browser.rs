@@ -401,7 +401,7 @@ impl Hub {
                 );
                 let next = match kind.as_str() {
                     "no_host" => match extension_problem() {
-                        Some((said, step)) => format!("{said}, so {step}. {CHECK_HOST}. {DESKTOP_MEANWHILE}"),
+                        Some((said, step)) => format!("{said}, so {step}. Then: {stale}"),
                         None => stale,
                     },
                     // An owner too old to say which link failed.
