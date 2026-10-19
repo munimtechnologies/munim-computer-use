@@ -25,7 +25,7 @@ use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::path::PathBuf;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -38,6 +38,8 @@ use interprocess::local_socket::{GenericNamespaced, ToNsName};
 // Imported anonymously: the traits share their names with the enums above.
 use interprocess::local_socket::traits::{Listener as _, Stream as _};
 use serde_json::{Value, json};
+
+use crate::bridge_diag::{self, OwnerRecord};
 
 /// Timeout for extension replies; a stuck call must not wedge a turn.
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
@@ -204,6 +206,10 @@ struct Hub {
     /// Owner: when this process took the bridge.
     owned_since: Mutex<Option<Instant>>,
     host: Mutex<HostHistory>,
+    /// Owner: whether peers can reach it right now.
+    peer_endpoint: AtomicBool,
+    /// Not yet joined: why the last attempt to reach the owner failed.
+    join_error: Mutex<Option<String>>,
 }
 
 impl Hub {
@@ -216,6 +222,8 @@ impl Hub {
             next_id: AtomicU64::new(1),
             owned_since: Mutex::new(None),
             host: Mutex::new(HostHistory::default()),
+            peer_endpoint: AtomicBool::new(false),
+            join_error: Mutex::new(None),
         })
     }
 
@@ -280,6 +288,28 @@ impl Hub {
         lock(&self.owned_since).is_some()
     }
 
+    /// This owner, as `bridge-owner.json` and the `bridge_status` reply say it.
+    fn owner_record(&self) -> OwnerRecord {
+        let started_unix = lock(&self.owned_since)
+            .map_or(0, |at| bridge_diag::unix_now().saturating_sub(at.elapsed().as_secs()));
+        OwnerRecord {
+            pid: std::process::id(),
+            version: VERSION.into(),
+            exe: bridge_diag::current_exe(),
+            started_unix,
+            extension_connected: lock(&self.extension).is_some(),
+            host_connections: lock(&self.host).connections,
+            peer_endpoint: self.peer_endpoint.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Rewrite `bridge-owner.json` after anything it reports changes.
+    fn record_owner(&self) {
+        if self.owns_bridge() {
+            bridge_diag::write_owner_record(&self.owner_record());
+        }
+    }
+
     /// What the owner knows about its native host connections.
     fn host_history(&self) -> String {
         let since = lock(&self.owned_since).map(|at| ago(at.elapsed())).unwrap_or_else(|| "?".into());
@@ -313,25 +343,22 @@ impl Hub {
         };
         let me = std::process::id();
         let (what, next) = match &link {
-            Link::NoHost if self.owns_bridge() => (
-                format!(
+            Link::NoHost if self.owns_bridge() => {
+                let what = format!(
                     "this MCP server (pid {me}) owns the browser bridge, but Chrome's native host is not connected \
                      to it — {}",
                     self.host_history()
-                ),
-                format!(
-                    "if the MT Desktop MCP Chrome extension is installed and enabled, Chrome reconnects within a \
-                     minute on its own, and reloading it at chrome://extensions reconnects at once; if it is not \
-                     installed, install it from chrome-extension. {CHECK_HOST}. {DESKTOP_MEANWHILE}"
-                ),
-            ),
-            Link::NoHost => (
-                format!(
-                    "this MCP server (pid {me}) has not joined the browser bridge yet: another MCP server is taking \
-                     it, or one from an older build holds it without sharing it"
-                ),
-                format!("retry in a few seconds. If it persists, {CHECK_HOST}. {DESKTOP_MEANWHILE}"),
-            ),
+                );
+                let next = match extension_problem() {
+                    Some((said, step)) => format!("{said}, so {step}. {CHECK_HOST}. {DESKTOP_MEANWHILE}"),
+                    None => format!(
+                        "the extension is installed, so Chrome reconnects within a minute on its own, and reloading \
+                         it at chrome://extensions reconnects at once. {CHECK_HOST}. {DESKTOP_MEANWHILE}"
+                    ),
+                };
+                (what, next)
+            }
+            Link::NoHost => self.not_joined(),
             Link::HostDropped => (
                 format!(
                     "Chrome's native host disconnected from this MCP server (pid {me}), which owns the browser \
@@ -373,7 +400,10 @@ impl Hub {
                      {CHECK_HOST}. {DESKTOP_MEANWHILE}"
                 );
                 let next = match kind.as_str() {
-                    "no_host" => stale,
+                    "no_host" => match extension_problem() {
+                        Some((said, step)) => format!("{said}, so {step}. {CHECK_HOST}. {DESKTOP_MEANWHILE}"),
+                        None => stale,
+                    },
                     // An owner too old to say which link failed.
                     "unknown" => format!("retry once. If it fails the same way, {stale}"),
                     _ => format!("{RETRY_ONCE}. If it keeps failing, {CHECK_HOST}"),
@@ -391,6 +421,92 @@ impl Hub {
         message.push_str(&format!("\nnext: {next}."));
         message
     }
+}
+
+impl Hub {
+    /// Why this server is not part of the bridge, naming whoever holds it and
+    /// whether the extension is even installed (#36).
+    fn not_joined(&self) -> (String, String) {
+        let me = std::process::id();
+        let owner = bridge_diag::read_owner_record().filter(|record| record.pid != me);
+        let holder = match &owner {
+            Some(record) => format!("it is held by {}, {}", record.describe(), record.extension_state()),
+            None => {
+                let servers = bridge_diag::running_servers();
+                if servers.is_empty() {
+                    "no other munim-computer-use process is visible to this one, so it is held by another \
+                     program, or by a server running as another user, elevated, or in a sandbox"
+                        .to_string()
+                } else {
+                    let listed: Vec<String> =
+                        servers.iter().take(6).map(|server| format!("pid {} ({})", server.pid, server.exe)).collect();
+                    format!(
+                        "its owner did not record itself (servers before 0.7.3 do not); the other \
+                         munim-computer-use processes running now, one of which is probably the owner: {}",
+                        listed.join(", ")
+                    )
+                }
+            }
+        };
+        let why = lock(&self.join_error)
+            .clone()
+            .unwrap_or_else(|| "this server is still starting its first attempt to join".into());
+        let what = format!(
+            "this MCP server (pid {me}) has not joined the browser bridge: {holder}; {why}. This server retries \
+             every 2 seconds."
+        );
+
+        let mut steps: Vec<String> = Vec::new();
+        let mut said = String::new();
+        if let Some((problem, step)) = extension_problem() {
+            said = format!("\n{problem}");
+            steps.push(step);
+        }
+        let denied = why.contains("different security contexts");
+        match &owner {
+            Some(record) if denied => steps.push(format!(
+                "start this MCP server and pid {} from the same context so they can share the bridge, or end pid {} \
+                 (it is munim-computer-use) so this server can take the bridge over",
+                record.pid, record.pid
+            )),
+            Some(record) if !record.extension_connected => steps.push(format!(
+                "end pid {} if it is a stale or sandboxed server; this server then takes the bridge over",
+                record.pid
+            )),
+            Some(record) => steps.push(format!(
+                "retry in a few seconds; if it keeps failing, end pid {} so this server can take the bridge over",
+                record.pid
+            )),
+            None if holder.contains("probably the owner") => steps.push(
+                "if one of the processes above is a stale or older server, ending it lets this server take the \
+                 bridge over; otherwise retry in a few seconds"
+                    .into(),
+            ),
+            None => steps.push("retry in a few seconds".into()),
+        }
+        steps.push(CHECK_HOST.into());
+        steps.push(DESKTOP_MEANWHILE.into());
+        // Each step after the first starts a sentence.
+        let steps: Vec<String> = steps
+            .into_iter()
+            .enumerate()
+            .map(|(index, step)| if index == 0 { step } else { capitalised(&step) })
+            .collect();
+        let what = if said.is_empty() { what.trim_end_matches('.').to_string() } else { format!("{what}{said}") };
+        (what, steps.join(". "))
+    }
+}
+
+fn capitalised(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect())
+}
+
+/// The extension this identity talks to is missing or off, as a sentence and
+/// the step that fixes it.
+fn extension_problem() -> Option<(String, String)> {
+    let id = crate::identity::get().extension_ids.first()?.clone();
+    bridge_diag::Presence::look(&id).problem(&id)
 }
 
 const CHECK_HOST: &str =
@@ -688,16 +804,19 @@ fn bind_rpc() -> Option<(interprocess::local_socket::Listener, Option<BridgeSock
     }
 }
 
-fn connect_rpc() -> Option<Stream> {
+/// The owner's peer endpoint, or why it could not be reached.
+pub(crate) fn connect_rpc() -> std::io::Result<Stream> {
     #[cfg(unix)]
     {
-        let path = rpc_socket_path()?;
-        Stream::connect(endpoint_name(&path).ok()?).ok()
+        let path = rpc_socket_path().ok_or_else(|| {
+            std::io::Error::other("there is no private directory for the bridge socket (see the server's log)")
+        })?;
+        Stream::connect(endpoint_name(&path)?)
     }
     #[cfg(windows)]
     {
-        let name = format!("{}.rpc", bridge_pipe_name()).to_ns_name::<GenericNamespaced>().ok()?;
-        Stream::connect(name).ok()
+        let name = format!("{}.rpc", bridge_pipe_name()).to_ns_name::<GenericNamespaced>()?;
+        Stream::connect(name)
     }
 }
 
@@ -709,20 +828,19 @@ fn run_bridge(hub: &Arc<Hub>) {
     loop {
         if let Some((listener, _cleanup)) = bind_bridge() {
             *lock(&hub.owned_since) = Some(Instant::now());
-            match bind_rpc() {
-                Some((rpc_listener, rpc_cleanup)) => {
-                    let peers = Arc::clone(hub);
-                    std::thread::spawn(move || {
-                        let _rpc_cleanup = rpc_cleanup;
-                        serve_peers(&peers, &rpc_listener);
-                    });
-                }
-                None => eprintln!("munim-computer-use: could not open the bridge for other MCP servers"),
-            }
+            *lock(&hub.join_error) = None;
+            hub.record_owner();
+            let peers = Arc::clone(hub);
+            std::thread::spawn(move || serve_peers_for_life(&peers));
             serve_extension(hub, &listener);
             return;
         }
-        if let Some(stream) = connect_rpc() {
+        let joined = connect_rpc();
+        if let Err(error) = &joined {
+            *lock(&hub.join_error) = Some(bridge_diag::join_failure(error));
+        }
+        if let Ok(stream) = joined {
+            *lock(&hub.join_error) = None;
             let (recv, send) = stream.split();
             *lock(&hub.rpc) = Some(send);
             for line in BufReader::new(recv).lines() {
@@ -762,6 +880,30 @@ fn accept_loop(listener: &interprocess::local_socket::Listener, mut on_stream: i
     }
 }
 
+/// Keep the peer endpoint open for as long as this process owns the bridge: a
+/// closed one would lock every later MCP server out of the browser for good.
+fn serve_peers_for_life(hub: &Arc<Hub>) {
+    let mut reported = false;
+    loop {
+        match bind_rpc() {
+            Some((listener, _cleanup)) => {
+                hub.peer_endpoint.store(true, Ordering::Relaxed);
+                hub.record_owner();
+                reported = false;
+                serve_peers(hub, &listener);
+            }
+            None if !reported => {
+                eprintln!("munim-computer-use: could not open the bridge for other MCP servers; retrying");
+                reported = true;
+            }
+            None => {}
+        }
+        hub.peer_endpoint.store(false, Ordering::Relaxed);
+        hub.record_owner();
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
 /// Accept the native host and route its replies to the waiting calls.
 fn serve_extension(hub: &Arc<Hub>, listener: &interprocess::local_socket::Listener) {
     accept_loop(listener, |stream| {
@@ -772,6 +914,7 @@ fn serve_extension(hub: &Arc<Hub>, listener: &interprocess::local_socket::Listen
             host.connections += 1;
             host.changed_at = Some(Instant::now());
         }
+        hub.record_owner();
         for line in BufReader::new(recv).lines() {
             let Ok(line) = line else { break };
             route(&hub.pending, &line, false);
@@ -780,6 +923,7 @@ fn serve_extension(hub: &Arc<Hub>, listener: &interprocess::local_socket::Listen
         // wake any in-flight call instead of letting it sit until CALL_TIMEOUT.
         drop_connection(&hub.extension, &hub.pending, &Link::HostDropped);
         lock(&hub.host).changed_at = Some(Instant::now());
+        hub.record_owner();
     });
 }
 
@@ -803,6 +947,13 @@ fn serve_peer(hub: &Hub, stream: Stream) {
             continue;
         }
         let response = match serde_json::from_str::<Value>(&line) {
+            // Answered here, never forwarded: check-native-host asks it to say
+            // who owns the bridge and whether the extension is connected.
+            Ok(request) if request.get("command").and_then(Value::as_str) == Some("bridge_status") => json!({
+                "id": request.get("id").cloned().unwrap_or(json!(-1)),
+                "ok": true,
+                "result": hub.owner_record().to_json(),
+            }),
             Ok(request) if request.get("command").and_then(Value::as_str).is_some() => {
                 let id = request.get("id").cloned().unwrap_or(json!(-1));
                 let command = request.get("command").and_then(Value::as_str).unwrap_or_default();

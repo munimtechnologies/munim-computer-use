@@ -175,6 +175,9 @@ pub fn check(identity: &Identity, extension_id: &str, launch: bool) -> Report {
     }
 
     let bridge = bridge_status(identity);
+    let owner = if bridge.2 { ask_owner() } else { OwnerReport::default() };
+    let presence = crate::bridge_diag::Presence::look(extension_id);
+    let extension_problem = presence.problem(extension_id);
     #[cfg(windows)]
     let context = crate::platform::session::Context::probe();
     #[cfg(windows)]
@@ -200,7 +203,10 @@ pub fn check(identity: &Identity, extension_id: &str, launch: bool) -> Report {
             format!("Chrome would not reach {host} ({})", why.join("; "))
         });
     }
-    let ready = primary_ok && context_problems.is_empty();
+    if let Some((said, step)) = &extension_problem {
+        problems.push(format!("{said}; {step}"));
+    }
+    let ready = primary_ok && context_problems.is_empty() && extension_problem.is_none();
 
     let mut text = format!("extension: {origin} (pass --extension-id for another build)\n\n");
     for finding in &findings {
@@ -219,6 +225,10 @@ pub fn check(identity: &Identity, extension_id: &str, launch: bool) -> Report {
         });
     }
     text.push_str(&format!("bridge: {}\n", bridge.1));
+    for line in &owner.lines {
+        text.push_str(&format!("  {line}\n"));
+    }
+    text.push_str(&format!("extension installed: {}\n", presence_line(&presence)));
     #[cfg(windows)]
     {
         text.push_str(&format!(
@@ -236,11 +246,14 @@ pub fn check(identity: &Identity, extension_id: &str, launch: bool) -> Report {
             ));
         }
     }
-    text.push_str(if ready {
+    text.push_str(&if ready {
         "\nready: Chrome can find and start this host. If the extension still reports it missing, check in \
          chrome://extensions that it is enabled and has the extension id above.\n"
+            .to_string()
+    } else if primary_ok && let Some((said, step)) = &extension_problem {
+        format!("\nnot ready — the host is fine, but: {said}. Next: {step}.\n")
     } else {
-        "\nnot ready — fix the first FAIL or WARN above, then run this again.\n"
+        "\nnot ready — fix the first FAIL or WARN above, then run this again.\n".to_string()
     });
 
     #[cfg(windows)]
@@ -253,7 +266,15 @@ pub fn check(identity: &Identity, extension_id: &str, launch: bool) -> Report {
             "extensionOrigin": origin,
             "wrapper": ours.map(|path| path.to_string_lossy().into_owned()),
             "hosts": findings.iter().map(Finding::to_json).collect::<Vec<_>>(),
-            "bridge": { "name": bridge.0, "listening": bridge.2, "detail": bridge.1 },
+            "bridge": {
+                "name": bridge.0,
+                "listening": bridge.2,
+                "detail": bridge.1,
+                "owner": owner.record.as_ref().map(crate::bridge_diag::OwnerRecord::to_json),
+                "extensionConnected": owner.extension_connected,
+                "joinError": owner.join_error,
+            },
+            "extensionInstalled": presence.to_json(),
             "process": context_json,
             "problems": problems,
         }),
@@ -647,6 +668,123 @@ fn bridge_status(identity: &Identity) -> (String, String, bool) {
         };
         (path.to_string_lossy().into_owned(), detail, listening)
     }
+}
+
+/// What the bridge owner says about itself over its peer endpoint.
+#[derive(Default)]
+struct OwnerReport {
+    record: Option<crate::bridge_diag::OwnerRecord>,
+    /// `None` when the owner could not be asked.
+    extension_connected: Option<bool>,
+    join_error: Option<String>,
+    lines: Vec<String>,
+}
+
+/// Ask the owner for `bridge_status`, as a peer would. An owner before 0.7.3
+/// passes the command on to the extension, and what comes back still tells
+/// whether the extension is connected. Nothing here can take the extension's
+/// place: only the bridge itself carries it, and this joins the peer endpoint.
+fn ask_owner() -> OwnerReport {
+    let mut report = OwnerReport::default();
+    let recorded = crate::bridge_diag::read_owner_record();
+    let reply = match crate::browser::connect_rpc() {
+        Err(error) => {
+            report.join_error = Some(crate::bridge_diag::join_failure(&error));
+            None
+        }
+        Ok(stream) => {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                use std::io::{BufRead, Write};
+                use interprocess::local_socket::traits::Stream as _;
+                let (recv, mut send) = stream.split();
+                let request = json!({ "id": 1, "command": "bridge_status", "params": { "clientId": "check-native-host" } });
+                if writeln!(send, "{request}").and_then(|()| send.flush()).is_err() {
+                    return;
+                }
+                let mut line = String::new();
+                if std::io::BufReader::new(recv).read_line(&mut line).is_ok() {
+                    let _ = sender.send(line);
+                }
+            });
+            receiver.recv_timeout(Duration::from_secs(5)).ok()
+        }
+    };
+    let reply: Option<Value> = reply.and_then(|line| serde_json::from_str(&line).ok());
+    match &reply {
+        Some(value) if value.get("ok").and_then(Value::as_bool) == Some(true) => {
+            report.record = value.get("result").and_then(crate::bridge_diag::OwnerRecord::from_json);
+            report.extension_connected = report.record.as_ref().map(|record| record.extension_connected);
+        }
+        Some(value) => {
+            // An owner before 0.7.3. 0.7.2 names itself in `link`; any other
+            // error came from the extension, which is therefore connected.
+            let error = value.get("error").and_then(Value::as_str).unwrap_or_default();
+            let link = value.get("link");
+            report.extension_connected = Some(match link.and_then(|link| link.get("kind")).and_then(Value::as_str) {
+                Some(kind) => kind != "no_host",
+                None => error != "the extension disconnected",
+            });
+            report.lines.push(format!(
+                "owner: {} (a build before 0.7.3, which does not report itself)",
+                match link.and_then(|link| link.get("pid")).and_then(Value::as_u64) {
+                    Some(pid) => format!(
+                        "pid {pid}, munim-computer-use {}",
+                        link.and_then(|link| link.get("version")).and_then(Value::as_str).unwrap_or("?")
+                    ),
+                    None => "unknown".into(),
+                }
+            ));
+        }
+        None => {}
+    }
+    // The record names the owner even when it cannot be asked.
+    if report.record.is_none() && reply.is_none() {
+        report.record = recorded;
+    }
+    if let Some(record) = &report.record {
+        report.lines.insert(0, format!("owner: {}", record.describe()));
+        if !record.peer_endpoint {
+            report.lines.push("WARN  its peer endpoint is closed, so other MCP servers cannot join it".into());
+        }
+    } else if reply.is_none() {
+        let servers = crate::bridge_diag::running_servers();
+        report.lines.push(if servers.is_empty() {
+            "owner: not a munim-computer-use process visible from here (another program, or a server running \
+             as another user, elevated, or in a sandbox)"
+                .into()
+        } else {
+            format!(
+                "owner: did not record itself (servers before 0.7.3 do not); munim-computer-use processes \
+                 running, one of which is probably the owner: {}",
+                servers.iter().map(|server| format!("pid {} ({})", server.pid, server.exe)).collect::<Vec<_>>().join(", ")
+            )
+        });
+    }
+    report.lines.push(match report.extension_connected {
+        Some(true) => "extension: connected to the owner".into(),
+        Some(false) => "extension: NOT connected to the owner".into(),
+        None => "extension: unknown (the owner could not be asked)".into(),
+    });
+    if let Some(error) = &report.join_error {
+        report.lines.push(format!("joining from this terminal: {error}"));
+    }
+    report
+}
+
+fn presence_line(presence: &crate::bridge_diag::Presence) -> String {
+    if presence.profiles.is_empty() {
+        return "unknown (no Chrome, Chromium, Edge or Brave profile found for this user)".into();
+    }
+    if presence.found.is_empty() {
+        return format!("NO — not in any of {}", presence.profiles.join(", "));
+    }
+    presence
+        .found
+        .iter()
+        .map(|installed| format!("{} ({})", installed.profile, if installed.enabled { "enabled" } else { "DISABLED" }))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]

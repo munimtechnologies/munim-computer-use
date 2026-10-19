@@ -13,6 +13,7 @@
 #![recursion_limit = "512"]
 
 mod apps;
+mod bridge_diag;
 mod browser;
 mod capture;
 mod clipboard;
