@@ -311,6 +311,17 @@ Names, argument shapes and descriptions are identical on every platform, and CI 
 
 ### Build from source
 
+On Fedora, install the native development libraries before building the Rust
+server (in addition to your Rust toolchain):
+
+```sh
+sudo dnf install gcc pkgconf-pkg-config clang-devel pipewire-devel \
+  libdrm-devel mesa-libgbm-devel mesa-libEGL-devel wayland-devel libxcb-devel
+```
+
+These are needed by the screen-capture dependencies even on X11. In particular,
+a missing `libpipewire-0.3.pc` during the build means `pipewire-devel` is missing.
+
 ```sh
 # macOS
 cd macos && swift build -c release
@@ -415,7 +426,7 @@ Look → act → verify. `get_app_state` for ids, act by id with `return_state: 
 
 ## Contributing
 
-This repository mirrors the `native/` tree of [munimtechnologies/mtcode](https://github.com/munimtechnologies/mtcode), where the server is developed and shipped inside MT Code. Issues and discussions are welcome here; code changes land in mtcode first and are synced.
+The server is developed here. [MT Code](https://github.com/munimtechnologies/mtcode) ships it by pinning a release of this repository (`native/munim-computer-use.json`), so changes reach MT Code with the next release. Issues and pull requests are welcome.
 
 ## Credits and license
 

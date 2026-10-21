@@ -16,7 +16,7 @@ use atspi::{connection::AccessibilityConnection, CoordType, Role, State};
 use futures_lite::future::block_on;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask, GetKeyboardMappingReply,
+    AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask, GetKeyboardMappingReply,
     InputFocus, Keycode, StackMode,
 };
 use x11rb::protocol::xtest::ConnectionExt as _;
@@ -36,6 +36,9 @@ const BUTTON_SCROLL_UP: u8 = 4;
 const BUTTON_SCROLL_DOWN: u8 = 5;
 const BUTTON_SCROLL_LEFT: u8 = 6;
 const BUTTON_SCROLL_RIGHT: u8 = 7;
+
+/// How long a pointer rests on its target before a button press.
+const POINTER_SETTLE: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Where an element lives on the AT-SPI bus. Proxies borrow their connection,
 /// so the registry stores addresses and rebuilds a proxy on demand.
@@ -344,6 +347,19 @@ impl LinuxDesktop {
                 DesktopError::new(format!("could not send _NET_ACTIVE_WINDOW: {error}"))
             })?;
 
+        // EWMH is asynchronous: bspwm must map a window on another desktop
+        // before SetInputFocus is legal. Let the WM finish activation first.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        while std::time::Instant::now() < deadline {
+            if let Ok(cookie) = connection.get_property(false, root, atom, AtomEnum::WINDOW, 0, 1)
+                && let Ok(reply) = cookie.reply()
+                && reply.value32().and_then(|mut values| values.next()) == Some(window_id)
+            {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
         // Nudge for WMs (Openbox under Xvfb) that ignore the client message.
         connection
             .set_input_focus(InputFocus::PARENT, window_id, 0u32)
@@ -479,6 +495,15 @@ impl LinuxDesktop {
         connection
             .flush()
             .map_err(|error| DesktopError::new(format!("X11 flush failed: {error}")))?;
+        Ok(())
+    }
+
+    /// Move the pointer to where a press will land. GTK can drop a press that
+    /// arrives before it has handled the pointer crossing into the widget
+    /// (seen with plain buttons under bspwm), so give it a moment first.
+    fn move_pointer_to_press(&self, x: f64, y: f64) -> Result<()> {
+        self.move_pointer(x, y)?;
+        std::thread::sleep(POINTER_SETTLE);
         Ok(())
     }
 
@@ -1046,48 +1071,62 @@ fn to_xtest_coord(value: f64, axis: &str) -> Result<i16> {
     Ok(value as i16)
 }
 
-impl Desktop for LinuxDesktop {
-    fn list_apps(&mut self) -> Result<String> {
-        // Window enumeration needs EWMH properties that minimal window managers
-        // (WSLg included) do not publish, and the accessibility bus is the more
-        // relevant view here anyway: an app absent from it cannot be driven.
-        let focused = apps::list_apps().ok().and_then(|apps| {
-            apps.into_iter().find(|app| app.frontmost)
-        });
-        let focused_name = focused
-            .as_ref()
-            .map(|app| app.name.to_lowercase())
-            .unwrap_or_default();
-        let focused_pid = focused.map(|app| app.pid);
+// AT-SPI can contain only some running apps. Keep X11-only windows available
+// for screenshots and coordinate input, even while the accessibility bus works.
+fn format_linux_app_list(accessible: Vec<(String, u32)>, windows: Vec<super::AppInfo>) -> String {
+    let accessible: Vec<(String, u32)> =
+        accessible.into_iter().filter(|(name, _)| !name.is_empty()).collect();
+    // A window whose pid the bus also reports is listed once, as the bus entry.
+    let (merged, remaining): (Vec<_>, Vec<_>) = windows
+        .into_iter()
+        .partition(|app| app.pid != 0 && accessible.iter().any(|(_, pid)| *pid == app.pid));
+    // The marker follows the focused window: onto its bus entry when the pids
+    // match, otherwise it stays on the window's own line, so it appears once.
+    let focused_pid = merged.iter().find(|app| app.frontmost).map(|app| app.pid);
 
-        if let Ok(applications) = self.applications()
-            && !applications.is_empty()
-        {
-            let mut lines: Vec<String> = applications
-                .into_iter()
-                .filter(|(_, name, _)| !name.is_empty())
-                .map(|(_, name, pid)| {
-                    // Prefer pid equality — xcap and AT-SPI names often disagree
-                    // (`Code` vs `Visual Studio Code`). Exact name is the fallback.
-                    let is_frontmost = focused_pid
-                        .filter(|front| *front != 0 && *front == pid)
-                        .is_some()
-                        || (!focused_name.is_empty() && name.to_lowercase() == focused_name);
-
-                    let marker = if is_frontmost { "  FRONTMOST" } else { "" };
-                    if pid == 0 {
-                        format!("{name}  [a11y]{marker}")
-                    } else {
-                        format!("{name}  [a11y]  pid={pid}{marker}")
-                    }
-                })
-                .collect();
-            if !lines.is_empty() {
-                lines.sort_by_key(|line| (!line.contains("FRONTMOST"), line.to_lowercase()));
-                return Ok(lines.join("\n"));
+    let mut entries: Vec<(bool, String)> = accessible
+        .iter()
+        .map(|(name, pid)| {
+            let frontmost = focused_pid == Some(*pid);
+            let marker = if frontmost { "  FRONTMOST" } else { "" };
+            let name = super::escape_app_field(name);
+            let line = if *pid == 0 {
+                format!("{name}  [a11y]{marker}")
+            } else {
+                format!("{name}  [a11y]  pid={pid}{marker}")
+            };
+            (frontmost, line)
+        })
+        .collect();
+    let mut notes = Vec::new();
+    if !remaining.is_empty() {
+        // Window lines end in `windows=N` or a quoted title unless marked.
+        for line in format_app_list(remaining).lines() {
+            if line.starts_with("note: ") {
+                notes.push(line.to_owned());
+            } else {
+                entries.push((line.ends_with("  FRONTMOST"), line.to_owned()));
             }
         }
-        Ok(format_app_list(apps::list_apps()?))
+    }
+    entries.sort_by_key(|(frontmost, line)| (!frontmost, line.to_lowercase()));
+    entries.into_iter().map(|(_, line)| line).chain(notes).collect::<Vec<_>>().join("\n")
+}
+
+impl Desktop for LinuxDesktop {
+    fn list_apps(&mut self) -> Result<String> {
+        let windows = apps::list_apps();
+        let accessible: Vec<(String, u32)> = self
+            .applications()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, name, pid)| (name, pid))
+            .collect();
+        // Minimal WMs may not publish the EWMH properties xcap needs.
+        if accessible.iter().all(|(name, _)| name.is_empty()) {
+            return Ok(format_app_list(windows?));
+        }
+        Ok(format_linux_app_list(accessible, windows.unwrap_or_default()))
     }
 
     fn resolve_pid(&mut self, app: &str) -> Result<u32> {
@@ -1278,7 +1317,7 @@ impl Desktop for LinuxDesktop {
 
         let (x, y) = self.point_coordinates(target)?;
         AgentCursor::shared().press(x, y);
-        self.move_pointer(x, y)?;
+        self.move_pointer_to_press(x, y)?;
         for _ in 0..click_count.max(1) {
             self.tap_button(BUTTON_LEFT)?;
         }
@@ -1296,7 +1335,7 @@ impl Desktop for LinuxDesktop {
         self.ensure_accessibility();
         let (x, y) = self.point_coordinates(target)?;
         AgentCursor::shared().press(x, y);
-        self.move_pointer(x, y)?;
+        self.move_pointer_to_press(x, y)?;
         self.button(BUTTON_RIGHT, true)?;
         if let Err(error) = self.button(BUTTON_RIGHT, false) {
             let _ = self.button(BUTTON_RIGHT, false);
@@ -1320,7 +1359,7 @@ impl Desktop for LinuxDesktop {
         let (from_x, from_y) = self.point_coordinates(from)?;
         let (to_x, to_y) = self.point_coordinates(to)?;
         AgentCursor::shared().show(from_x, from_y);
-        self.move_pointer(from_x, from_y)?;
+        self.move_pointer_to_press(from_x, from_y)?;
         // Fly the overlay to the destination *before* button-down so the
         // blocking wait cannot hold a stationary press (Bugbot: drag timing).
         AgentCursor::shared().press(to_x, to_y);
@@ -1375,7 +1414,7 @@ impl Desktop for LinuxDesktop {
                     )));
                 }
                 let clicked = if let Ok((x, y)) = self.center(&reference) {
-                    self.move_pointer(x, y)
+                    self.move_pointer_to_press(x, y)
                         .and_then(|()| self.tap_button(BUTTON_LEFT))
                         .is_ok()
                 } else {
@@ -1516,7 +1555,7 @@ impl Desktop for LinuxDesktop {
             // AT-SPI bounds the same way click / right_click / drag do.
             let (x, y) = self.point_coordinates(Point::Element(id))?;
             AgentCursor::shared().show(x, y);
-            self.move_pointer(x, y)?;
+            self.move_pointer_to_press(x, y)?;
         }
         let button = match direction {
             ScrollDirection::Up => BUTTON_SCROLL_UP,
@@ -1583,6 +1622,41 @@ mod tests {
         char_to_keysym, match_application, modifier_keysym, named_keysym, to_xtest_coord, truncate,
         ElementRef,
     };
+
+    #[test]
+    fn mixed_accessibility_listing_keeps_x11_windows_and_correct_focus() {
+        let window = |pid, focused| super::super::AppInfo {
+            name: "Editor".into(), id: "editor".into(), pid, windows: 1,
+            frontmost: focused, title: format!("Document {pid}"),
+        };
+        let listing = super::format_linux_app_list(
+            vec![("Editor".into(), 11), ("Panel".into(), 33)],
+            vec![window(11, false), window(22, true)],
+        );
+        assert_eq!(listing.matches("pid=11").count(), 1, "{listing}");
+        assert!(listing.contains("pid=22  windows=1  FRONTMOST"), "{listing}");
+        assert!(listing.contains("Panel  [a11y]  pid=33"), "{listing}");
+        assert_eq!(listing.matches("FRONTMOST").count(), 1, "{listing}");
+        let headless = super::format_linux_app_list(vec![("Panel".into(), 33)], vec![]);
+        assert_eq!(headless, "Panel  [a11y]  pid=33");
+        let unknown = super::format_linux_app_list(vec![("Unknown".into(), 0)], vec![window(22, false)]);
+        assert!(unknown.contains("pid=22"));
+
+        // A pid-less bus entry with the focused app's name must not take a
+        // second marker from the window line that stays listed.
+        let pidless = super::format_linux_app_list(vec![("Editor".into(), 0)], vec![window(22, true)]);
+        assert_eq!(pidless.matches("FRONTMOST").count(), 1, "{pidless}");
+        assert!(pidless.starts_with("Editor  [editor]  pid=22"), "{pidless}");
+
+        // The duplicate-instance note stays after every app line.
+        let twins = super::format_linux_app_list(
+            vec![("Panel".into(), 33), ("Zeta".into(), 55)],
+            vec![window(22, false), window(44, false)],
+        );
+        let last = twins.lines().last().unwrap_or_default();
+        assert!(last.starts_with("note: 2 instances of Editor"), "{twins}");
+        assert_eq!(twins.lines().filter(|line| line.starts_with("note: ")).count(), 1, "{twins}");
+    }
 
     #[test]
     fn latin1_characters_map_to_themselves() {
