@@ -170,11 +170,44 @@ One look at an app, the step an agent repeats most, measured against [Windows-MC
 How it was measured, on 27 October 2026: Windows 11 (build 26200), one 1920×1080 display, File Explorer open in front on `C:\Windows\System32` (4,837 items). munim-computer-use 0.7.3 (the release binary) with `app` set to Explorer's pid; Windows-MCP 0.8.5 (`uvx windows-mcp serve`), `Snapshot` with default arguments and with `use_vision: true`. Each server was started once and called over stdio, the first call of a run was dropped as warm-up, and the two servers ran in alternating rounds; times are the median of 10 calls (3 with vision, whose first call took 2.1 s and the other two 11–12 s). Tokens are estimates: text at 4 characters per token, images by Anthropic's formula (width × height / 750 after the API's resize). Windows-MCP's `Snapshot` also lists the desktop's other open windows, while `get_app_state` covers one app, so part of the size difference is scope.
 
 <picture>
+  <source media="(prefers-color-scheme: dark)" srcset="./.github/resources/chart-history-dark.svg">
+  <img alt="get_app_state on the same File Explorer window in every Windows release: about 0.4 s and 2.5K tokens from 0.2.0 through 0.6.1, then about 0.25 s and 1.9K tokens from 0.7.0 on; Windows-MCP 0.8.5 took 0.75 s and about 3.7K tokens in the same rounds" src="./.github/resources/chart-history-light.svg" width="820">
+</picture>
+
+The same window read by every Windows release, from the release binaries, in two rounds of all 17 with Windows-MCP in each round (a separate run from the table above, so the times differ a little; the ratio holds). 0.7.0 is where `get_app_state` started reading only what is on screen and fetching each element's attributes in one request.
+
+<details>
+<summary>The numbers</summary>
+
+| Release | Read time (median) | Characters | Tokens (≈) |
+| ------- | ------------------ | ---------- | ---------- |
+| 0.2.0   | 0.40 s              | 9,860      | 2.5K       |
+| 0.3.0   | 0.43 s              | 9,860      | 2.5K       |
+| 0.3.1   | 0.38 s              | 9,860      | 2.5K       |
+| 0.4.0   | 0.38 s              | 9,860      | 2.5K       |
+| 0.4.1   | 0.38 s              | 9,860      | 2.5K       |
+| 0.4.2   | 0.39 s              | 9,860      | 2.5K       |
+| 0.4.3   | 0.40 s              | 9,860      | 2.5K       |
+| 0.4.4   | 0.38 s              | 9,860      | 2.5K       |
+| 0.5.0   | 0.38 s              | 9,860      | 2.5K       |
+| 0.5.1   | 0.37 s              | 9,860      | 2.5K       |
+| 0.5.2   | 0.43 s              | 9,860      | 2.5K       |
+| 0.6.0   | 0.37 s              | 9,860      | 2.5K       |
+| 0.6.1   | 0.41 s              | 9,860      | 2.5K       |
+| 0.7.0   | 0.23 s              | 7,499      | 1.9K       |
+| 0.7.1   | 0.28 s              | 7,499      | 1.9K       |
+| 0.7.2   | 0.25 s              | 7,520      | 1.9K       |
+| 0.7.3   | 0.25 s              | 7,520      | 1.9K       |
+| Windows-MCP 0.8.5 `Snapshot` | 0.75 s | 14,929 | 3.7K |
+
+</details>
+
+<picture>
   <source media="(prefers-color-scheme: dark)" srcset="./.github/resources/chart-speed-dark.svg">
   <img alt="Speedups release over release: macOS Finder with 2,000 files 2.2 s to 165 ms; Windows list of 3,000 rows 2.3 s to 0.85 s; settle after a field edit 350 ms to 230 ms" src="./.github/resources/chart-speed-light.svg" width="820">
 </picture>
 
-These are the before and after numbers from [Why it works well](#why-it-works-well). `node scripts/readme-charts.mjs` redraws all three charts; the coverage chart is counted from the capability matrix.
+These are the before and after numbers from [Why it works well](#why-it-works-well). `node scripts/readme-charts.mjs` redraws all four charts; the coverage chart is counted from the capability matrix.
 
 ## Why it works well
 

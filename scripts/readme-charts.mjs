@@ -153,7 +153,67 @@ function coverageChart(t) {
   return svg(W, H, "Capability coverage across computer-use servers", desc, t, body);
 }
 
-// --- 3. Release-over-release speedups ----------------------------------------
+// --- 3. Every Windows release on the same window -----------------------------
+
+// get_app_state on File Explorer at C:\Windows\System32, median of 10 warm calls
+// per release (two rounds of 5), and Windows-MCP 0.8.5's Snapshot in the same
+// rounds. Tokens are characters / 4.
+const HISTORY = [
+  ["0.2.0", 0.402, 9860], ["0.3.0", 0.43, 9860], ["0.3.1", 0.384, 9860], ["0.4.0", 0.384, 9860],
+  ["0.4.1", 0.378, 9860], ["0.4.2", 0.391, 9860], ["0.4.3", 0.404, 9860], ["0.4.4", 0.379, 9860],
+  ["0.5.0", 0.376, 9860], ["0.5.1", 0.372, 9860], ["0.5.2", 0.428, 9860], ["0.6.0", 0.374, 9860],
+  ["0.6.1", 0.413, 9860], ["0.7.0", 0.233, 7499], ["0.7.1", 0.285, 7499], ["0.7.2", 0.248, 7520],
+  ["0.7.3", 0.251, 7520],
+].map(([version, seconds, chars]) => ({ version, seconds, tokens: Math.round(chars / 4) }));
+const HISTORY_REFERENCE = { label: "Windows-MCP 0.8.5", seconds: 0.753, tokens: Math.round(14929 / 4) };
+
+function historyChart(t) {
+  const W = 820, left = 64, right = 150, plotH = 150, gapH = 74;
+  const plotW = W - left - right;
+  const panels = [
+    { title: "Read time (s, lower is better)", key: "seconds", max: 0.8, ticks: [0, 0.2, 0.4, 0.6, 0.8], fmt: (v) => `${v.toFixed(2)} s`, tick: (v) => `${v} s` },
+    { title: "Tokens per read (≈, lower is better)", key: "tokens", max: 4000, ticks: [0, 1000, 2000, 3000, 4000], fmt: (v) => `${(v / 1000).toFixed(1)}K`, tick: (v) => (v ? `${v / 1000}K` : "0") },
+  ];
+  const top = 128;
+  const H = top + panels.length * plotH + (panels.length - 1) * gapH + 44;
+  const x = (i) => left + (i / (HISTORY.length - 1)) * plotW;
+  let body = text(20, 30, "get_app_state in every Windows release", { fill: t.ink, size: 16, weight: 600 });
+  body += text(20, 50, "The same File Explorer window (C:\\Windows\\System32, 4,837 items) read by each release, median of 10 warm calls.", { fill: t.ink2, size: 12 });
+  body += text(20, 66, "0.7.0 started reading only what is on screen, with each element's attributes in one request.", { fill: t.ink2, size: 12 });
+  body += `<line x1="20" x2="34" y1="85" y2="85" stroke="${t.munim}" stroke-width="2"/>` + text(40, 89, "munim-computer-use", { fill: t.ink2, size: 12 });
+  body += `<line x1="170" x2="184" y1="85" y2="85" stroke="${t.other}" stroke-width="2"/>` + text(190, 89, HISTORY_REFERENCE.label + ", same rounds", { fill: t.ink2, size: 12 });
+  panels.forEach((p, n) => {
+    const y0 = top + n * (plotH + gapH);
+    const y = (v) => y0 + plotH - (v / p.max) * plotH;
+    body += text(left, y0 - 10, p.title, { fill: t.ink2, size: 12, weight: 600 });
+    for (const tick of p.ticks) {
+      body += `<line x1="${left}" x2="${left + plotW}" y1="${y(tick)}" y2="${y(tick)}" stroke="${tick ? t.grid : t.axis}" stroke-width="1"/>`;
+      body += text(left - 8, y(tick) + 4, p.tick(tick), { fill: t.muted, size: 11, anchor: "end" });
+    }
+    const marked = HISTORY.findIndex((h) => h.version === "0.7.0");
+    body += `<line x1="${x(marked)}" x2="${x(marked)}" y1="${y0}" y2="${y0 + plotH}" stroke="${t.axis}" stroke-width="1"/>`;
+    // The reference is one measurement, not a series over our releases: a flat line labelled at its end.
+    const ref = y(HISTORY_REFERENCE[p.key]);
+    body += `<line x1="${left}" x2="${left + plotW}" y1="${ref}" y2="${ref}" stroke="${t.other}" stroke-width="2" stroke-linecap="round"/>`;
+    body += text(left + plotW + 10, ref + 4, `${p.fmt(HISTORY_REFERENCE[p.key])} Windows-MCP`, { fill: t.ink2, size: 12 });
+    const points = HISTORY.map((h, i) => `${x(i).toFixed(1)},${y(h[p.key]).toFixed(1)}`).join(" ");
+    body += `<polyline points="${points}" fill="none" stroke="${t.munim}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+    HISTORY.forEach((h, i) => {
+      body += `<circle cx="${x(i)}" cy="${y(h[p.key])}" r="4" fill="${t.munim}" stroke="${t.surface}" stroke-width="2"/>`;
+    });
+    const last = HISTORY[HISTORY.length - 1], first = HISTORY[0];
+    body += text(left + plotW + 10, y(last[p.key]) + 4, `${p.fmt(last[p.key])} in ${last.version}`, { fill: t.ink, size: 12, weight: 600 });
+    body += text(x(0) + 8, y(first[p.key]) - 10, `${p.fmt(first[p.key])} in ${first.version}`, { fill: t.ink2, size: 12 });
+    HISTORY.forEach((h, i) => {
+      body += text(x(i), y0 + plotH + 18, h.version, { fill: h.version === "0.7.0" ? t.ink : t.muted, size: 10, weight: h.version === "0.7.0" ? 600 : 400, anchor: "middle" });
+    });
+  });
+  const desc = HISTORY.map((h) => `${h.version}: ${h.seconds} s, about ${h.tokens} tokens`).join("; ")
+    + `; ${HISTORY_REFERENCE.label}: ${HISTORY_REFERENCE.seconds} s, about ${HISTORY_REFERENCE.tokens} tokens`;
+  return svg(W, H, "get_app_state read time and size in every Windows release", desc, t, body);
+}
+
+// --- 4. Release-over-release speedups ----------------------------------------
 
 const SPEEDUPS = [
   { label: "macOS Finder, 2,000 files", before: 2.2, now: 0.165 },
@@ -191,5 +251,6 @@ for (const [mode, t] of Object.entries(THEMES)) {
   writeFileSync(join(out, `chart-look-${mode}.svg`), lookChart(t));
   writeFileSync(join(out, `chart-coverage-${mode}.svg`), coverageChart(t));
   writeFileSync(join(out, `chart-speed-${mode}.svg`), speedupChart(t));
+  writeFileSync(join(out, `chart-history-${mode}.svg`), historyChart(t));
 }
 console.log(readMatrix().map((c) => `${c.name}: ${c.yes} yes, ${c.partial} partly, ${c.applicable} applicable`).join("\n"));
