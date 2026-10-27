@@ -59,7 +59,11 @@ async function download(url, dest) {
 function extractZip(zipPath, dir) {
   // bsdtar on macOS and tar.exe on Windows 10+ both open zip archives, so no
   // dependency is needed for the two platforms that get prebuilt binaries.
-  const result = spawnSync("tar", ["-xf", zipPath, "-C", dir], { stdio: "inherit" });
+  // On Windows, name System32's tar.exe: a client started from Git Bash or
+  // MSYS has GNU tar first on PATH, which reads "C:\..." as a remote host.
+  const systemTar = process.platform === "win32" && path.join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe");
+  const tar = systemTar && fs.existsSync(systemTar) ? systemTar : "tar";
+  const result = spawnSync(tar, ["-xf", zipPath, "-C", dir], { stdio: "inherit" });
   if (result.status !== 0) throw new Error("could not extract the release archive with tar");
 }
 
