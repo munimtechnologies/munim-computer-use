@@ -65,7 +65,7 @@
 - [Why it works well](#why-it-works-well)
 - [Works alongside you](#works-alongside-you)
 - [Apps and sites the agent may use](#apps-and-sites-the-agent-may-use)
-- [Tools](#tools-32)
+- [Tools](#tools-33)
 - [Repository layout](#repository-layout)
 - [Environment flags](#environment-flags)
 - [Embedding in an app](#embedding-in-an-app)
@@ -228,6 +228,7 @@ These are the before and after numbers from [Why it works well](#why-it-works-we
 - **Model-agnostic.** No vision model is required for interaction; local models work too.
 - **Look → act → verify.** `hover` for mouse-over menus, `wait` for loads, `query` to find a control by label without reading a whole tree.
 - **Act and look in one call.** Pass `return_state: true` to any action (`click`, `type_text`, `set_value`, `browser_click`, `browser_navigate`, …) and the result carries the app's fresh accessibility tree, or the page's current snapshot. Browser actions report readiness separately: a loaded tab is not proof that delayed SPA UI has rendered. Use `wait_for_selector` for an expected visible element (see below). `state_query` narrows the desktop tree the same way `query` does.
+- **Several steps, one call.** `run_steps` takes a list like click the field, type, press return and runs it in order, each step with the same checks as a direct call. The whole list is checked before anything runs, the first failing step stops the rest, and the result says what ran and what did not. Put `return_state` on it to see the app after the last step.
 - **Pages as text.** `browser_read` returns a page's readable text with its headings, including what is scrolled out of view, from a tab in the background. It comes in chunks you can continue with `offset`, `query` keeps only the matching lines under their heading, and `include_links` lists the links.
 - **Passwords stay out of the conversation.** `browser_request_credentials` asks the user to sign in in a small Chrome window that shows the site's real origin. What they type goes straight into the page's fields and is never returned to the model. `browser_snapshot` never shows a password field's value, and on the desktop, typing into password fields is refused by default.
 - **Pick up what you are looking at.** `get_app_state` and `screenshot` take `app: "frontmost"` for the app in front of the user, so a client can hand the agent "this window" in one step.
@@ -265,16 +266,16 @@ You decide which apps and websites the agent may touch. Put a `policy.json` in t
 
 This is a guard rail for an agent that follows its instructions, not a sandbox. A coordinate click lands wherever it points, and a whole-display screenshot shows every window.
 
-## Tools (32)
+## Tools (33)
 
 | Area    | Tools                                                                                                                                                                                                      |
 | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | See     | `list_apps`, `get_app_state` (with `query`), `screenshot`, `zoom`, `list_displays`                                                                                                                         |
-| Act     | `click`, `right_click`, `hover`, `drag`, `scroll`, `type_text`, `set_value`, `select_text`, `press_key`, `activate_app`, `wait`                                                                            |
+| Act     | `click`, `right_click`, `hover`, `drag`, `scroll`, `type_text`, `set_value`, `select_text`, `press_key`, `activate_app`, `wait`, `run_steps`                                                               |
 | Clipboard | `clipboard_read`, `clipboard_write` (plain text)                                                                                                                                                         |
 | Browser | `browser_open_tab`, `browser_list_tabs`, `browser_use_tab`, `browser_release_tab`, `browser_select_tab`, `browser_navigate`, `browser_snapshot`, `browser_read`, `browser_click`, `browser_type`, `browser_request_credentials`, `browser_press_key`, `browser_close_tab`, `browser_close_all_tabs` |
 
-Every action tool also takes `return_state`, which returns current state after the action in the same call.
+Every action tool also takes `return_state`, which returns current state after the action in the same call. `run_steps` runs a list of them in one call and stops at the first that fails.
 
 ### Browser readiness and safe re-observation
 
