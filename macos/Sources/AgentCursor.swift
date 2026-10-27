@@ -205,7 +205,7 @@ final class AgentCursor {
         let dist = hypot(point.x - from.x, point.y - from.y)
         if dist < 2 { return 60_000 }
         // Same duration formula as the overlay flight.
-        let seconds = min(0.85, max(0.28, 0.20 + Double(dist) / 1100.0))
+        let seconds = min(0.45, max(0.12, 0.10 + Double(dist) / 1800.0))
         return useconds_t((seconds + 0.04) * 1_000_000)
     }
 
@@ -794,7 +794,7 @@ private final class OverlayController: NSObject, NSApplicationDelegate {
         let approach = min(handle * 0.85, max(20, dist * 0.16))
         pathC2 = CGPoint(x: point.x, y: point.y + approach)
 
-        pathDuration = min(0.85, max(0.28, 0.20 + Double(dist) / 1100.0))
+        pathDuration = min(0.45, max(0.12, 0.10 + Double(dist) / 1800.0))
         pathElapsed = 0
         pathActive = true
         velocity = .zero

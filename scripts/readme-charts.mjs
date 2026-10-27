@@ -61,11 +61,11 @@ ${body}
 // always attaches (Anthropic's w*h/750). Measured 27 October 2026.
 const SIZES = [100, 1000, 5000, 20000];
 const SCALE = [
-  { name: "munim-computer-use 0.7.3", short: "munim", ms: [235, 225, 237, 237], tokens: [2008, 2012, 2012, 2015] },
-  { name: "Cua Driver 0.38.0", short: "Cua Driver", ms: [169, 174, 185, 176], tokens: [3898, 3901, 3901, 3904] },
-  { name: "Windows-MCP 0.8.5", short: "Windows-MCP", ms: [790, 689, 771, 756], tokens: [3855, 3857, 3858, 3860] },
-  { name: "computer-use-mcp 7.8.0 (zavora)", short: "zavora", ms: [431, 487, 442, 421], tokens: [9346, 9346, 9348, 9351] },
-  { name: "open-computer-use 1.1.2", short: "open-computer-use", ms: [3427, 3735, 3513, 3202], tokens: [5858, 5849, 5861, 5864] },
+  { name: "munim-computer-use 0.8.0", short: "munim", ms: [139, 132, 155, 138], tokens: [2008, 2012, 2012, 2015] },
+  { name: "Cua Driver 0.38.0", short: "Cua Driver", ms: [199, 176, 177, 191], tokens: [3898, 3901, 3901, 3904] },
+  { name: "Windows-MCP 0.8.5", short: "Windows-MCP", ms: [770, 770, 784, 755], tokens: [3806, 3809, 3809, 3811] },
+  { name: "computer-use-mcp 7.8.0 (zavora)", short: "zavora", ms: [430, 495, 433, 520], tokens: [9346, 9348, 9348, 9349] },
+  { name: "open-computer-use 1.1.2", short: "open-computer-use", ms: [3946, 3823, 3700, 4227], tokens: [5858, 5861, 5861, 5852] },
 ];
 // Fixed slots, in series order (validated: scripts' palette check, both modes).
 const SERIES = {
@@ -74,7 +74,7 @@ const SERIES = {
 };
 
 function scaleChart(t, mode) {
-  const W = 820, left = 64, right = 190, plotH = 220, gapH = 84, top = 150;
+  const W = 820, left = 64, right = 215, plotH = 220, gapH = 84, top = 150;
   const plotW = W - left - right;
   const colors = SERIES[mode];
   const lx = Math.log10(SIZES[0]), rx = Math.log10(SIZES[SIZES.length - 1]);
@@ -139,7 +139,9 @@ function scaleChart(t, mode) {
       const values = group.map((e) => p.fmt(e.value));
       const label = values.every((v) => v === values[0])
         ? group.map((e) => SCALE[e.i].short).join(", ") + ` ${values[0]}`
-        : group.map((e, k) => `${SCALE[e.i].short} ${values[k]}`).join(", ");
+        : group.length === 2 && p.key === "tokens"
+          ? group.map((e) => SCALE[e.i].short).join(", ") + ` ${[...values].sort().join("–").replace(/K–/, "–")}`
+          : group.map((e, k) => `${SCALE[e.i].short} ${values[k]}`).join(", ");
       body += text(left + plotW + 10, y + 4, label, { fill: group.some((e) => e.i === 0) ? t.ink : t.ink2, size: 12, weight: group.some((e) => e.i === 0) ? 600 : 400 });
     }
   });
@@ -208,8 +210,10 @@ const HISTORY = [
   ["0.4.1", 0.378, 9860], ["0.4.2", 0.391, 9860], ["0.4.3", 0.404, 9860], ["0.4.4", 0.379, 9860],
   ["0.5.0", 0.376, 9860], ["0.5.1", 0.372, 9860], ["0.5.2", 0.428, 9860], ["0.6.0", 0.374, 9860],
   ["0.6.1", 0.413, 9860], ["0.7.0", 0.233, 7499], ["0.7.1", 0.285, 7499], ["0.7.2", 0.248, 7520],
-  ["0.7.3", 0.251, 7520],
+  ["0.7.3", 0.251, 7520], ["0.8.0", 0.158, 7515],
 ].map(([version, seconds, chars]) => ({ version, seconds, tokens: Math.round(chars / 4) }));
+// Releases that changed how get_app_state reads, drawn with a rule.
+const MARKED = ["0.7.0", "0.8.0"];
 const HISTORY_REFERENCE = { label: "Windows-MCP 0.8.5", seconds: 0.753, tokens: Math.round(14929 / 4) };
 
 function historyChart(t) {
@@ -224,7 +228,7 @@ function historyChart(t) {
   const x = (i) => left + (i / (HISTORY.length - 1)) * plotW;
   let body = text(20, 30, "get_app_state in every Windows release", { fill: t.ink, size: 16, weight: 600 });
   body += text(20, 50, "The same File Explorer window (C:\\Windows\\System32, 4,837 items) read by each release, median of 10 warm calls.", { fill: t.ink2, size: 12 });
-  body += text(20, 66, "0.7.0 started reading only what is on screen, with each element's attributes in one request.", { fill: t.ink2, size: 12 });
+  body += text(20, 66, "0.7.0 started reading only what is on screen; 0.8.0 fetches the whole window in one request instead of one per element.", { fill: t.ink2, size: 12 });
   body += `<line x1="20" x2="34" y1="85" y2="85" stroke="${t.munim}" stroke-width="2"/>` + text(40, 89, "munim-computer-use", { fill: t.ink2, size: 12 });
   body += `<line x1="170" x2="184" y1="85" y2="85" stroke="${t.other}" stroke-width="2"/>` + text(190, 89, HISTORY_REFERENCE.label + ", same rounds", { fill: t.ink2, size: 12 });
   panels.forEach((p, n) => {
@@ -235,8 +239,9 @@ function historyChart(t) {
       body += `<line x1="${left}" x2="${left + plotW}" y1="${y(tick)}" y2="${y(tick)}" stroke="${tick ? t.grid : t.axis}" stroke-width="1"/>`;
       body += text(left - 8, y(tick) + 4, p.tick(tick), { fill: t.muted, size: 11, anchor: "end" });
     }
-    const marked = HISTORY.findIndex((h) => h.version === "0.7.0");
-    body += `<line x1="${x(marked)}" x2="${x(marked)}" y1="${y0}" y2="${y0 + plotH}" stroke="${t.axis}" stroke-width="1"/>`;
+    for (const marked of HISTORY.flatMap((h, i) => (MARKED.includes(h.version) ? [i] : []))) {
+      body += `<line x1="${x(marked)}" x2="${x(marked)}" y1="${y0}" y2="${y0 + plotH}" stroke="${t.axis}" stroke-width="1"/>`;
+    }
     // The reference is one measurement, not a series over our releases: a flat line labelled at its end.
     const ref = y(HISTORY_REFERENCE[p.key]);
     body += `<line x1="${left}" x2="${left + plotW}" y1="${ref}" y2="${ref}" stroke="${t.other}" stroke-width="2" stroke-linecap="round"/>`;
@@ -250,7 +255,8 @@ function historyChart(t) {
     body += text(left + plotW + 10, y(last[p.key]) + 4, `${p.fmt(last[p.key])} in ${last.version}`, { fill: t.ink, size: 12, weight: 600 });
     body += text(x(0) + 8, y(first[p.key]) - 10, `${p.fmt(first[p.key])} in ${first.version}`, { fill: t.ink2, size: 12 });
     HISTORY.forEach((h, i) => {
-      body += text(x(i), y0 + plotH + 18, h.version, { fill: h.version === "0.7.0" ? t.ink : t.muted, size: 10, weight: h.version === "0.7.0" ? 600 : 400, anchor: "middle" });
+      const marked = MARKED.includes(h.version);
+      body += text(x(i), y0 + plotH + 18, h.version, { fill: marked ? t.ink : t.muted, size: 10, weight: marked ? 600 : 400, anchor: "middle" });
     });
   });
   const desc = HISTORY.map((h) => `${h.version}: ${h.seconds} s, about ${h.tokens} tokens`).join("; ")

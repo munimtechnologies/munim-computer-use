@@ -235,7 +235,7 @@ fn travel_wait_micros(from: Option<(f64, f64)>, x: f64, y: f64) -> u64 {
     if dist < 2.0 {
         return 60_000;
     }
-    let seconds = (0.18 + dist / 900.0).clamp(0.28, 0.95);
+    let seconds = (0.10 + dist / 1800.0).clamp(0.12, 0.45);
     ((seconds + 0.05) * 1_000_000.0) as u64
 }
 
@@ -492,7 +492,7 @@ fn begin(state: &mut Anim, x: f64, y: f64, _popping: bool) {
     );
     let approach = (handle * 0.9).min((dist * 0.28).max(28.0));
     state.path_c2 = (x, y + approach);
-    state.path_duration = (0.18 + dist / 900.0).clamp(0.28, 0.95);
+    state.path_duration = (0.10 + dist / 1800.0).clamp(0.12, 0.45);
     state.path_elapsed = 0.0;
     state.path_active = true;
     state.vel = (0.0, 0.0);

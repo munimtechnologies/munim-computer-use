@@ -155,27 +155,37 @@ The chart counts the table above (`n/a` cells are left out), so it shares the ta
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="./.github/resources/chart-scale-dark.svg">
-  <img alt="Five computer-use servers reading File Explorer with 100 to 20,000 files on Windows 11. Time per read: Cua Driver about 0.18 s, munim-computer-use about 0.24 s, computer-use-mcp (zavora) about 0.44 s, Windows-MCP about 0.75 s, open-computer-use about 3.5 s. Tokens per read: munim about 2.0K, Cua Driver and Windows-MCP about 3.9K, open-computer-use about 5.9K, zavora about 9.3K. Every line is flat across folder sizes." src="./.github/resources/chart-scale-light.svg" width="820">
+  <img alt="Five computer-use servers reading File Explorer with 100 to 20,000 files on Windows 11. Time per read: munim-computer-use 0.8.0 about 0.14 s, Cua Driver about 0.19 s, computer-use-mcp (zavora) about 0.47 s, Windows-MCP about 0.77 s, open-computer-use about 3.9 s. Tokens per read: munim about 2.0K, Cua Driver and Windows-MCP about 3.8 to 3.9K, open-computer-use about 5.9K, zavora about 9.3K. Every line is flat across folder sizes." src="./.github/resources/chart-scale-light.svg" width="820">
 </picture>
 
-Reading a window is the step an agent repeats most. Here every Windows server we could run reads the same File Explorer window as the folder grows from 100 to 20,000 files. All of them read only the rows on screen, so the lines are flat; what differs is the level. Cua Driver is the fastest reader, and munim-computer-use returns the fewest tokens, about half of the next.
+Reading a window is the step an agent repeats most. Here every Windows server we could run reads the same File Explorer window as the folder grows from 100 to 20,000 files. All of them read only the rows on screen, so the lines are flat; what differs is the level. munim-computer-use is the fastest at every size and returns the fewest tokens, about half of the next.
 
-| Server                          | Read tool                                       | 100 files | 1,000  | 5,000  | 20,000 | Tokens per read (≈)     |
-| ------------------------------- | ----------------------------------------------- | --------- | ------ | ------ | ------ | ----------------------- |
-| **munim-computer-use 0.7.3**    | `get_app_state`                                 | 0.24 s    | 0.23 s | 0.24 s | 0.24 s | **2.0K**                |
-| Cua Driver 0.38.0               | `get_window_state`, `include_screenshot: false` | 0.17 s    | 0.17 s | 0.19 s | 0.18 s | 3.9K                    |
-| Windows-MCP 0.8.5               | `Snapshot`                                      | 0.79 s    | 0.69 s | 0.77 s | 0.76 s | 3.9K                    |
-| computer-use-mcp 7.8.0 (zavora) | `get_ui_tree` (`COMPUTER_USE_PROFILE=full`)     | 0.43 s    | 0.49 s | 0.44 s | 0.42 s | 9.3K                    |
-| open-computer-use 1.1.2         | `get_app_state`                                 | 3.43 s    | 3.74 s | 3.51 s | 3.20 s | 5.9K, with a screenshot |
+| Server                          | Read tool                                       | 100 files  | 1,000      | 5,000      | 20,000     | Tokens per read (≈)     |
+| ------------------------------- | ----------------------------------------------- | ---------- | ---------- | ---------- | ---------- | ----------------------- |
+| **munim-computer-use 0.8.0**    | `get_app_state`                                 | **0.14 s** | **0.13 s** | **0.16 s** | **0.14 s** | **2.0K**                |
+| Cua Driver 0.38.0               | `get_window_state`, `include_screenshot: false` | 0.20 s     | 0.18 s     | 0.18 s     | 0.19 s     | 3.9K                    |
+| Windows-MCP 0.8.5               | `Snapshot`                                      | 0.77 s     | 0.77 s     | 0.78 s     | 0.76 s     | 3.8K                    |
+| computer-use-mcp 7.8.0 (zavora) | `get_ui_tree` (`COMPUTER_USE_PROFILE=full`)     | 0.43 s     | 0.50 s     | 0.43 s     | 0.52 s     | 9.3K                    |
+| open-computer-use 1.1.2         | `get_app_state`                                 | 3.95 s     | 3.82 s     | 3.70 s     | 4.23 s     | 5.9K, with a screenshot |
 
 How it was measured, on 27 October 2026: Windows 11 (build 26200), one 1920×1080 display. For each folder size a fresh File Explorer window was opened in front and every server was started once, called over stdio with its own read tool and default arguments (text only where the tool has a switch for it; open-computer-use always attaches a screenshot), one warm-up call dropped, then 5 timed calls; the whole run was done twice, so each time is the median of 10. Tokens are estimates: text at 4 characters per token, images by Anthropic's formula (width × height / 750 after the API's resize). Windows-MCP's `Snapshot` also lists the desktop's other windows; the others read one window. [Terminator](https://github.com/mediar-ai/terminator) was left out: its `get_window_tree` picks the first `explorer` process, which is the taskbar, and it takes no pid.
 
+Acting, on the same PC: the five clicks of 1 + 2 = on Calculator (clear, 1, +, 2, =), each a separate call by element id, after one read. Median of 3 runs.
+
+| Server                       | Five clicks | Per click |
+| ---------------------------- | ----------- | --------- |
+| **munim-computer-use 0.8.0** | **1.70 s**  | **0.34 s** |
+| Cua Driver 0.38.0            | 2.32 s      | 0.46 s    |
+| munim-computer-use 0.7.3     | 2.98 s      | 0.60 s    |
+
+Most of a click is the agent pointer flying to the target so you can see where the agent acts; 0.8.0 halves that flight. `run_steps` sends all five in one call.
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="./.github/resources/chart-history-dark.svg">
-  <img alt="get_app_state on the same File Explorer window in every Windows release: about 0.4 s and 2.5K tokens from 0.2.0 through 0.6.1, then about 0.25 s and 1.9K tokens from 0.7.0 on; Windows-MCP 0.8.5 took 0.75 s and about 3.7K tokens in the same rounds" src="./.github/resources/chart-history-light.svg" width="820">
+  <img alt="get_app_state on the same File Explorer window in every Windows release: about 0.4 s and 2.5K tokens from 0.2.0 through 0.6.1, about 0.25 s and 1.9K tokens from 0.7.0, and 0.16 s in 0.8.0; Windows-MCP 0.8.5 took 0.75 s and about 3.7K tokens" src="./.github/resources/chart-history-light.svg" width="820">
 </picture>
 
-The same window read by every Windows release, from the release binaries, in two rounds of all 17 with Windows-MCP in each round (a separate run from the one above, so the times differ a little). 0.7.0 is where `get_app_state` started reading only what is on screen and fetching each element's attributes in one request.
+The same window read by every Windows release, from the release binaries, in two rounds of all 17 with Windows-MCP in each round, plus 0.8.0 measured against 0.7.3 the same way (a separate run from the one above, so the times differ a little). 0.7.0 is where `get_app_state` started reading only what is on screen and fetching each element's attributes in one request; 0.8.0 fetches the whole window in one request instead of one per element, with the same output.
 
 <details>
 <summary>The numbers</summary>
@@ -199,6 +209,7 @@ The same window read by every Windows release, from the release binaries, in two
 | 0.7.1   | 0.28 s              | 7,499      | 1.9K       |
 | 0.7.2   | 0.25 s              | 7,520      | 1.9K       |
 | 0.7.3   | 0.25 s              | 7,520      | 1.9K       |
+| 0.8.0   | 0.16 s              | 7,515      | 1.9K       |
 | Windows-MCP 0.8.5 `Snapshot` | 0.75 s | 14,929 | 3.7K |
 
 </details>
@@ -208,7 +219,7 @@ The same window read by every Windows release, from the release binaries, in two
 ## Why it works well
 
 - **Accessibility first, pixels second.** `get_app_state` returns the app's accessibility tree with stable element ids, so the agent presses _the button_ instead of guessing at a coordinate. It costs a fraction of the tokens of a screenshot and it is what scores highest on OSWorld-style tasks. Screenshots are for verifying and for content the tree cannot describe.
-- **What is on screen, fast.** `get_app_state` lists what is in view: a list or table gives its visible rows, and anything scrolled away is skipped and counted (`offscreen: true` lists it too). Attributes are read in one request per element. A Finder window of 2,000 files reads in 165 ms instead of 2.2 s, and a Windows list of 3,000 rows in 0.85 s instead of 2.3 s, with room left for the rest of the app.
+- **What is on screen, fast.** `get_app_state` lists what is in view: a list or table gives its visible rows, and anything scrolled away is skipped and counted (`offscreen: true` lists it too). Attributes are read in one request per element, and on Windows the whole window comes back in a single request. A Finder window of 2,000 files reads in 165 ms instead of 2.2 s, and File Explorer in about 0.15 s, faster than any other Windows server we measured (see [Benchmarks](#benchmarks)).
 - **Dialogs first.** While a sheet, alert or popover blocks a window, only its controls are listed, with a note saying so, so the agent answers the dialog instead of clicking behind it.
 - **Electron and Chromium apps (macOS).** Slack, VS Code, Discord and other Chromium-based apps expose their tree only to a client that asks; `get_app_state` asks, and says so while a background app is still building it.
 - **Text the tree cannot describe.** When an app exposes no labelled controls, its window is read with on-device OCR (Apple Vision on macOS, Windows OCR on Windows) and the text is listed with ids that `click`, `hover`, `right_click` and `drag` accept. The image never leaves the machine. `ocr: "always"` or `"never"` overrides it.

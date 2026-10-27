@@ -1177,7 +1177,7 @@ dependencies = [
 
 [[package]]
 name = "munim-computer-use-native"
-version = "0.7.3"
+version = "0.8.0"
 dependencies = [
  "arboard",
  "atspi",

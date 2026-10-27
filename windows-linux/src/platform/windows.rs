@@ -99,6 +99,12 @@ struct Batch {
     without_hidden_rows: UICondition,
     /// Just those hidden rows, to count them without fetching their properties.
     hidden_rows: UICondition,
+    /// A window's whole tree, in the same control view `request` walks, with
+    /// the same properties, in one round trip. Walking it a level per request
+    /// cost one cross-process call per element with children: about 200 calls
+    /// for a File Explorer window. What is off screen is still left out by
+    /// the walk, by the same rules; it is just already fetched.
+    tree: UICacheRequest,
 }
 
 /// The properties `Node::cached` reads.
@@ -129,7 +135,7 @@ impl WindowsDesktop {
         })
     }
 
-    fn batch_request(automation: &UIAutomation) -> Option<Batch> {
+    fn property_request(automation: &UIAutomation) -> Option<UICacheRequest> {
         let request = automation.create_cache_request().ok()?;
         for property in BATCHED {
             // IsDialog needs Windows 10 1809; older systems just go without it.
@@ -137,6 +143,17 @@ impl WindowsDesktop {
                 return None;
             }
         }
+        Some(request)
+    }
+
+    fn tree_request(automation: &UIAutomation) -> Option<UICacheRequest> {
+        let request = Self::property_request(automation)?;
+        request.set_tree_scope(TreeScope::Subtree).ok()?;
+        Some(request)
+    }
+
+    fn batch_request(automation: &UIAutomation) -> Option<Batch> {
+        let request = Self::property_request(automation)?;
         // Rows as `Node::is_row` defines them: ListItem, TreeItem, DataItem.
         let row_type = |id: i32| automation.create_property_condition(UIProperty::ControlType, Variant::from(id), None);
         let rows = automation.create_or_condition(
@@ -146,7 +163,13 @@ impl WindowsDesktop {
         let offscreen = || automation.create_property_condition(UIProperty::IsOffscreen, Variant::from(true), None);
         let hidden_rows = automation.create_and_condition(offscreen().ok()?, rows).ok()?;
         let without_hidden_rows = automation.create_not_condition(hidden_rows.clone()).ok()?;
-        Some(Batch { request, all: automation.create_true_condition().ok()?, without_hidden_rows, hidden_rows })
+        Some(Batch {
+            request,
+            tree: Self::tree_request(automation)?,
+            all: automation.create_true_condition().ok()?,
+            without_hidden_rows,
+            hidden_rows,
+        })
     }
 
     /// Resolve an id, rechecking that the element is still what was listed:
@@ -717,10 +740,19 @@ impl WindowsDesktop {
         Ok(())
     }
 
-    /// The children of `element`, with their properties. With `skip_hidden_rows`,
-    /// rows UIA reports scrolled away are left out on the provider's side and
-    /// only counted; the second number is that count.
-    fn children(&self, element: &UIElement, skip_hidden_rows: bool) -> (Vec<Node>, usize) {
+    /// The children of `node`, with their properties: from the cache when
+    /// its window's tree was fetched whole, otherwise one request. In that
+    /// case, with `skip_hidden_rows`, rows UIA reports scrolled away are left
+    /// out on the provider's side and only counted; the second number is that
+    /// count.
+    fn children(&self, node: &Node, skip_hidden_rows: bool) -> (Vec<Node>, usize) {
+        let element = &node.element;
+        if node.in_tree {
+            // Fetched with the window. Hidden rows are among them, and the
+            // walk skips and counts them one by one.
+            let found = element.get_cached_children().map(|found| found.into_iter().map(Node::in_tree).collect());
+            return (found.unwrap_or_default(), 0);
+        }
         if let Some(batch) = &self.batch {
             if skip_hidden_rows
                 && let Ok(found) = element.find_all_build_cache(TreeScope::Children, &batch.without_hidden_rows, &batch.request)
@@ -751,13 +783,17 @@ impl WindowsDesktop {
         (nodes, 0)
     }
 
-    /// A top-level window as the root of a walk.
+    /// A top-level window as the root of a walk, with its whole tree when
+    /// the provider can hand it over in one go.
     fn window_node(&self, window: HWND) -> Option<Node> {
         let handle = Handle::from(window.0 as isize);
-        if let Some(batch) = &self.batch
-            && let Ok(element) = self.automation.element_from_handle_build_cache(handle, &batch.request)
-        {
-            return Some(Node::cached(element));
+        if let Some(batch) = &self.batch {
+            if let Ok(element) = self.automation.element_from_handle_build_cache(handle, &batch.tree) {
+                return Some(Node::in_tree(element));
+            }
+            if let Ok(element) = self.automation.element_from_handle_build_cache(handle, &batch.request) {
+                return Some(Node::cached(element));
+            }
         }
         self.automation.element_from_handle(Handle::from(window.0 as isize)).ok().map(Node::live)
     }
@@ -865,9 +901,10 @@ impl WindowsDesktop {
             clip
         };
         let prune = !limits.offscreen && !window.minimized;
-        // Long lists live in scroll containers: leave their hidden rows to
-        // the provider rather than fetching every one.
-        let (children, hidden_rows) = self.children(&node.element, prune && node.scrolls);
+        // Long lists live in scroll containers. Without the whole tree in
+        // hand, leave their hidden rows to the provider rather than fetching
+        // every one.
+        let (children, hidden_rows) = self.children(node, prune && node.scrolls);
         walk.skipped += hidden_rows;
         for child in children {
             if walk.rows.len() >= limits.max_elements {
@@ -929,6 +966,8 @@ struct Node {
     scrolls: bool,
     /// A modal window or dialog: blocks the window it is in.
     dialog: bool,
+    /// Fetched with its window's whole tree: its children are in the cache.
+    in_tree: bool,
 }
 
 fn variant_bool(value: uiautomation::Result<Variant>) -> bool {
@@ -968,9 +1007,14 @@ impl Node {
             bounds: bounds_of(element.get_cached_bounding_rectangle()),
             scrolls: variant_bool(element.get_cached_property_value(UIProperty::IsScrollPatternAvailable)),
             dialog,
+            in_tree: false,
             control_type,
             element,
         }
+    }
+
+    fn in_tree(element: UIElement) -> Self {
+        Self { in_tree: true, ..Self::cached(element) }
     }
 
     fn live(element: UIElement) -> Self {
@@ -993,6 +1037,7 @@ impl Node {
             bounds: bounds_of(element.get_bounding_rectangle()),
             scrolls: variant_bool(element.get_property_value(UIProperty::IsScrollPatternAvailable)),
             dialog,
+            in_tree: false,
             control_type,
             element,
         }
@@ -1581,7 +1626,13 @@ impl Desktop for WindowsDesktop {
             scoped = true;
             for (window, dialog) in dialogs {
                 let root = match &self.batch {
-                    Some(batch) => dialog.build_updated_cache(&batch.request).map(Node::cached).unwrap_or_else(|_| Node::live(dialog)),
+                    Some(batch) => {
+                        dialog
+                            .build_updated_cache(&batch.tree)
+                            .map(Node::in_tree)
+                            .or_else(|_| dialog.build_updated_cache(&batch.request).map(Node::cached))
+                            .unwrap_or_else(|_| Node::live(dialog))
+                    }
                     None => Node::live(dialog),
                 };
                 if ocr_window.is_none() {
