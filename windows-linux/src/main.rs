@@ -28,6 +28,8 @@ mod keys;
 mod live;
 mod platform;
 mod policy;
+#[cfg(windows)]
+mod secure_desktop;
 mod settle;
 mod tools;
 
@@ -96,6 +98,11 @@ fn main() {
             eprintln!("munim-computer-use: native host stopped: {error}");
         }
         return;
+    }
+
+    #[cfg(windows)]
+    if let Some(code) = mode.and_then(secure_desktop::run) {
+        std::process::exit(code);
     }
 
     if mode == Some("install-native-host") {
@@ -202,12 +209,25 @@ fn main() {
             }
             continue;
         };
-        let params = request.get("params").cloned().unwrap_or(json!({}));
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut params = request.get("params").cloned().unwrap_or(json!({}));
 
         #[cfg(any(windows, target_os = "linux"))]
         let _tool_guard = (method == "tools/call").then(|| DesktopToolGuard::enter());
 
-        let outcome = dispatch(&method, &params, desktop.as_deref_mut(), &mut browser);
+        // A remote viewer's captures and input go to the secure desktop helper
+        // while a UAC or lock-screen prompt has the screen.
+        #[cfg(windows)]
+        let routed = (method == "tools/call" && identity::remote_control())
+            .then(|| secure_desktop::route(&mut params))
+            .flatten();
+        #[cfg(not(windows))]
+        let routed: Option<Value> = None;
+
+        let outcome = match routed {
+            Some(result) => Ok(result),
+            None => dispatch(&method, &params, desktop.as_deref_mut(), &mut browser),
+        };
         let response = match outcome {
             Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
             Err(error) => json!({
@@ -385,57 +405,9 @@ fn call_tool(
         };
     }
     if name == "screenshot"
-        && let Some(display) = arg_i64(&args, "display")
+        && let Some(result) = display_screenshot(&args)
     {
-        let max_width = arg_i64(&args, "max_width")
-            .unwrap_or(capture::DEFAULT_MAX_WIDTH as i64)
-            .clamp(0, 8000) as u32;
-        let format = match capture::CaptureFormat::parse(arg_str(&args, "format"), arg_i64(&args, "quality")) {
-            Ok(format) => format,
-            Err(error) => return text_result(format!("error: {error}"), true),
-        };
-        let Ok(index) = usize::try_from(display) else {
-            return text_result("error: display index must be zero or greater", true);
-        };
-        if args.get("live").and_then(Value::as_bool) == Some(true) {
-            let request = live::LiveRequest {
-                display: index,
-                max_width,
-                format,
-                after: args.get("after").and_then(Value::as_u64),
-                wait_ms: arg_i64(&args, "wait_ms")
-                    .unwrap_or(i64::from(live::DEFAULT_WAIT_MS))
-                    .clamp(0, i64::from(live::MAX_WAIT_MS)) as u32,
-                pointer: args.get("cursor").and_then(Value::as_bool) == Some(true),
-            };
-            match live::frame(&request) {
-                Ok(live::LiveFrame::Changed { capture, seq }) => {
-                    let text = capture::caption(&capture, &format!("display {index}"));
-                    let mut result = image_result(capture.bytes, format.mime_type(), text);
-                    if let Some(content) = result.get_mut("content").and_then(Value::as_array_mut) {
-                        content.push(json!({ "type": "text", "text": live::live_line(seq, true) }));
-                    }
-                    return with_cursor(result, &args);
-                }
-                Ok(live::LiveFrame::Unchanged { seq }) => {
-                    return with_cursor(text_result(live::live_line(seq, false), false), &args);
-                }
-                Err(live::LiveError::Failed(error)) => return text_result(format!("error: {error}"), true),
-                // No live path here: an ordinary capture, without the live line,
-                // tells the viewer to keep polling.
-                Err(live::LiveError::Unsupported) => {}
-            }
-        }
-        return match usize::try_from(display) {
-            Ok(index) => match capture::capture_display(index, max_width, format) {
-                Ok(capture) => {
-                    let text = capture::caption(&capture, &format!("display {index}"));
-                    with_cursor(image_result(capture.bytes, format.mime_type(), text), &args)
-                }
-                Err(error) => text_result(format!("error: {error}"), true),
-            },
-            Err(_) => text_result("error: display index must be zero or greater", true),
-        };
+        return result;
     }
     // Zoom and wait need neither accessibility nor a window: keep them usable
     // when the backend failed to start, like display screenshots.
@@ -598,6 +570,58 @@ fn run_steps(
     };
     content.insert(0, json!({ "type": "text", "text": summary }));
     json!({ "isError": failed.is_some(), "content": content })
+}
+
+/// A whole-display screenshot (`display` set), live or one-shot. None when the
+/// request names no display. Shared with the secure desktop helper.
+fn display_screenshot(args: &Value) -> Option<Value> {
+    let display = arg_i64(args, "display")?;
+    let max_width = arg_i64(args, "max_width")
+        .unwrap_or(capture::DEFAULT_MAX_WIDTH as i64)
+        .clamp(0, 8000) as u32;
+    let format = match capture::CaptureFormat::parse(arg_str(args, "format"), arg_i64(args, "quality")) {
+        Ok(format) => format,
+        Err(error) => return Some(text_result(format!("error: {error}"), true)),
+    };
+    let Ok(index) = usize::try_from(display) else {
+        return Some(text_result("error: display index must be zero or greater", true));
+    };
+    if args.get("live").and_then(Value::as_bool) == Some(true) {
+        let request = live::LiveRequest {
+            display: index,
+            max_width,
+            format,
+            after: args.get("after").and_then(Value::as_u64),
+            wait_ms: arg_i64(args, "wait_ms")
+                .unwrap_or(i64::from(live::DEFAULT_WAIT_MS))
+                .clamp(0, i64::from(live::MAX_WAIT_MS)) as u32,
+            pointer: args.get("cursor").and_then(Value::as_bool) == Some(true),
+        };
+        match live::frame(&request) {
+            Ok(live::LiveFrame::Changed { capture, seq }) => {
+                let text = capture::caption(&capture, &format!("display {index}"));
+                let mut result = image_result(capture.bytes, format.mime_type(), text);
+                if let Some(content) = result.get_mut("content").and_then(Value::as_array_mut) {
+                    content.push(json!({ "type": "text", "text": live::live_line(seq, true) }));
+                }
+                return Some(with_cursor(result, args));
+            }
+            Ok(live::LiveFrame::Unchanged { seq }) => {
+                return Some(with_cursor(text_result(live::live_line(seq, false), false), args));
+            }
+            Err(live::LiveError::Failed(error)) => return Some(text_result(format!("error: {error}"), true)),
+            // No live path here: an ordinary capture, without the live line,
+            // tells the viewer to keep polling.
+            Err(live::LiveError::Unsupported) => {}
+        }
+    }
+    Some(match capture::capture_display(index, max_width, format) {
+        Ok(capture) => {
+            let text = capture::caption(&capture, &format!("display {index}"));
+            with_cursor(image_result(capture.bytes, format.mime_type(), text), args)
+        }
+        Err(error) => text_result(format!("error: {error}"), true),
+    })
 }
 
 fn zoom_region(args: &Value) -> Result<Value, DesktopError> {

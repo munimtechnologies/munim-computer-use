@@ -26,6 +26,8 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 # Friendly wrapper over the UI Automation COM API. Raw `windows` bindings would
 # put several hundred lines of COM plumbing between us and every tool call.
 uiautomation = "0.25.1"
+# The LocalSystem service behind secure-desktop capture (secure_desktop.rs).
+windows-service = "0.8"
 windows = { version = "0.62.2", features = [
   "Win32_Foundation",
   "Win32_UI_Input_KeyboardAndMouse",
@@ -44,6 +46,11 @@ windows = { version = "0.62.2", features = [
   # Why a sandboxed server sees empty trees and black captures, and why a
   # registration Chrome cannot see (platform/session.rs, host_check.rs).
   "Win32_Security",
+  # The secure desktop helper: its service, pipe and elevation (secure_desktop.rs).
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+  "Win32_UI_Shell",
   "Win32_Storage_Packaging_Appx",
   "Win32_System_RemoteDesktop",
   "Win32_System_StationsAndDesktops",

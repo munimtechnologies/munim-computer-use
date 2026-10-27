@@ -2044,6 +2044,67 @@ impl Desktop for WindowsDesktop {
     }
 }
 
+/// Real pointer and keyboard input with no UI Automation, for the secure
+/// desktop helper (secure_desktop.rs): UIA cannot reach the Winlogon desktop,
+/// and a remote viewer aims at pixels anyway.
+pub(crate) mod raw {
+    use super::*;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP};
+
+    pub(crate) fn hover(x: f64, y: f64) -> Result<String> {
+        check_display_point(x, y)?;
+        WindowsDesktop::jump_cursor(x, y)?;
+        Ok(format!("hovering at ({x:.0}, {y:.0})"))
+    }
+
+    pub(crate) fn click(x: f64, y: f64, count: u32, right: bool) -> Result<String> {
+        check_display_point(x, y)?;
+        WindowsDesktop::jump_cursor(x, y)?;
+        let (down, up) = if right {
+            (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP)
+        } else {
+            (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP)
+        };
+        for _ in 0..count.max(1) {
+            WindowsDesktop::mouse_button(down)?;
+            WindowsDesktop::mouse_button(up)?;
+        }
+        Ok(format!("{} at ({x:.0}, {y:.0})", if right { "right-clicked" } else { "clicked" }))
+    }
+
+    pub(crate) fn drag(from: (f64, f64), to: (f64, f64)) -> Result<String> {
+        check_display_point(from.0, from.1)?;
+        check_display_point(to.0, to.1)?;
+        WindowsDesktop::cursor_drag(from, to)?;
+        Ok(format!("dragged ({:.0}, {:.0}) → ({:.0}, {:.0})", from.0, from.1, to.0, to.1))
+    }
+
+    pub(crate) fn scroll(at: Option<(f64, f64)>, direction: ScrollDirection, amount: i32) -> Result<String> {
+        if let Some((x, y)) = at {
+            check_display_point(x, y)?;
+            WindowsDesktop::jump_cursor(x, y)?;
+        }
+        let (horizontal, vertical) = direction.deltas(amount);
+        if horizontal != 0 {
+            WindowsDesktop::scroll_wheel(true, horizontal)?;
+        }
+        if vertical != 0 {
+            WindowsDesktop::scroll_wheel(false, vertical)?;
+        }
+        Ok(format!("scrolled {direction:?} by {amount}").to_lowercase())
+    }
+
+    pub(crate) fn press_key(key: &str, modifiers: &[String]) -> Result<String> {
+        send_key_plan(&key_plan(key, modifiers, layout_vk)?)?;
+        Ok(if modifiers.is_empty() { format!("pressed {key}") } else { format!("pressed {}+{key}", modifiers.join("+")) })
+    }
+
+    pub(crate) fn type_text(text: &str) -> Result<String> {
+        send_inputs(&text_inputs(text))?;
+        Ok(format!("typed {} characters", text.chars().count()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{KeyPlan, Stroke, is_app_control, key_plan, on_display, point_in_rect, scale_point, text_inputs, truncate};
