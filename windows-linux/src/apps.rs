@@ -44,6 +44,7 @@ fn grouped_windows() -> Result<Vec<Group>> {
         let name = window
             .app_name()
             .ok()
+            .map(|name| readable_app_name(&name))
             .filter(|name| !name.is_empty())
             .or_else(|| window.title().ok().filter(|title| !title.is_empty()))
             .unwrap_or_else(|| format!("pid {pid}"));
@@ -76,6 +77,22 @@ fn grouped_windows() -> Result<Vec<Group>> {
     }
 
     Ok(groups.into_values().collect())
+}
+
+/// xcap names a Windows app by its executable's file description, and by the
+/// executable's full path when it cannot read that, as for packaged apps under
+/// `C:\Program Files\WindowsApps` (Notepad, Terminal). A path is no name to
+/// ask for an app by, so keep its file name without the `.exe`.
+fn readable_app_name(name: &str) -> String {
+    let name = name.trim();
+    if !name.contains(['\\', '/']) {
+        return name.to_string();
+    }
+    let file = name.rsplit(['\\', '/']).next().unwrap_or(name);
+    match file.len().checked_sub(4) {
+        Some(stem) if file.is_char_boundary(stem) && file[stem..].eq_ignore_ascii_case(".exe") => file[..stem].to_string(),
+        _ => file.to_string(),
+    }
 }
 
 pub fn list_apps() -> Result<Vec<AppInfo>> {
@@ -178,7 +195,7 @@ fn ambiguity_message(query: &str, several: &[&AppInfo]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ambiguity_message, resolve_pid};
+    use super::{ambiguity_message, readable_app_name, resolve_pid};
     use crate::platform::AppInfo;
 
     fn chrome(pid: u32, title: &str, frontmost: bool) -> AppInfo {
@@ -215,6 +232,18 @@ mod tests {
     fn an_unmatched_name_points_at_list_apps() {
         let error = resolve_pid("definitely-not-running-xyzzy").unwrap_err().0;
         assert!(error.contains("list_apps"), "unhelpful: {error}");
+    }
+
+    #[test]
+    fn a_packaged_app_reported_by_path_is_named_by_its_file() {
+        assert_eq!(
+            readable_app_name(r"C:\Program Files\WindowsApps\Microsoft.WindowsNotepad_11.2607.14.0_x64__8wekyb3d8bbwe\Notepad\Notepad.exe"),
+            "Notepad"
+        );
+        assert_eq!(readable_app_name("/usr/bin/gnome-calculator"), "gnome-calculator");
+        assert_eq!(readable_app_name(r"C:\Tools\thing.EXE"), "thing");
+        assert_eq!(readable_app_name("Google Chrome"), "Google Chrome", "a real name is kept");
+        assert_eq!(readable_app_name("Setup.exe"), "Setup.exe", "only a path is shortened");
     }
 
     #[test]

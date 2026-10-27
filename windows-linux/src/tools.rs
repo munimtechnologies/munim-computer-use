@@ -24,7 +24,7 @@ pub fn browser_control_enabled() -> bool {
 }
 
 /// Returned in the `initialize` result; identical in the Swift server.
-pub const SERVER_INSTRUCTIONS: &str = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Pass return_state on an action to get current state back in the same call. For delayed browser UI, use wait_for_selector with return_state and inspect readiness; a loaded tab is not SPA readiness. A timeout does not undo the action: re-observe with browser_snapshot and the same wait before repeating a non-idempotent action. Use browser_read to read a page's text. Never ask for, or type, a password or code yourself: browser_request_credentials lets the user enter it without you seeing it. The user's Computer Use policy can block apps and sites or require their approval; when a call says so, do not work around it. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf.";
+pub const SERVER_INSTRUCTIONS: &str = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Pass return_state on an action to get current state back in the same call. Use run_steps for several actions you already know, like click, type, press return: one call, stopping at the first that fails. For delayed browser UI, use wait_for_selector with return_state and inspect readiness; a loaded tab is not SPA readiness. A timeout does not undo the action: re-observe with browser_snapshot and the same wait before repeating a non-idempotent action. Use browser_read to read a page's text. Never ask for, or type, a password or code yourself: browser_request_credentials lets the user enter it without you seeing it. The user's Computer Use policy can block apps and sites or require their approval; when a call says so, do not work around it. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf.";
 
 pub fn tool_defs() -> Value {
     let Value::Array(defs) = all_tool_defs() else {
@@ -553,6 +553,49 @@ fn all_tool_defs() -> Value {
                 "destructiveHint": false,
                 "idempotentHint": true,
                 "openWorldHint": false
+            }
+        },
+        {
+            "name": "run_steps",
+            "description": "Run a sequence of actions in one call, in order, stopping at the first step that fails. Each step names another tool and its arguments, and runs exactly as if you had called it: the same app and site rules, element id checks and password-field refusals apply. Use it for steps you already know will follow each other, like click a field, type, press return, after reading the app with get_app_state. Element ids from that snapshot stay valid until a step reads the app again. The result lists every step's outcome; when a step fails, the steps after it do not run and the call reports an error. Put return_state on run_steps, not on a step, to get the state after the last step. At most 20 steps; run_steps cannot contain run_steps.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "description": "The actions to run, in order",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "tool": {
+                                    "type": "string",
+                                    "description": "Name of the tool to call, e.g. click, type_text, press_key, wait, browser_click"
+                                },
+                                "args": {
+                                    "type": "object",
+                                    "description": "That tool's arguments, as you would pass them to it directly"
+                                }
+                            },
+                            "required": ["tool"]
+                        }
+                    },
+                    "return_state": {
+                        "type": "boolean",
+                        "description": "Pass return_state to the last step, so the result ends with the state after it (the app you last read, or the page for a browser step)"
+                    },
+                    "state_query": {
+                        "type": "string",
+                        "description": "With return_state, list only elements whose role, label or value contains this text, like get_app_state's query"
+                    }
+                },
+                "required": ["steps"]
+            },
+            "annotations": {
+                "title": "Run steps",
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": true
             }
         },
         {
@@ -1173,7 +1216,7 @@ fn all_tool_defs() -> Value {
 mod tests {
     use super::{all_tool_defs, tool_defs};
 
-    /// The macOS server advertises exactly these 32 tools. Drifting apart would
+    /// The macOS server advertises exactly these 33 tools. Drifting apart would
     /// silently give a model different capabilities per platform.
     #[test]
     fn advertises_the_macos_tool_surface() {
@@ -1185,7 +1228,7 @@ mod tests {
             .map(|tool| tool["name"].as_str().expect("tool has a name"))
             .collect();
 
-        assert_eq!(names.len(), 32, "tool count drifted from the macOS server");
+        assert_eq!(names.len(), 33, "tool count drifted from the macOS server");
         for expected in [
             "list_apps",
             "get_app_state",
@@ -1202,6 +1245,7 @@ mod tests {
             "zoom",
             "hover",
             "wait",
+            "run_steps",
             "select_text",
             "clipboard_read",
             "clipboard_write",
