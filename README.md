@@ -154,27 +154,28 @@ The chart counts the table above (`n/a` cells are left out), so it shares the ta
 ## Benchmarks
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="./.github/resources/chart-look-dark.svg">
-  <img alt="Reading File Explorer on Windows 11: munim get_app_state 0.31 s and about 1.9K tokens; with a screenshot 0.40 s and about 2.9K tokens; Windows-MCP Snapshot 0.95 s and about 3.8K tokens; Windows-MCP Snapshot with vision 11.2 s and about 5.2K tokens" src="./.github/resources/chart-look-light.svg" width="820">
+  <source media="(prefers-color-scheme: dark)" srcset="./.github/resources/chart-scale-dark.svg">
+  <img alt="Five computer-use servers reading File Explorer with 100 to 20,000 files on Windows 11. Time per read: Cua Driver about 0.18 s, munim-computer-use about 0.24 s, computer-use-mcp (zavora) about 0.44 s, Windows-MCP about 0.75 s, open-computer-use about 3.5 s. Tokens per read: munim about 2.0K, Cua Driver and Windows-MCP about 3.9K, open-computer-use about 5.9K, zavora about 9.3K. Every line is flat across folder sizes." src="./.github/resources/chart-scale-light.svg" width="820">
 </picture>
 
-One look at an app, the step an agent repeats most, measured against [Windows-MCP](https://github.com/CursorTouch/Windows-MCP), the most used Windows server:
+Reading a window is the step an agent repeats most. Here every Windows server we could run reads the same File Explorer window as the folder grows from 100 to 20,000 files. All of them read only the rows on screen, so the lines are flat; what differs is the level. Cua Driver is the fastest reader, and munim-computer-use returns the fewest tokens, about half of the next.
 
-| Call                                 | Time (median) | Returns                               | Tokens (≈) |
-| ------------------------------------ | ------------- | ------------------------------------- | ---------- |
-| munim `get_app_state`                | 0.31 s        | 7,516 characters                      | 1.9K       |
-| munim `get_app_state` + `screenshot` | 0.40 s        | 7,851 characters + a 1118×633 image   | 2.9K       |
-| Windows-MCP `Snapshot`               | 0.95 s        | 15,301 characters                     | 3.8K       |
-| Windows-MCP `Snapshot` + vision      | 11.2 s        | 14,631 characters + a 1920×1080 image | 5.2K       |
+| Server                          | Read tool                                       | 100 files | 1,000  | 5,000  | 20,000 | Tokens per read (≈)     |
+| ------------------------------- | ----------------------------------------------- | --------- | ------ | ------ | ------ | ----------------------- |
+| **munim-computer-use 0.7.3**    | `get_app_state`                                 | 0.24 s    | 0.23 s | 0.24 s | 0.24 s | **2.0K**                |
+| Cua Driver 0.38.0               | `get_window_state`, `include_screenshot: false` | 0.17 s    | 0.17 s | 0.19 s | 0.18 s | 3.9K                    |
+| Windows-MCP 0.8.5               | `Snapshot`                                      | 0.79 s    | 0.69 s | 0.77 s | 0.76 s | 3.9K                    |
+| computer-use-mcp 7.8.0 (zavora) | `get_ui_tree` (`COMPUTER_USE_PROFILE=full`)     | 0.43 s    | 0.49 s | 0.44 s | 0.42 s | 9.3K                    |
+| open-computer-use 1.1.2         | `get_app_state`                                 | 3.43 s    | 3.74 s | 3.51 s | 3.20 s | 5.9K, with a screenshot |
 
-How it was measured, on 27 October 2026: Windows 11 (build 26200), one 1920×1080 display, File Explorer open in front on `C:\Windows\System32` (4,837 items). munim-computer-use 0.7.3 (the release binary) with `app` set to Explorer's pid; Windows-MCP 0.8.5 (`uvx windows-mcp serve`), `Snapshot` with default arguments and with `use_vision: true`. Each server was started once and called over stdio, the first call of a run was dropped as warm-up, and the two servers ran in alternating rounds; times are the median of 10 calls (3 with vision, whose first call took 2.1 s and the other two 11–12 s). Tokens are estimates: text at 4 characters per token, images by Anthropic's formula (width × height / 750 after the API's resize). Windows-MCP's `Snapshot` also lists the desktop's other open windows, while `get_app_state` covers one app, so part of the size difference is scope.
+How it was measured, on 27 October 2026: Windows 11 (build 26200), one 1920×1080 display. For each folder size a fresh File Explorer window was opened in front and every server was started once, called over stdio with its own read tool and default arguments (text only where the tool has a switch for it; open-computer-use always attaches a screenshot), one warm-up call dropped, then 5 timed calls; the whole run was done twice, so each time is the median of 10. Tokens are estimates: text at 4 characters per token, images by Anthropic's formula (width × height / 750 after the API's resize). Windows-MCP's `Snapshot` also lists the desktop's other windows; the others read one window. [Terminator](https://github.com/mediar-ai/terminator) was left out: its `get_window_tree` picks the first `explorer` process, which is the taskbar, and it takes no pid.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="./.github/resources/chart-history-dark.svg">
   <img alt="get_app_state on the same File Explorer window in every Windows release: about 0.4 s and 2.5K tokens from 0.2.0 through 0.6.1, then about 0.25 s and 1.9K tokens from 0.7.0 on; Windows-MCP 0.8.5 took 0.75 s and about 3.7K tokens in the same rounds" src="./.github/resources/chart-history-light.svg" width="820">
 </picture>
 
-The same window read by every Windows release, from the release binaries, in two rounds of all 17 with Windows-MCP in each round (a separate run from the table above, so the times differ a little; the ratio holds). 0.7.0 is where `get_app_state` started reading only what is on screen and fetching each element's attributes in one request.
+The same window read by every Windows release, from the release binaries, in two rounds of all 17 with Windows-MCP in each round (a separate run from the one above, so the times differ a little). 0.7.0 is where `get_app_state` started reading only what is on screen and fetching each element's attributes in one request.
 
 <details>
 <summary>The numbers</summary>
@@ -202,12 +203,7 @@ The same window read by every Windows release, from the release binaries, in two
 
 </details>
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="./.github/resources/chart-speed-dark.svg">
-  <img alt="Speedups release over release: macOS Finder with 2,000 files 2.2 s to 165 ms; Windows list of 3,000 rows 2.3 s to 0.85 s; settle after a field edit 350 ms to 230 ms" src="./.github/resources/chart-speed-light.svg" width="820">
-</picture>
-
-These are the before and after numbers from [Why it works well](#why-it-works-well). `node scripts/readme-charts.mjs` redraws all four charts; the coverage chart is counted from the capability matrix.
+`node scripts/readme-charts.mjs` redraws the charts; the coverage chart is counted from the capability matrix.
 
 ## Why it works well
 

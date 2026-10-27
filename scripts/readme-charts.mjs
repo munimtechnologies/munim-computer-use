@@ -20,12 +20,12 @@ const THEMES = {
   light: {
     surface: "#fcfcfb", ink: "#0b0b0b", ink2: "#52514e", muted: "#898781",
     grid: "#e1e0d9", axis: "#c3c2b7",
-    munim: "#2a78d6", other: "#eb6834", partial: "#86b6ef", before: "#c3c2b7",
+    munim: "#2a78d6", other: "#eb6834", partial: "#86b6ef",
   },
   dark: {
     surface: "#1a1a19", ink: "#f0efec", ink2: "#c3c2b7", muted: "#898781",
     grid: "#2c2c2a", axis: "#383835",
-    munim: "#3987e5", other: "#d95926", partial: "#1c5cab", before: "#52514e",
+    munim: "#3987e5", other: "#d95926", partial: "#1c5cab",
   },
 };
 
@@ -53,54 +53,99 @@ ${body}
 `;
 }
 
-// --- 1. One look at an app: munim-computer-use vs Windows-MCP ---------------
+// --- 1. Five servers reading a growing folder --------------------------------
 
-const LOOK_ROWS = [
-  { label: "munim get_app_state", who: "munim", seconds: 0.31, tokens: 1879 },
-  { label: "munim get_app_state + screenshot", who: "munim", seconds: 0.40, tokens: 2907 },
-  { label: "Windows-MCP Snapshot", who: "other", seconds: 0.95, tokens: 3825 },
-  { label: "Windows-MCP Snapshot + vision", who: "other", seconds: 11.2, tokens: 5191 },
+// Each server's own "read this window" tool on File Explorer showing a folder of
+// N files, text only where the server allows it. Median of 10 warm calls (two
+// rounds of 5). Tokens are characters / 4, plus the screenshot open-computer-use
+// always attaches (Anthropic's w*h/750). Measured 27 October 2026.
+const SIZES = [100, 1000, 5000, 20000];
+const SCALE = [
+  { name: "munim-computer-use 0.7.3", short: "munim", ms: [235, 225, 237, 237], tokens: [2008, 2012, 2012, 2015] },
+  { name: "Cua Driver 0.38.0", short: "Cua Driver", ms: [169, 174, 185, 176], tokens: [3898, 3901, 3901, 3904] },
+  { name: "Windows-MCP 0.8.5", short: "Windows-MCP", ms: [790, 689, 771, 756], tokens: [3855, 3857, 3858, 3860] },
+  { name: "computer-use-mcp 7.8.0 (zavora)", short: "zavora", ms: [431, 487, 442, 421], tokens: [9346, 9346, 9348, 9351] },
+  { name: "open-computer-use 1.1.2", short: "open-computer-use", ms: [3427, 3735, 3513, 3202], tokens: [5858, 5849, 5861, 5864] },
 ];
+// Fixed slots, in series order (validated: scripts' palette check, both modes).
+const SERIES = {
+  light: ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"],
+  dark: ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181"],
+};
 
-function lookChart(t) {
-  const W = 820, labelW = 236, panelW = 262, gap = 40, top = 92, rowH = 40, barH = 20;
-  const H = top + LOOK_ROWS.length * rowH + 44;
+function scaleChart(t, mode) {
+  const W = 820, left = 64, right = 190, plotH = 220, gapH = 84, top = 150;
+  const plotW = W - left - right;
+  const colors = SERIES[mode];
+  const lx = Math.log10(SIZES[0]), rx = Math.log10(SIZES[SIZES.length - 1]);
+  const x = (n) => left + ((Math.log10(n) - lx) / (rx - lx)) * plotW;
   const panels = [
-    // Vision mode would flatten every other bar on a 12 s axis, so it runs off
-    // the end with a break and its value.
-    { title: "Time per look (s, lower is better)", key: "seconds", max: 2, ticks: [0, 0.5, 1, 1.5, 2], fmt: (v) => `${v} s` },
-    { title: "Tokens per look (≈, lower is better)", key: "tokens", max: 6000, ticks: [0, 2000, 4000, 6000], fmt: (v) => `${(v / 1000).toFixed(1)}K` },
+    {
+      title: "Time per read (log scale, lower is better)", key: "ms",
+      // Latencies span 0.17 s to 3.7 s, so a log axis keeps the fast ones apart.
+      y: (v, y0) => y0 + plotH - ((Math.log10(v) - Math.log10(100)) / (Math.log10(5000) - Math.log10(100))) * plotH,
+      ticks: [100, 200, 500, 1000, 2000, 5000], tick: (v) => (v < 1000 ? `${v / 1000} s` : `${v / 1000} s`),
+      fmt: (v) => `${(v / 1000).toFixed(2)} s`,
+    },
+    {
+      title: "Tokens per read (≈, lower is better)", key: "tokens",
+      y: (v, y0) => y0 + plotH - (v / 10000) * plotH,
+      ticks: [0, 2500, 5000, 7500, 10000], tick: (v) => (v ? `${v / 1000}K` : "0"),
+      fmt: (v) => `${(v / 1000).toFixed(1)}K`,
+    },
   ];
-  let body = text(20, 30, "Reading one app on Windows 11", { fill: t.ink, size: 16, weight: 600 });
-  body += text(20, 50, "File Explorer on C:\\Windows\\System32 (4,837 items), same PC, warm calls. Median of 10 calls (3 with vision); the 11.2 s bar is cut short.", { fill: t.ink2, size: 12 });
-  body += swatch(20, 74, t.munim, "munim-computer-use 0.7.3", t) + swatch(200, 74, t.other, "Windows-MCP 0.8.5", t);
-  panels.forEach((p, i) => {
-    const x0 = labelW + i * (panelW + gap);
-    const scale = (v) => (v / p.max) * (panelW - 50);
-    body += text(x0, top - 2, p.title, { fill: t.ink2, size: 12, weight: 600 });
+  const H = top + panels.length * plotH + gapH + 40;
+  let body = text(20, 30, "Reading a window as the folder grows, five servers on Windows 11", { fill: t.ink, size: 16, weight: 600 });
+  body += text(20, 50, "Each server's read tool on File Explorer showing 100 to 20,000 files, same PC, median of 10 warm calls.", { fill: t.ink2, size: 12 });
+  body += text(20, 66, "Every server reads only the rows on screen, so folder size barely matters; what differs is the level.", { fill: t.ink2, size: 12 });
+  SCALE.forEach((s, i) => {
+    const lx0 = 20 + (i % 3) * 250, ly = 92 + Math.floor(i / 3) * 20;
+    body += `<line x1="${lx0}" x2="${lx0 + 14}" y1="${ly - 4}" y2="${ly - 4}" stroke="${colors[i]}" stroke-width="2"/>`;
+    body += `<circle cx="${lx0 + 7}" cy="${ly - 4}" r="3" fill="${colors[i]}"/>`;
+    body += text(lx0 + 20, ly, s.name, { fill: t.ink2, size: 12, weight: i === 0 ? 600 : 400 });
+  });
+  panels.forEach((p, n) => {
+    const y0 = top + n * (plotH + gapH);
+    body += text(left, y0 - 12, p.title, { fill: t.ink2, size: 12, weight: 600 });
     for (const tick of p.ticks) {
-      const x = x0 + scale(tick);
-      body += `<line x1="${x}" x2="${x}" y1="${top + 8}" y2="${top + LOOK_ROWS.length * rowH + 4}" stroke="${tick ? t.grid : t.axis}" stroke-width="1"/>`;
-      body += text(x, top + LOOK_ROWS.length * rowH + 22, p.key === "tokens" ? `${tick / 1000}K` : `${tick} s`, { fill: t.muted, size: 11, anchor: "middle" });
+      const y = p.y(tick, y0);
+      body += `<line x1="${left}" x2="${left + plotW}" y1="${y}" y2="${y}" stroke="${tick === p.ticks[0] ? t.axis : t.grid}" stroke-width="1"/>`;
+      body += text(left - 8, y + 4, p.tick(tick), { fill: t.muted, size: 11, anchor: "end" });
     }
-    LOOK_ROWS.forEach((r, j) => {
-      const y = top + 8 + j * rowH + (rowH - barH) / 2;
-      const clipped = r[p.key] > p.max;
-      const w = clipped ? panelW - 50 + 14 : scale(r[p.key]);
-      body += bar(x0, y, w, barH, t[r.who]);
-      if (clipped) {
-        const bx = x0 + scale(p.max) - 4;
-        body += `<path d="M${bx},${y + barH + 2}l6,${-barH - 4}m4,0l-6,${barH + 4}" stroke="${t.surface}" stroke-width="3"/>`;
-      }
-      body += text(x0 + w + 6, y + 15, p.fmt(r[p.key]), { fill: t.ink, size: 12 });
-    });
+    for (const size of SIZES) {
+      body += text(x(size), y0 + plotH + 18, `${size.toLocaleString("en-US")} files`, { fill: t.muted, size: 11, anchor: "middle" });
+    }
+    // munim is drawn last so it sits on top where lines cross.
+    const order = SCALE.map((_, i) => i).reverse();
+    for (const i of order) {
+      const s = SCALE[i];
+      const points = SIZES.map((size, j) => `${x(size).toFixed(1)},${p.y(s[p.key][j], y0).toFixed(1)}`).join(" ");
+      body += `<polyline points="${points}" fill="none" stroke="${colors[i]}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+      SIZES.forEach((size, j) => {
+        body += `<circle cx="${x(size)}" cy="${p.y(s[p.key][j], y0)}" r="4" fill="${colors[i]}" stroke="${t.surface}" stroke-width="2"/>`;
+      });
+    }
+    // End labels; lines that end within a label's height share one label.
+    const ends = SCALE.map((s, i) => ({ i, y: p.y(s[p.key][SIZES.length - 1], y0), value: s[p.key][SIZES.length - 1] }))
+      .sort((a, b) => a.y - b.y);
+    const groups = [];
+    for (const end of ends) {
+      const last = groups[groups.length - 1];
+      if (last && end.y - last[last.length - 1].y < 15) last.push(end);
+      else groups.push([end]);
+    }
+    for (const group of groups) {
+      const y = group.reduce((sum, e) => sum + e.y, 0) / group.length;
+      const values = group.map((e) => p.fmt(e.value));
+      const label = values.every((v) => v === values[0])
+        ? group.map((e) => SCALE[e.i].short).join(", ") + ` ${values[0]}`
+        : group.map((e, k) => `${SCALE[e.i].short} ${values[k]}`).join(", ");
+      body += text(left + plotW + 10, y + 4, label, { fill: group.some((e) => e.i === 0) ? t.ink : t.ink2, size: 12, weight: group.some((e) => e.i === 0) ? 600 : 400 });
+    }
   });
-  LOOK_ROWS.forEach((r, j) => {
-    const y = top + 8 + j * rowH + rowH / 2 + 4;
-    body += text(20, y, r.label, { fill: t.ink, size: 13, weight: r.who === "munim" ? 600 : 400 });
-  });
-  const desc = LOOK_ROWS.map((r) => `${r.label}: ${r.seconds} s, about ${r.tokens} tokens`).join("; ");
-  return svg(W, H, "Reading one app on Windows 11: munim-computer-use vs Windows-MCP", desc, t, body);
+  const desc = SCALE.map((s) => `${s.name}: ${s.ms.map((v) => `${v} ms`).join(", ")}; ${s.tokens.map((v) => `${v} tokens`).join(", ")}`).join(". ")
+    + ` (for ${SIZES.join(", ")} files)`;
+  return svg(W, H, "Five computer-use servers reading File Explorer as the folder grows", desc, t, body);
 }
 
 // --- 2. Capability coverage, counted from the README matrix -----------------
@@ -213,44 +258,9 @@ function historyChart(t) {
   return svg(W, H, "get_app_state read time and size in every Windows release", desc, t, body);
 }
 
-// --- 4. Release-over-release speedups ----------------------------------------
-
-const SPEEDUPS = [
-  { label: "macOS Finder, 2,000 files", before: 2.2, now: 0.165 },
-  { label: "Windows list, 3,000 rows", before: 2.3, now: 0.85 },
-  { label: "Settle after a field edit", before: 0.35, now: 0.23 },
-];
-
-function speedupChart(t) {
-  const W = 820, labelW = 210, plotW = 470, top = 92, groupH = 56, barH = 18;
-  const H = top + SPEEDUPS.length * groupH + 40;
-  const max = 2.5, scale = (v) => (v / max) * plotW;
-  const fmt = (v) => (v < 1 ? `${Math.round(v * 1000)} ms` : `${v} s`);
-  let body = text(20, 30, "Faster with each release", { fill: t.ink, size: 16, weight: 600 });
-  body += text(20, 50, "get_app_state read time and return_state settle time, before and after the changes described under Why it works well.", { fill: t.ink2, size: 12 });
-  body += swatch(20, 74, t.before, "Before", t) + swatch(90, 74, t.munim, "Now", t);
-  for (const tick of [0, 0.5, 1, 1.5, 2, 2.5]) {
-    const x = labelW + scale(tick);
-    body += `<line x1="${x}" x2="${x}" y1="${top}" y2="${top + SPEEDUPS.length * groupH}" stroke="${tick ? t.grid : t.axis}" stroke-width="1"/>`;
-    body += text(x, top + SPEEDUPS.length * groupH + 18, `${tick} s`, { fill: t.muted, size: 11, anchor: "middle" });
-  }
-  SPEEDUPS.forEach((s, j) => {
-    const y = top + j * groupH + 8;
-    body += text(20, y + 24, s.label, { fill: t.ink, size: 13 });
-    body += bar(labelW, y, scale(s.before), barH, t.before);
-    body += text(labelW + scale(s.before) + 6, y + 14, fmt(s.before), { fill: t.ink2, size: 12 });
-    body += bar(labelW, y + barH + 2, scale(s.now), barH, t.munim);
-    const factor = (s.before / s.now).toFixed(1).replace(/\.0$/, "");
-    body += text(labelW + scale(s.now) + 6, y + barH + 16, `${fmt(s.now)}  (${factor}× faster)`, { fill: t.ink, size: 12, weight: 600 });
-  });
-  const desc = SPEEDUPS.map((s) => `${s.label}: ${s.before} s before, ${s.now} s now`).join("; ");
-  return svg(W, H, "munim-computer-use speedups release over release", desc, t, body);
-}
-
 for (const [mode, t] of Object.entries(THEMES)) {
-  writeFileSync(join(out, `chart-look-${mode}.svg`), lookChart(t));
+  writeFileSync(join(out, `chart-scale-${mode}.svg`), scaleChart(t, mode));
   writeFileSync(join(out, `chart-coverage-${mode}.svg`), coverageChart(t));
-  writeFileSync(join(out, `chart-speed-${mode}.svg`), speedupChart(t));
   writeFileSync(join(out, `chart-history-${mode}.svg`), historyChart(t));
 }
 console.log(readMatrix().map((c) => `${c.name}: ${c.yes} yes, ${c.partial} partly, ${c.applicable} applicable`).join("\n"));
