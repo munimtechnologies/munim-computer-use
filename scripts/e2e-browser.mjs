@@ -339,7 +339,7 @@ let tab;
 check("tools/list advertises browser_read and browser_request_credentials", async () => {
   const reply = await rpc("tools/list");
   const names = reply.result.tools.map((entry) => entry.name);
-  assert.equal(names.length, 32);
+  assert.equal(names.length, 33);
   assert.ok(names.includes("browser_read") && names.includes("browser_request_credentials"));
 });
 

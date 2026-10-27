@@ -65,7 +65,7 @@
 - [Why it works well](#why-it-works-well)
 - [Works alongside you](#works-alongside-you)
 - [Apps and sites the agent may use](#apps-and-sites-the-agent-may-use)
-- [Tools](#tools-32)
+- [Tools](#tools-33)
 - [Repository layout](#repository-layout)
 - [Environment flags](#environment-flags)
 - [Embedding in an app](#embedding-in-an-app)
@@ -133,12 +133,12 @@ Then ask: _"Open Safari, find the cheapest flight to Denver on Tuesday and put i
 | Hover, wait, label query                       | **✅**                 | ⚠️          | ⚠️                 | ❌                | ⚠️                       | ✅          | ⚠️        | ❌                | ⚠️                        | Windows-MCP has Wait/WaitFor; MacOS-MCP has Wait; Anthropic has `wait`/`mouse_move`.                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | Your signed-in Chrome, own tab group or yours  | **✅**                 | ⚠️          | ⚠️                 | ❌                | ❌                       | ⚠️          | ❌        | ❌                | ❌                        | Codex uses its in-app browser; Cua Driver attaches to a browser over CDP; Windows-MCP reads the DOM of open browsers. Munim Computer Use opens its own labelled tab group in your real Chrome, and can also take over a tab you already have open when you ask it to.                                                                                                                                                                                                                                                                     |
 | Act and observe in one call                    | **✅**                 | ✅          | n/a                | n/a               | ✅                       | ❌          | ❌        | ❌                | ❌                        | `return_state` on any action appends the fresh accessibility tree or page snapshot, so one call acts and checks. Cua Driver's `run_steps` runs several actions and reports what changed. The Anthropic demo returns a screenshot after each action; Codex and the Agents API run the loop themselves.                                                                                                                                                                                                                                     |
-| Several actions in one call                    | **❌**                 | ✅          | n/a                | n/a               | ❌                       | ⚠️          | ❌        | ❌                | ✅                        | Cua Driver and computer-use-mcp (zavora) run a list of steps in one call with `run_steps`; Windows-MCP's `MultiSelect` and `MultiEdit` act on several elements at once. Munim Computer Use takes one action per call, with `return_state` to look in the same call.                                                                                                                                                                                                                                                                       |
+| Several actions in one call                    | **✅**                 | ✅          | n/a                | n/a               | ❌                       | ⚠️          | ❌        | ❌                | ✅                        | Cua Driver and computer-use-mcp (zavora) run a list of steps in one call with `run_steps`; Windows-MCP's `MultiSelect` and `MultiEdit` act on several elements at once. Munim Computer Use's `run_steps` does the same, checks the whole list before running any of it, and stops at the first failure.                                                                                                                                                                                                                                                                       |
 | Read a page's text in a signed-in tab          | **✅**                 | ⚠️          | ❌                 | ❌                | ❌                       | ⚠️          | ❌        | ❌                | ❌                        | `browser_read` returns the page as text with headings, in chunks, with a `query` filter, from a background tab. Windows-MCP scrapes pages.                                                                                                                                                                                                                                                                                                                                                                                                |
 | Sign-in without the model seeing the password  | **✅**                 | ❌          | ❌                 | ✅                | ❌                       | ❌          | ❌        | ❌                | ❌                        | `browser_request_credentials` opens a Chrome window naming the site's real origin; what the user types goes into the page and never into the conversation. The Agents API hands sign-in to the developer's app the same way. Desktop password fields refuse typing by default.                                                                                                                                                                                                                                                            |
 | Per-app and per-site allow / ask / block rules | **✅**                 | ❌          | ⚠️                 | ⚠️                | ❌                       | ❌          | ❌        | ❌                | ❌                        | A policy file the user controls; `ask` shows an approval prompt once per task. Codex asks before each new app and keeps an "Always allow" list; the Agents API asks the developer's app before each new website.                                                                                                                                                                                                                                                                                                                          |
 | Works with any MCP client                      | **✅**                 | ✅          | ❌                 | ❌                | ❌                       | ✅          | ✅        | ✅                | ✅                        | Codex Computer Use is Codex only; the Anthropic demo is Claude only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| Identical tool surface on every platform       | **✅**                 | ⚠️          | n/a                | n/a               | n/a                      | n/a         | n/a       | ⚠️                | ✅                        | 32 tools with byte-identical schemas across the Swift and Rust servers. Cua Driver keeps shared parameters in step with a CI check, with a few tools on one platform only.                                                                                                                                                                                                                                                                                                                                                                |
+| Identical tool surface on every platform       | **✅**                 | ⚠️          | n/a                | n/a               | n/a                      | n/a         | n/a       | ⚠️                | ✅                        | 33 tools with byte-identical schemas across the Swift and Rust servers. Cua Driver keeps shared parameters in step with a CI check, with a few tools on one platform only.                                                                                                                                                                                                                                                                                                                                                                |
 | Prebuilt signed binaries + npm launcher        | **✅**                 | ✅ (script) | ✅                 | n/a               | ❌                       | ❌          | ❌        | ✅ (npm)          | ✅ (npm)                  | macOS universal (Developer ID signed) and Windows x64 on Releases.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | Open source                                    | **✅ Apache-2.0**      | ✅ MIT      | ❌                 | ❌                | ✅                       | ✅ MIT      | ✅ MIT    | ✅ MIT            | ✅ MIT                    |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 
@@ -146,7 +146,7 @@ Also looked at: [mediar-ai/mcp-server-macos-use](https://github.com/mediar-ai/mc
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="./.github/resources/chart-coverage-dark.svg">
-  <img alt="Capability coverage: Munim Computer Use 18 of 19 rows; Cua Driver 12 plus 5 partly of 19; computer-use-mcp (zavora) 9 plus 1 partly of 19; open-computer-use 7 plus 1 partly of 19; Windows-MCP 5 plus 4 partly of 18; Codex Computer Use 4 plus 5 partly of 15; Anthropic reference demo 4 plus 1 partly of 16; MacOS-MCP 4 plus 1 partly of 18; OpenAI Agents API 1 plus 1 partly of 10" src="./.github/resources/chart-coverage-light.svg" width="820">
+  <img alt="Capability coverage: Munim Computer Use 19 of 19 rows; Cua Driver 12 plus 5 partly of 19; computer-use-mcp (zavora) 9 plus 1 partly of 19; open-computer-use 7 plus 1 partly of 19; Windows-MCP 5 plus 4 partly of 18; Codex Computer Use 4 plus 5 partly of 15; Anthropic reference demo 4 plus 1 partly of 16; MacOS-MCP 4 plus 1 partly of 18; OpenAI Agents API 1 plus 1 partly of 10" src="./.github/resources/chart-coverage-light.svg" width="820">
 </picture>
 
 The chart counts the table above (`n/a` cells are left out), so it shares the table's bias: we picked the rows.
@@ -154,27 +154,28 @@ The chart counts the table above (`n/a` cells are left out), so it shares the ta
 ## Benchmarks
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="./.github/resources/chart-look-dark.svg">
-  <img alt="Reading File Explorer on Windows 11: munim get_app_state 0.31 s and about 1.9K tokens; with a screenshot 0.40 s and about 2.9K tokens; Windows-MCP Snapshot 0.95 s and about 3.8K tokens; Windows-MCP Snapshot with vision 11.2 s and about 5.2K tokens" src="./.github/resources/chart-look-light.svg" width="820">
+  <source media="(prefers-color-scheme: dark)" srcset="./.github/resources/chart-scale-dark.svg">
+  <img alt="Five computer-use servers reading File Explorer with 100 to 20,000 files on Windows 11. Time per read: Cua Driver about 0.18 s, munim-computer-use about 0.24 s, computer-use-mcp (zavora) about 0.44 s, Windows-MCP about 0.75 s, open-computer-use about 3.5 s. Tokens per read: munim about 2.0K, Cua Driver and Windows-MCP about 3.9K, open-computer-use about 5.9K, zavora about 9.3K. Every line is flat across folder sizes." src="./.github/resources/chart-scale-light.svg" width="820">
 </picture>
 
-One look at an app, the step an agent repeats most, measured against [Windows-MCP](https://github.com/CursorTouch/Windows-MCP), the most used Windows server:
+Reading a window is the step an agent repeats most. Here every Windows server we could run reads the same File Explorer window as the folder grows from 100 to 20,000 files. All of them read only the rows on screen, so the lines are flat; what differs is the level. Cua Driver is the fastest reader, and munim-computer-use returns the fewest tokens, about half of the next.
 
-| Call                                 | Time (median) | Returns                               | Tokens (≈) |
-| ------------------------------------ | ------------- | ------------------------------------- | ---------- |
-| munim `get_app_state`                | 0.31 s        | 7,516 characters                      | 1.9K       |
-| munim `get_app_state` + `screenshot` | 0.40 s        | 7,851 characters + a 1118×633 image   | 2.9K       |
-| Windows-MCP `Snapshot`               | 0.95 s        | 15,301 characters                     | 3.8K       |
-| Windows-MCP `Snapshot` + vision      | 11.2 s        | 14,631 characters + a 1920×1080 image | 5.2K       |
+| Server                          | Read tool                                       | 100 files | 1,000  | 5,000  | 20,000 | Tokens per read (≈)     |
+| ------------------------------- | ----------------------------------------------- | --------- | ------ | ------ | ------ | ----------------------- |
+| **munim-computer-use 0.7.3**    | `get_app_state`                                 | 0.24 s    | 0.23 s | 0.24 s | 0.24 s | **2.0K**                |
+| Cua Driver 0.38.0               | `get_window_state`, `include_screenshot: false` | 0.17 s    | 0.17 s | 0.19 s | 0.18 s | 3.9K                    |
+| Windows-MCP 0.8.5               | `Snapshot`                                      | 0.79 s    | 0.69 s | 0.77 s | 0.76 s | 3.9K                    |
+| computer-use-mcp 7.8.0 (zavora) | `get_ui_tree` (`COMPUTER_USE_PROFILE=full`)     | 0.43 s    | 0.49 s | 0.44 s | 0.42 s | 9.3K                    |
+| open-computer-use 1.1.2         | `get_app_state`                                 | 3.43 s    | 3.74 s | 3.51 s | 3.20 s | 5.9K, with a screenshot |
 
-How it was measured, on 27 October 2026: Windows 11 (build 26200), one 1920×1080 display, File Explorer open in front on `C:\Windows\System32` (4,837 items). munim-computer-use 0.7.3 (the release binary) with `app` set to Explorer's pid; Windows-MCP 0.8.5 (`uvx windows-mcp serve`), `Snapshot` with default arguments and with `use_vision: true`. Each server was started once and called over stdio, the first call of a run was dropped as warm-up, and the two servers ran in alternating rounds; times are the median of 10 calls (3 with vision, whose first call took 2.1 s and the other two 11–12 s). Tokens are estimates: text at 4 characters per token, images by Anthropic's formula (width × height / 750 after the API's resize). Windows-MCP's `Snapshot` also lists the desktop's other open windows, while `get_app_state` covers one app, so part of the size difference is scope.
+How it was measured, on 27 October 2026: Windows 11 (build 26200), one 1920×1080 display. For each folder size a fresh File Explorer window was opened in front and every server was started once, called over stdio with its own read tool and default arguments (text only where the tool has a switch for it; open-computer-use always attaches a screenshot), one warm-up call dropped, then 5 timed calls; the whole run was done twice, so each time is the median of 10. Tokens are estimates: text at 4 characters per token, images by Anthropic's formula (width × height / 750 after the API's resize). Windows-MCP's `Snapshot` also lists the desktop's other windows; the others read one window. [Terminator](https://github.com/mediar-ai/terminator) was left out: its `get_window_tree` picks the first `explorer` process, which is the taskbar, and it takes no pid.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="./.github/resources/chart-history-dark.svg">
   <img alt="get_app_state on the same File Explorer window in every Windows release: about 0.4 s and 2.5K tokens from 0.2.0 through 0.6.1, then about 0.25 s and 1.9K tokens from 0.7.0 on; Windows-MCP 0.8.5 took 0.75 s and about 3.7K tokens in the same rounds" src="./.github/resources/chart-history-light.svg" width="820">
 </picture>
 
-The same window read by every Windows release, from the release binaries, in two rounds of all 17 with Windows-MCP in each round (a separate run from the table above, so the times differ a little; the ratio holds). 0.7.0 is where `get_app_state` started reading only what is on screen and fetching each element's attributes in one request.
+The same window read by every Windows release, from the release binaries, in two rounds of all 17 with Windows-MCP in each round (a separate run from the one above, so the times differ a little). 0.7.0 is where `get_app_state` started reading only what is on screen and fetching each element's attributes in one request.
 
 <details>
 <summary>The numbers</summary>
@@ -202,12 +203,7 @@ The same window read by every Windows release, from the release binaries, in two
 
 </details>
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="./.github/resources/chart-speed-dark.svg">
-  <img alt="Speedups release over release: macOS Finder with 2,000 files 2.2 s to 165 ms; Windows list of 3,000 rows 2.3 s to 0.85 s; settle after a field edit 350 ms to 230 ms" src="./.github/resources/chart-speed-light.svg" width="820">
-</picture>
-
-These are the before and after numbers from [Why it works well](#why-it-works-well). `node scripts/readme-charts.mjs` redraws all four charts; the coverage chart is counted from the capability matrix.
+`node scripts/readme-charts.mjs` redraws the charts; the coverage chart is counted from the capability matrix.
 
 ## Why it works well
 
@@ -228,6 +224,7 @@ These are the before and after numbers from [Why it works well](#why-it-works-we
 - **Model-agnostic.** No vision model is required for interaction; local models work too.
 - **Look → act → verify.** `hover` for mouse-over menus, `wait` for loads, `query` to find a control by label without reading a whole tree.
 - **Act and look in one call.** Pass `return_state: true` to any action (`click`, `type_text`, `set_value`, `browser_click`, `browser_navigate`, …) and the result carries the app's fresh accessibility tree, or the page's current snapshot. Browser actions report readiness separately: a loaded tab is not proof that delayed SPA UI has rendered. Use `wait_for_selector` for an expected visible element (see below). `state_query` narrows the desktop tree the same way `query` does.
+- **Several steps, one call.** `run_steps` takes a list like click the field, type, press return and runs it in order, each step with the same checks as a direct call. The whole list is checked before anything runs, the first failing step stops the rest, and the result says what ran and what did not. Put `return_state` on it to see the app after the last step.
 - **Pages as text.** `browser_read` returns a page's readable text with its headings, including what is scrolled out of view, from a tab in the background. It comes in chunks you can continue with `offset`, `query` keeps only the matching lines under their heading, and `include_links` lists the links.
 - **Passwords stay out of the conversation.** `browser_request_credentials` asks the user to sign in in a small Chrome window that shows the site's real origin. What they type goes straight into the page's fields and is never returned to the model. `browser_snapshot` never shows a password field's value, and on the desktop, typing into password fields is refused by default.
 - **Pick up what you are looking at.** `get_app_state` and `screenshot` take `app: "frontmost"` for the app in front of the user, so a client can hand the agent "this window" in one step.
@@ -265,16 +262,16 @@ You decide which apps and websites the agent may touch. Put a `policy.json` in t
 
 This is a guard rail for an agent that follows its instructions, not a sandbox. A coordinate click lands wherever it points, and a whole-display screenshot shows every window.
 
-## Tools (32)
+## Tools (33)
 
 | Area    | Tools                                                                                                                                                                                                      |
 | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | See     | `list_apps`, `get_app_state` (with `query`), `screenshot`, `zoom`, `list_displays`                                                                                                                         |
-| Act     | `click`, `right_click`, `hover`, `drag`, `scroll`, `type_text`, `set_value`, `select_text`, `press_key`, `activate_app`, `wait`                                                                            |
+| Act     | `click`, `right_click`, `hover`, `drag`, `scroll`, `type_text`, `set_value`, `select_text`, `press_key`, `activate_app`, `wait`, `run_steps`                                                               |
 | Clipboard | `clipboard_read`, `clipboard_write` (plain text)                                                                                                                                                         |
 | Browser | `browser_open_tab`, `browser_list_tabs`, `browser_use_tab`, `browser_release_tab`, `browser_select_tab`, `browser_navigate`, `browser_snapshot`, `browser_read`, `browser_click`, `browser_type`, `browser_request_credentials`, `browser_press_key`, `browser_close_tab`, `browser_close_all_tabs` |
 
-Every action tool also takes `return_state`, which returns current state after the action in the same call.
+Every action tool also takes `return_state`, which returns current state after the action in the same call. `run_steps` runs a list of them in one call and stops at the first that fails.
 
 ### Browser readiness and safe re-observation
 

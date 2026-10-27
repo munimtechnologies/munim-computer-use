@@ -3845,6 +3845,49 @@ let toolDefs: [[String: Any]] = [
         ],
     ],
     [
+        "name": "run_steps",
+        "description": "Run a sequence of actions in one call, in order, stopping at the first step that fails. Each step names another tool and its arguments, and runs exactly as if you had called it: the same app and site rules, element id checks and password-field refusals apply. Use it for steps you already know will follow each other, like click a field, type, press return, after reading the app with get_app_state. Element ids from that snapshot stay valid until a step reads the app again. The result lists every step's outcome; when a step fails, the steps after it do not run and the call reports an error. Put return_state on run_steps, not on a step, to get the state after the last step. At most 20 steps; run_steps cannot contain run_steps.",
+        "inputSchema": [
+            "type": "object",
+            "properties": [
+                "steps": [
+                    "type": "array",
+                    "description": "The actions to run, in order",
+                    "items": [
+                        "type": "object",
+                        "properties": [
+                            "tool": [
+                                "type": "string",
+                                "description": "Name of the tool to call, e.g. click, type_text, press_key, wait, browser_click",
+                            ],
+                            "args": [
+                                "type": "object",
+                                "description": "That tool's arguments, as you would pass them to it directly",
+                            ],
+                        ],
+                        "required": ["tool"],
+                    ],
+                ],
+                "return_state": [
+                    "type": "boolean",
+                    "description": "Pass return_state to the last step, so the result ends with the state after it (the app you last read, or the page for a browser step)",
+                ],
+                "state_query": [
+                    "type": "string",
+                    "description": "With return_state, list only elements whose role, label or value contains this text, like get_app_state's query",
+                ],
+            ],
+            "required": ["steps"],
+        ],
+        "annotations": [
+            "title": "Run steps",
+            "readOnlyHint": false,
+            "destructiveHint": true,
+            "idempotentHint": false,
+            "openWorldHint": true,
+        ],
+    ],
+    [
         "name": "select_text",
         "description": "Select a character range inside a text element through the accessibility API, for example to copy part of a value or to replace just that part with type_text. Defaults to selecting from `start` to the end of the value. Use set_value to replace the whole value instead. Only the selection changes; the text is not modified.",
         "inputSchema": [
@@ -4487,7 +4530,7 @@ func negotiatedProtocolVersion(_ params: [String: Any]) -> String {
 }
 
 /// Returned in the `initialize` result; identical in the Rust server.
-let serverInstructions = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Pass return_state on an action to get current state back in the same call. For delayed browser UI, use wait_for_selector with return_state and inspect readiness; a loaded tab is not SPA readiness. A timeout does not undo the action: re-observe with browser_snapshot and the same wait before repeating a non-idempotent action. Use browser_read to read a page's text. Never ask for, or type, a password or code yourself: browser_request_credentials lets the user enter it without you seeing it. The user's Computer Use policy can block apps and sites or require their approval; when a call says so, do not work around it. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf."
+let serverInstructions = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Pass return_state on an action to get current state back in the same call. Use run_steps for several actions you already know, like click, type, press return: one call, stopping at the first that fails. For delayed browser UI, use wait_for_selector with return_state and inspect readiness; a loaded tab is not SPA readiness. A timeout does not undo the action: re-observe with browser_snapshot and the same wait before repeating a non-idempotent action. Use browser_read to read a page's text. Never ask for, or type, a password or code yourself: browser_request_credentials lets the user enter it without you seeing it. The user's Computer Use policy can block apps and sites or require their approval; when a call says so, do not work around it. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf."
 
 // MARK: - Clipboard
 
@@ -4620,6 +4663,193 @@ final class CursorOverlay {
 
     /// Non-blocking hop for mid-drag visuals.
     func glide(at point: CGPoint) { AgentCursor.shared.glide(at: point) }
+}
+
+/// The most steps one `run_steps` call may hold.
+let maxSteps = 20
+
+/// Check a `run_steps` list before anything runs, so a typo in step 4 cannot
+/// leave steps 1–3 done and the rest not. Returns each step's tool and the
+/// arguments it will get: `return_state` belongs to the batch, so it is taken
+/// off every step and handed to the last one. Same rules and wording as the
+/// Rust server's `plan_steps`.
+func planSteps(_ args: [String: Any]) -> Result<[(String, [String: Any])], StepPlanError> {
+    guard let steps = args["steps"] as? [Any] else {
+        return .failure(StepPlanError("steps must be a list of {\"tool\": name, \"args\": {...}}"))
+    }
+    if steps.isEmpty { return .failure(StepPlanError("steps is empty — give at least one step")) }
+    if steps.count > maxSteps {
+        return .failure(StepPlanError("\(steps.count) steps is more than the \(maxSteps) one call may run — split them"))
+    }
+    let known = Set(advertisedToolDefs().compactMap { $0["name"] as? String })
+    var plan: [(String, [String: Any])] = []
+    for (index, raw) in steps.enumerated() {
+        let number = index + 1
+        guard let step = raw as? [String: Any], let tool = step["tool"] as? String else {
+            return .failure(StepPlanError("step \(number) has no tool — each step is {\"tool\": name, \"args\": {...}}"))
+        }
+        if tool == "run_steps" { return .failure(StepPlanError("step \(number): run_steps cannot contain run_steps")) }
+        guard known.contains(tool) else { return .failure(StepPlanError("step \(number): unknown tool '\(tool)'")) }
+        var stepArgs: [String: Any] = [:]
+        if let raw = step["args"], !(raw is NSNull) {
+            guard let map = raw as? [String: Any] else {
+                return .failure(StepPlanError("step \(number) (\(tool)): args must be an object"))
+            }
+            stepArgs = map
+        }
+        stepArgs["return_state"] = nil
+        stepArgs["state_query"] = nil
+        plan.append((tool, stepArgs))
+    }
+    if (args["return_state"] as? Bool) == true, var last = plan.popLast() {
+        last.1["return_state"] = true
+        if let query = args["state_query"] as? String { last.1["state_query"] = query }
+        plan.append(last)
+    }
+    return .success(plan)
+}
+
+struct StepPlanError: Error {
+    let message: String
+    init(_ message: String) { self.message = message }
+}
+
+/// Run each step through `callTool`, so a step gets exactly the checks a
+/// direct call would, and stop at the first one that fails. Every step's
+/// output is kept, labelled with its number: its first text leads, and its
+/// images and any further text follow.
+func runSteps(_ args: [String: Any]) -> [String: Any] {
+    let plan: [(String, [String: Any])]
+    switch planSteps(args) {
+    case .success(let steps): plan = steps
+    case .failure(let error): return textResult("error: \(error.message); nothing was run", isError: true)
+    }
+    var content: [[String: Any]] = []
+    var failed: (number: Int, tool: String)?
+    for (index, (tool, stepArgs)) in plan.enumerated() {
+        let number = index + 1
+        let result = callTool(tool, stepArgs)
+        var items = result["content"] as? [[String: Any]] ?? []
+        var text = "done"
+        if let at = items.firstIndex(where: { ($0["type"] as? String) == "text" }) {
+            text = items.remove(at: at)["text"] as? String ?? text
+        }
+        content.append(["type": "text", "text": "\(number). \(tool): \(text)"])
+        content.append(contentsOf: items)
+        if (result["isError"] as? Bool) == true {
+            failed = (number, tool)
+            break
+        }
+    }
+    let total = plan.count
+    let summary: String
+    switch failed {
+    case nil: summary = "ran all \(total) step\(total == 1 ? "" : "s")"
+    case let (number, tool)? where number == total: summary = "step \(number) of \(total) (\(tool)) failed"
+    case let (number, tool)? where number + 1 == total:
+        summary = "stopped at step \(number) of \(total): \(tool) failed, so step \(total) did not run"
+    case let (number, tool)?:
+        summary = "stopped at step \(number) of \(total): \(tool) failed, so steps \(number + 1)–\(total) did not run"
+    }
+    content.insert(["type": "text", "text": summary], at: 0)
+    return ["content": content, "isError": failed != nil]
+}
+
+/// One tool call's result, as `tools/call` answers it. `run_steps` calls this
+/// for every step, so a step gets exactly the checks a direct call would.
+func callTool(_ name: String, _ args: [String: Any]) -> [String: Any] {
+    // Handled ahead of the Accessibility check: screen capture is gated by
+    // Screen Recording, a separate permission, so screenshots should still
+    // work if only that one is granted.
+    if name == "wait" {
+        let out = toolWait(args)
+        return textResult(out, isError: out.hasPrefix("error:"))
+    }
+    if name == "zoom" {
+        guard let x0 = args["x0"] as? Double, let y0 = args["y0"] as? Double,
+              let x1 = args["x1"] as? Double, let y1 = args["y1"] as? Double,
+              x0.isFinite, y0.isFinite, x1.isFinite, y1.isFinite
+        else {
+            return textResult(
+                "error: zoom needs x0, y0, x1, y1 in screen coordinates (the space click uses)",
+                isError: true)
+        }
+        let rect = CGRect(x: min(x0, x1), y: min(y0, y1), width: abs(x1 - x0), height: abs(y1 - y0))
+        guard rect.width >= 4, rect.height >= 4 else {
+            return textResult(
+                "error: zoom region must be at least 4×4 points", isError: true)
+        }
+        let maxWidth = clampedMaxWidth(args)
+        let encoding: ImageEncoding
+        do { encoding = try ImageEncoding.parse(args) } catch {
+            return textResult("\(error)", isError: true)
+        }
+        guard let shot = captureRegion(rect: rect, maxWidth: maxWidth, encoding: encoding) else {
+            return textResult(
+                "error: could not capture that region — check Screen Recording permission and "
+                + "that the region lies on an attached display (list_displays).", isError: true)
+        }
+        return imageResult(shot, label: "zoomed region")
+    }
+    if name == "screenshot" {
+        let encoding: ImageEncoding
+        do { encoding = try ImageEncoding.parse(args) } catch {
+            return textResult("\(error)", isError: true)
+        }
+        if let display = args["display"] as? Int {
+            let maxWidth = clampedMaxWidth(args)
+            if (args["live"] as? Bool) == true {
+                return liveScreenshotResult(
+                    args, display: display, maxWidth: maxWidth, encoding: encoding)
+            }
+            guard let shot = captureDisplay(index: display, maxWidth: maxWidth, encoding: encoding) else {
+                return textResult(
+                    "error: could not capture display \(display) — check Screen Recording "
+                    + "permission, or call list_displays for valid indices.", isError: true)
+            }
+            return imageResult(shot, label: "display \(display)")
+        }
+        guard let query = args["app"] as? String, let resolved = resolveApp(query) else {
+            return textResult(
+                "error: no running app matching \(args["app"] as? String ?? "<missing app argument>")",
+                isError: true)
+        }
+        if let refusal = PolicyStore.checkApp(resolved.app) {
+            return textResult(refusal, isError: true)
+        }
+        let maxWidth = clampedMaxWidth(args)
+        // A minimized window or hidden app has nothing to capture until parked.
+        if let refusal = WindowParking.shared.reach(pid: resolved.app.processIdentifier, window: nil) {
+            return textResult("error: cannot capture: \(refusal)", isError: true)
+        }
+        guard let shot = captureWindow(
+            pid: resolved.app.processIdentifier, maxWidth: maxWidth, encoding: encoding)
+        else {
+            return textResult(
+                "error: screen capture failed. The host app may be missing Screen Recording "
+                + "permission, or this app may have no on-screen window.",
+                isError: true)
+        }
+        return imageResult(
+            shot, label: "window of \(resolved.app.localizedName ?? query)")
+    }
+
+    // list_displays / browser_* do not need Accessibility — Screen
+    // Recording / Chrome bridge only. Keep them ahead of the AX gate so
+    // the Screen Recording-only flow can still recover (Bot finding).
+    if name == "list_displays" || name.hasPrefix("browser_") || name.hasPrefix("clipboard_") {
+        let out = dispatch(name, args)
+        return textResult(out, isError: out.hasPrefix("error:"))
+    }
+
+    if !AXIsProcessTrusted() {
+        return textResult(
+            "Accessibility permission is not granted to the host app. Enable it in "
+            + "System Settings → Privacy & Security → Accessibility, then restart the app.",
+            isError: true)
+    }
+    let out = dispatch(name, args)
+    return textResult(out, isError: out.hasPrefix("error:"))
 }
 
 // MARK: - JSON-RPC over stdio
@@ -4812,115 +5042,7 @@ while let line = readLine(strippingNewline: true) {
             }
             let args = params["arguments"] as? [String: Any] ?? [:]
 
-            // Handled ahead of the Accessibility check: screen capture is gated by
-            // Screen Recording, a separate permission, so screenshots should still
-            // work if only that one is granted.
-            if name == "wait" {
-                let out = toolWait(args)
-                respond(id: id, result: textResult(out, isError: out.hasPrefix("error:")))
-                break
-            }
-            if name == "zoom" {
-                guard let x0 = args["x0"] as? Double, let y0 = args["y0"] as? Double,
-                      let x1 = args["x1"] as? Double, let y1 = args["y1"] as? Double,
-                      x0.isFinite, y0.isFinite, x1.isFinite, y1.isFinite
-                else {
-                    respond(id: id, result: textResult(
-                        "error: zoom needs x0, y0, x1, y1 in screen coordinates (the space click uses)",
-                        isError: true))
-                    break
-                }
-                let rect = CGRect(x: min(x0, x1), y: min(y0, y1), width: abs(x1 - x0), height: abs(y1 - y0))
-                guard rect.width >= 4, rect.height >= 4 else {
-                    respond(id: id, result: textResult(
-                        "error: zoom region must be at least 4×4 points", isError: true))
-                    break
-                }
-                let maxWidth = clampedMaxWidth(args)
-                let encoding: ImageEncoding
-                do { encoding = try ImageEncoding.parse(args) } catch {
-                    respond(id: id, result: textResult("\(error)", isError: true))
-                    break
-                }
-                guard let shot = captureRegion(rect: rect, maxWidth: maxWidth, encoding: encoding) else {
-                    respond(id: id, result: textResult(
-                        "error: could not capture that region — check Screen Recording permission and "
-                        + "that the region lies on an attached display (list_displays).", isError: true))
-                    break
-                }
-                respond(id: id, result: imageResult(shot, label: "zoomed region"))
-                break
-            }
-            if name == "screenshot" {
-                let encoding: ImageEncoding
-                do { encoding = try ImageEncoding.parse(args) } catch {
-                    respond(id: id, result: textResult("\(error)", isError: true))
-                    break
-                }
-                if let display = args["display"] as? Int {
-                    let maxWidth = clampedMaxWidth(args)
-                    if (args["live"] as? Bool) == true {
-                        respond(id: id, result: liveScreenshotResult(
-                            args, display: display, maxWidth: maxWidth, encoding: encoding))
-                        break
-                    }
-                    guard let shot = captureDisplay(index: display, maxWidth: maxWidth, encoding: encoding) else {
-                        respond(id: id, result: textResult(
-                            "error: could not capture display \(display) — check Screen Recording "
-                            + "permission, or call list_displays for valid indices.", isError: true))
-                        break
-                    }
-                    respond(id: id, result: imageResult(shot, label: "display \(display)"))
-                    break
-                }
-                guard let query = args["app"] as? String, let resolved = resolveApp(query) else {
-                    respond(id: id, result: textResult(
-                        "error: no running app matching \(args["app"] as? String ?? "<missing app argument>")",
-                        isError: true))
-                    break
-                }
-                if let refusal = PolicyStore.checkApp(resolved.app) {
-                    respond(id: id, result: textResult(refusal, isError: true))
-                    break
-                }
-                let maxWidth = clampedMaxWidth(args)
-                // A minimized window or hidden app has nothing to capture until parked.
-                if let refusal = WindowParking.shared.reach(pid: resolved.app.processIdentifier, window: nil) {
-                    respond(id: id, result: textResult("error: cannot capture: \(refusal)", isError: true))
-                    break
-                }
-                guard let shot = captureWindow(
-                    pid: resolved.app.processIdentifier, maxWidth: maxWidth, encoding: encoding)
-                else {
-                    respond(id: id, result: textResult(
-                        "error: screen capture failed. The host app may be missing Screen Recording "
-                        + "permission, or this app may have no on-screen window.",
-                        isError: true))
-                    break
-                }
-                respond(id: id, result: imageResult(
-                    shot, label: "window of \(resolved.app.localizedName ?? query)"))
-                break
-            }
-
-            // list_displays / browser_* do not need Accessibility — Screen
-            // Recording / Chrome bridge only. Keep them ahead of the AX gate so
-            // the Screen Recording-only flow can still recover (Bot finding).
-            if name == "list_displays" || name.hasPrefix("browser_") || name.hasPrefix("clipboard_") {
-                let out = dispatch(name, args)
-                respond(id: id, result: textResult(out, isError: out.hasPrefix("error:")))
-                break
-            }
-
-            if !AXIsProcessTrusted() {
-                respond(id: id, result: textResult(
-                    "Accessibility permission is not granted to the host app. Enable it in "
-                    + "System Settings → Privacy & Security → Accessibility, then restart the app.",
-                    isError: true))
-                break
-            }
-            let out = dispatch(name, args)
-            respond(id: id, result: textResult(out, isError: out.hasPrefix("error:")))
+            respond(id: id, result: name == "run_steps" ? runSteps(args) : callTool(name, args))
         }
 
     case "ping":

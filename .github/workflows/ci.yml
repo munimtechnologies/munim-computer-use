@@ -53,6 +53,10 @@ jobs:
         run: |
           cargo build --locked --manifest-path windows-linux/Cargo.toml
           python scripts/test-native-host-restart.py --binary windows-linux/target/debug/munim-computer-use.exe
+      - name: run_steps over stdio
+        if: runner.os == 'Windows'
+        working-directory: .
+        run: node scripts/run-steps.test.mjs windows-linux/target/debug/munim-computer-use.exe
       - name: browser tools end to end (real Chrome)
         if: runner.os == 'Linux'
         working-directory: .
@@ -71,6 +75,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: swift build -c release
+      - name: run_steps over stdio
+        working-directory: .
+        run: node scripts/run-steps.test.mjs macos/.build/release/munim-computer-use
       - name: bridge keeps serving new peers with many connected
         working-directory: .
         run: node scripts/bridge-peers.test.mjs macos/.build/release/munim-computer-use 120

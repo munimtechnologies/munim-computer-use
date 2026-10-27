@@ -358,6 +358,10 @@ fn call_tool(
         .to_string();
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
+    if name == "run_steps" {
+        return run_steps(&args, desktop, browser);
+    }
+
     if let Some(rest) = name.strip_prefix("browser_") {
         if !tools::browser_control_enabled() {
             return text_result(
@@ -484,6 +488,116 @@ fn call_tool(
         Ok(value) => value,
         Err(error) => text_result(format!("error: {error}"), true),
     }
+}
+
+/// The most steps one `run_steps` call may hold.
+const MAX_STEPS: usize = 20;
+
+/// Check a `run_steps` list before anything runs, so a typo in step 4 cannot
+/// leave steps 1–3 done and the rest not. Returns each step's tool and the
+/// arguments it will get: `return_state` belongs to the batch, so it is taken
+/// off every step and handed to the last one.
+fn plan_steps(args: &Value) -> Result<Vec<(String, Value)>, String> {
+    let Some(steps) = args.get("steps").and_then(Value::as_array) else {
+        return Err("steps must be a list of {\"tool\": name, \"args\": {...}}".to_string());
+    };
+    if steps.is_empty() {
+        return Err("steps is empty — give at least one step".to_string());
+    }
+    if steps.len() > MAX_STEPS {
+        return Err(format!("{} steps is more than the {MAX_STEPS} one call may run — split them", steps.len()));
+    }
+    let known: Vec<String> = match tools::tool_defs() {
+        Value::Array(defs) => defs
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut plan = Vec::with_capacity(steps.len());
+    for (index, step) in steps.iter().enumerate() {
+        let number = index + 1;
+        let Some(tool) = step.get("tool").and_then(Value::as_str) else {
+            return Err(format!("step {number} has no tool — each step is {{\"tool\": name, \"args\": {{...}}}}"));
+        };
+        if tool == "run_steps" {
+            return Err(format!("step {number}: run_steps cannot contain run_steps"));
+        }
+        if !known.iter().any(|name| name == tool) {
+            return Err(format!("step {number}: unknown tool '{tool}'"));
+        }
+        let mut step_args = match step.get("args") {
+            None | Some(Value::Null) => json!({}),
+            Some(Value::Object(map)) => Value::Object(map.clone()),
+            Some(_) => return Err(format!("step {number} ({tool}): args must be an object")),
+        };
+        if let Some(map) = step_args.as_object_mut() {
+            map.remove("return_state");
+            map.remove("state_query");
+        }
+        plan.push((tool.to_string(), step_args));
+    }
+    if args.get("return_state").and_then(Value::as_bool) == Some(true)
+        && let Some((_, last)) = plan.last_mut()
+        && let Some(map) = last.as_object_mut()
+    {
+        map.insert("return_state".to_string(), json!(true));
+        if let Some(query) = args.get("state_query").filter(|query| query.is_string()) {
+            map.insert("state_query".to_string(), query.clone());
+        }
+    }
+    Ok(plan)
+}
+
+/// Run each step through `call_tool`, so a step gets exactly the checks a
+/// direct call would, and stop at the first one that fails. Every step's
+/// output is kept, labelled with its number, images included.
+fn run_steps(
+    args: &Value,
+    mut desktop: Option<&mut (dyn Desktop + '_)>,
+    browser: &mut browser::BrowserBridge,
+) -> Value {
+    let plan = match plan_steps(args) {
+        Ok(plan) => plan,
+        Err(error) => return text_result(format!("error: {error}; nothing was run"), true),
+    };
+    let total = plan.len();
+    let mut content: Vec<Value> = Vec::new();
+    let mut failed: Option<(usize, String)> = None;
+    for (index, (tool, step_args)) in plan.into_iter().enumerate() {
+        let number = index + 1;
+        let result = call_tool(
+            &json!({ "name": tool, "arguments": step_args }),
+            desktop.as_deref_mut(),
+            browser,
+        );
+        // The step's first text leads, labelled; its images and any further
+        // text follow in their own order.
+        let mut items = result.get("content").and_then(Value::as_array).cloned().unwrap_or_default();
+        let first_text = items.iter().position(|item| item.get("type").and_then(Value::as_str) == Some("text"));
+        let text = first_text
+            .map(|at| items.remove(at))
+            .and_then(|item| item.get("text").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_else(|| "done".to_string());
+        content.push(json!({ "type": "text", "text": format!("{number}. {tool}: {text}") }));
+        content.extend(items);
+        if result.get("isError").and_then(Value::as_bool) == Some(true) {
+            failed = Some((number, tool));
+            break;
+        }
+    }
+    let summary = match &failed {
+        None => format!("ran all {total} step{}", if total == 1 { "" } else { "s" }),
+        Some((number, tool)) if *number == total => format!("step {number} of {total} ({tool}) failed"),
+        Some((number, tool)) if number + 1 == total => {
+            format!("stopped at step {number} of {total}: {tool} failed, so step {total} did not run")
+        }
+        Some((number, tool)) => {
+            format!("stopped at step {number} of {total}: {tool} failed, so steps {}–{total} did not run", number + 1)
+        }
+    };
+    content.insert(0, json!({ "type": "text", "text": summary }));
+    json!({ "isError": failed.is_some(), "content": content })
 }
 
 fn zoom_region(args: &Value) -> Result<Value, DesktopError> {
@@ -1073,6 +1187,88 @@ mod tests {
         .unwrap();
         let text = text_of(&filtered);
         assert!(text.contains("[e1] Button \"Save\"") && !text.contains("Cancel"), "{text}");
+    }
+
+    #[test]
+    fn a_step_plan_is_checked_whole_before_anything_runs() {
+        let plan = |args: serde_json::Value| super::plan_steps(&args);
+        assert!(plan(json!({})).unwrap_err().contains("must be a list"));
+        assert!(plan(json!({ "steps": [] })).unwrap_err().contains("empty"));
+        let many: Vec<_> = (0..21).map(|_| json!({ "tool": "wait" })).collect();
+        assert!(plan(json!({ "steps": many })).unwrap_err().contains("more than the 20"));
+        let error = plan(json!({ "steps": [{ "tool": "click" }, { "tool": "clik" }] })).unwrap_err();
+        assert_eq!(error, "step 2: unknown tool 'clik'");
+        assert!(plan(json!({ "steps": [{ "tool": "run_steps" }] })).unwrap_err().contains("cannot contain run_steps"));
+        assert!(plan(json!({ "steps": [{ "tool": "click", "args": [1] }] })).unwrap_err().contains("args must be an object"));
+        assert!(plan(json!({ "steps": [{ "args": {} }] })).unwrap_err().contains("step 1 has no tool"));
+    }
+
+    #[test]
+    fn return_state_moves_from_the_steps_to_the_last_one() {
+        let plan = super::plan_steps(&json!({
+            "steps": [
+                { "tool": "click", "args": { "element_id": "e1", "return_state": true } },
+                { "tool": "type_text", "args": { "text": "hi" } }
+            ],
+            "return_state": true,
+            "state_query": "save"
+        }))
+        .unwrap();
+        assert_eq!(plan[0].1, json!({ "element_id": "e1" }));
+        assert_eq!(plan[1].1, json!({ "text": "hi", "return_state": true, "state_query": "save" }));
+
+        let plain = super::plan_steps(&json!({ "steps": [{ "tool": "press_key", "args": { "key": "return", "return_state": true } }] })).unwrap();
+        assert_eq!(plain[0].1, json!({ "key": "return" }), "a step's own return_state is dropped");
+    }
+
+    #[test]
+    fn steps_run_in_order_and_every_outcome_is_labelled() {
+        let mut desktop = FakeDesktop::default();
+        let mut browser = crate::browser::BrowserBridge::inert();
+        let result = super::run_steps(
+            &json!({ "steps": [
+                { "tool": "click", "args": { "element_id": "e1" } },
+                { "tool": "type_text", "args": { "text": "hi" } },
+                { "tool": "wait", "args": { "seconds": 0.01 } },
+                { "tool": "press_key", "args": { "key": "return" } }
+            ] }),
+            Some(&mut desktop),
+            &mut browser,
+        );
+        assert_eq!(result["isError"], json!(false));
+        let texts: Vec<&str> = result["content"].as_array().unwrap().iter().filter_map(|item| item["text"].as_str()).collect();
+        assert_eq!(texts, ["ran all 4 steps", "1. click: clicked e1", "2. type_text: typed", "3. wait: waited 0.0s", "4. press_key: pressed"]);
+    }
+
+    #[test]
+    fn the_first_failing_step_stops_the_rest() {
+        let mut desktop = FakeDesktop::default();
+        let mut browser = crate::browser::BrowserBridge::inert();
+        let result = super::run_steps(
+            &json!({ "steps": [
+                { "tool": "click", "args": { "element_id": "e1" } },
+                { "tool": "click", "args": { "element_id": "zz" } },
+                { "tool": "type_text", "args": { "text": "never" } },
+                { "tool": "press_key", "args": { "key": "return" } }
+            ] }),
+            Some(&mut desktop),
+            &mut browser,
+        );
+        assert_eq!(result["isError"], json!(true));
+        let texts: Vec<&str> = result["content"].as_array().unwrap().iter().filter_map(|item| item["text"].as_str()).collect();
+        assert_eq!(texts.len(), 3, "{texts:?}");
+        assert_eq!(texts[0], "stopped at step 2 of 4: click failed, so steps 3–4 did not run");
+        assert!(texts[2].starts_with("2. click: error: 'zz' is not an element id"), "{}", texts[2]);
+
+        let last = super::run_steps(
+            &json!({ "steps": [{ "tool": "wait" , "args": { "seconds": 0.01 } }, { "tool": "click", "args": {} }] }),
+            None,
+            &mut browser,
+        );
+        assert_eq!(text_of(&last), "step 2 of 2 (click) failed");
+
+        let nothing = super::run_steps(&json!({ "steps": [{ "tool": "nope" }] }), Some(&mut desktop), &mut browser);
+        assert_eq!(text_of(&nothing), "error: step 1: unknown tool 'nope'; nothing was run");
     }
 
     #[test]
