@@ -1794,6 +1794,8 @@ struct CaptureShot {
 private final class CaptureBox: @unchecked Sendable {
     private let lock = NSLock()
     private var value: CaptureShot?
+    private var failure: String?
+    private var failureFromSystem = false
     func set(_ shot: CaptureShot?) {
         lock.lock()
         value = shot
@@ -1804,6 +1806,76 @@ private final class CaptureBox: @unchecked Sendable {
         defer { lock.unlock() }
         return value
     }
+    /// Keeps why the capture failed, for the caller's error message.
+    /// `system` marks a ScreenCaptureKit refusal rather than a bad request.
+    func fail(_ reason: String, system: Bool = false) {
+        lock.lock()
+        failure = reason
+        failureFromSystem = system
+        lock.unlock()
+    }
+    func failureReason() -> (reason: String, system: Bool)? {
+        lock.lock()
+        defer { lock.unlock() }
+        return failure.map { ($0, failureFromSystem) }
+    }
+}
+
+/// Why the most recent screenshot, display or region capture came back empty,
+/// or nil when it succeeded. The capture functions return nil on any failure,
+/// so the tool error reads this to say what actually went wrong instead of
+/// guessing at Screen Recording permission.
+private let lastCaptureFailureLock = NSLock()
+private var lastCaptureFailureReason: (reason: String, system: Bool)?
+
+func lastCaptureFailure() -> (reason: String, system: Bool)? {
+    lastCaptureFailureLock.lock()
+    defer { lastCaptureFailureLock.unlock() }
+    return lastCaptureFailureReason
+}
+
+private func finishCapture(_ box: CaptureBox, timedOut: Bool, after seconds: Int) -> CaptureShot? {
+    let shot = timedOut ? nil : box.get()
+    let reason: (reason: String, system: Bool)?
+    if shot != nil {
+        reason = nil
+    } else if timedOut {
+        reason = ("ScreenCaptureKit did not answer within \(seconds) s", true)
+    } else {
+        reason = box.failureReason() ?? ("ScreenCaptureKit returned no image", true)
+    }
+    lastCaptureFailureLock.lock()
+    lastCaptureFailureReason = reason
+    lastCaptureFailureLock.unlock()
+    return shot
+}
+
+/// A ScreenCaptureKit error as one line: its description plus domain and code,
+/// which tell a refusal (permission, TCC) apart from a failed stream.
+private func describeCaptureError(_ error: Error) -> String {
+    let ns = error as NSError
+    return "\(ns.localizedDescription) (\(ns.domain) \(ns.code))"
+}
+
+/// The tool error for a failed capture: the recorded reason, then a hint only
+/// when ScreenCaptureKit itself refused. The Screen Recording hint is given
+/// only when macOS reports the permission missing; with it granted, a refusal
+/// is usually a stale grant that reopening the host app clears.
+func captureErrorText(_ what: String) -> String {
+    let failure = lastCaptureFailure()
+    var text = "error: could not capture \(what)"
+    if let failure {
+        text += ": \(failure.reason)"
+    }
+    guard failure?.system ?? true else { return text + "." }
+    if !CGPreflightScreenCaptureAccess() {
+        text += ". Screen Recording is not granted to the app that runs this server"
+            + " (System Settings > Privacy & Security > Screen & System Audio Recording)."
+    } else {
+        text += ". Screen Recording is granted; if this persists, quit and reopen the app"
+            + " that runs this server."
+    }
+    return text
 }
 
 /// The attached displays, kept between captures. Asking ScreenCaptureKit for
@@ -1901,7 +1973,10 @@ func captureWindow(pid: pid_t, maxWidth: Int, encoding: ImageEncoding) -> Captur
             let candidates = content.windows
                 .filter { $0.owningApplication?.processID == pid }
                 .sorted { ($0.frame.width * $0.frame.height) > ($1.frame.width * $1.frame.height) }
-            guard let window = candidates.first else { return }
+            guard let window = candidates.first else {
+                box.fail("the app has no on-screen window")
+                return
+            }
 
             let config = SCStreamConfiguration()
             let scale: Double
@@ -1917,12 +1992,16 @@ func captureWindow(pid: pid_t, maxWidth: Int, encoding: ImageEncoding) -> Captur
             let image = try await SCScreenshotManager.captureImage(
                 contentFilter: SCContentFilter(desktopIndependentWindow: window),
                 configuration: config)
-            guard let data = encoding.encode(image) else { return }
+            guard let data = encoding.encode(image) else {
+                box.fail("could not encode the image as \(encoding.mimeType)")
+                return
+            }
             box.set(CaptureShot(
                 data: data, mimeType: encoding.mimeType, frame: window.frame,
                 pixelWidth: image.width, pixelHeight: image.height, title: window.title))
         } catch {
             box.set(nil)
+            box.fail(describeCaptureError(error), system: true)
         }
     }
 
@@ -1930,9 +2009,9 @@ func captureWindow(pid: pid_t, maxWidth: Int, encoding: ImageEncoding) -> Captur
     if waited == .timedOut {
         task.cancel()
         // Do not read `box` after cancel — the task may still be writing.
-        return nil
+        return finishCapture(box, timedOut: true, after: 15)
     }
-    return box.get()
+    return finishCapture(box, timedOut: false, after: 15)
 }
 
 /// Capture a whole display. Window capture covers one app; this is for seeing
@@ -1947,7 +2026,10 @@ func captureDisplay(index: Int, maxWidth: Int, encoding: ImageEncoding) -> Captu
         for fresh in [false, true] {
             do {
                 let displays = try await DisplayCache.shared.current(fresh: fresh)
-                guard index >= 0, index < displays.count else { continue }
+                guard index >= 0, index < displays.count else {
+                    box.fail("no display \(index); \(displays.count) attached")
+                    continue
+                }
                 let display = displays[index]
                 let config = SCStreamConfiguration()
                 let scale: Double
@@ -1962,12 +2044,16 @@ func captureDisplay(index: Int, maxWidth: Int, encoding: ImageEncoding) -> Captu
                 let image = try await SCScreenshotManager.captureImage(
                     contentFilter: SCContentFilter(display: display, excludingWindows: []),
                     configuration: config)
-                guard let data = encoding.encode(image) else { return }
+                guard let data = encoding.encode(image) else {
+                    box.fail("could not encode the image as \(encoding.mimeType)")
+                    return
+                }
                 box.set(CaptureShot(
                     data: data, mimeType: encoding.mimeType, frame: display.frame,
                     pixelWidth: image.width, pixelHeight: image.height, title: nil))
                 return
             } catch {
+                box.fail(describeCaptureError(error), system: true)
                 continue
             }
         }
@@ -1975,9 +2061,9 @@ func captureDisplay(index: Int, maxWidth: Int, encoding: ImageEncoding) -> Captu
     if semaphore.wait(timeout: .now() + 20) == .timedOut {
         task.cancel()
         // Do not read `box` after cancel — the task may still be writing.
-        return nil
+        return finishCapture(box, timedOut: true, after: 20)
     }
-    return box.get()
+    return finishCapture(box, timedOut: false, after: 20)
 }
 
 /// Capture one region of the screen at full physical resolution. `rect` is in
@@ -1994,9 +2080,15 @@ func captureRegion(rect: CGRect, maxWidth: Int, encoding: ImageEncoding) -> Capt
                 let center = CGPoint(x: rect.midX, y: rect.midY)
                 guard let display = displays.first(where: { $0.frame.contains(center) })
                     ?? displays.first
-                else { continue }
+                else {
+                    box.fail("no display is attached")
+                    continue
+                }
                 let clipped = rect.intersection(display.frame)
-                guard clipped.width >= 4, clipped.height >= 4 else { continue }
+                guard clipped.width >= 4, clipped.height >= 4 else {
+                    box.fail("the region is not on an attached display")
+                    continue
+                }
                 let scale = backingScale(for: display)
                 var width = clipped.width * scale
                 var height = clipped.height * scale
@@ -2017,21 +2109,25 @@ func captureRegion(rect: CGRect, maxWidth: Int, encoding: ImageEncoding) -> Capt
                 let image = try await SCScreenshotManager.captureImage(
                     contentFilter: SCContentFilter(display: display, excludingWindows: []),
                     configuration: config)
-                guard let data = encoding.encode(image) else { return }
+                guard let data = encoding.encode(image) else {
+                    box.fail("could not encode the image as \(encoding.mimeType)")
+                    return
+                }
                 box.set(CaptureShot(
                     data: data, mimeType: encoding.mimeType, frame: clipped,
                     pixelWidth: image.width, pixelHeight: image.height, title: nil))
                 return
             } catch {
+                box.fail(describeCaptureError(error), system: true)
                 continue
             }
         }
     }
     if semaphore.wait(timeout: .now() + 15) == .timedOut {
         task.cancel()
-        return nil
+        return finishCapture(box, timedOut: true, after: 15)
     }
-    return box.get()
+    return finishCapture(box, timedOut: false, after: 15)
 }
 
 func toolListDisplays(_ args: [String: Any]) -> String {
@@ -4786,8 +4882,7 @@ func callTool(_ name: String, _ args: [String: Any]) -> [String: Any] {
         }
         guard let shot = captureRegion(rect: rect, maxWidth: maxWidth, encoding: encoding) else {
             return textResult(
-                "error: could not capture that region — check Screen Recording permission and "
-                + "that the region lies on an attached display (list_displays).", isError: true)
+                captureErrorText("that region"), isError: true)
         }
         return imageResult(shot, label: "zoomed region")
     }
@@ -4804,8 +4899,7 @@ func callTool(_ name: String, _ args: [String: Any]) -> [String: Any] {
             }
             guard let shot = captureDisplay(index: display, maxWidth: maxWidth, encoding: encoding) else {
                 return textResult(
-                    "error: could not capture display \(display) — check Screen Recording "
-                    + "permission, or call list_displays for valid indices.", isError: true)
+                    captureErrorText("display \(display)"), isError: true)
             }
             return imageResult(shot, label: "display \(display)")
         }
@@ -4826,8 +4920,7 @@ func callTool(_ name: String, _ args: [String: Any]) -> [String: Any] {
             pid: resolved.app.processIdentifier, maxWidth: maxWidth, encoding: encoding)
         else {
             return textResult(
-                "error: screen capture failed. The host app may be missing Screen Recording "
-                + "permission, or this app may have no on-screen window.",
+                captureErrorText("a window of \(resolved.app.localizedName ?? query)"),
                 isError: true)
         }
         return imageResult(
