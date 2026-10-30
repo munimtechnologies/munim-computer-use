@@ -124,19 +124,77 @@ fn list_displays_inner() -> Result<String> {
     }
 
     let mut lines = Vec::new();
-    for (index, monitor) in monitors.iter().enumerate() {
+    for (index, (monitor, frame)) in monitors.iter().zip(display_frames(&monitors)).enumerate() {
         let name = monitor.name().unwrap_or_else(|_| format!("display {index}"));
-        let width = monitor.width().unwrap_or(0);
-        let height = monitor.height().unwrap_or(0);
-        let x = monitor.x().unwrap_or(0);
-        let y = monitor.y().unwrap_or(0);
         let primary = monitor.is_primary().unwrap_or(false);
         lines.push(format!(
-            "[{index}] {name}  {width}x{height}  at ({x},{y}){}",
+            "[{index}] {name}  {:.0}x{:.0}  at ({:.0},{:.0}){}",
+            frame.width,
+            frame.height,
+            frame.x,
+            frame.y,
             if primary { "  PRIMARY" } else { "" }
         ));
     }
     Ok(lines.join("\n"))
+}
+
+/// Where each display sits, in the coordinates click/hover/drag take.
+///
+/// On Linux those are X screen pixels, because input goes through XTEST. xcap
+/// divides its monitor geometry by a scale factor (Xft.dpi / 96 on X11, the
+/// physical-to-logical ratio on Wayland), and GNOME runs Xwayland at a
+/// different size again, so read the RandR monitors ourselves (#41).
+fn display_frames(monitors: &[Monitor]) -> Vec<CaptureFrame> {
+    #[cfg(target_os = "linux")]
+    let randr = randr_monitors();
+    monitors
+        .iter()
+        .map(|monitor| {
+            #[cfg(target_os = "linux")]
+            if let Some(frame) = monitor.id().ok().and_then(|output| randr_frame(&randr, output)) {
+                return frame;
+            }
+            CaptureFrame {
+                x: f64::from(monitor.x().unwrap_or(0)),
+                y: f64::from(monitor.y().unwrap_or(0)),
+                width: f64::from(monitor.width().unwrap_or(0)),
+                height: f64::from(monitor.height().unwrap_or(0)),
+            }
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn randr_monitors() -> Vec<x11rb::protocol::randr::MonitorInfo> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::randr::ConnectionExt as _;
+
+    let Ok((connection, screen)) = x11rb::connect(None) else {
+        return Vec::new();
+    };
+    let Some(root) = connection.setup().roots.get(screen).map(|screen| screen.root) else {
+        return Vec::new();
+    };
+    connection
+        .randr_get_monitors(root, true)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .map(|reply| reply.monitors)
+        .unwrap_or_default()
+}
+
+/// The RandR monitor that drives `output`, which is what xcap's `Monitor::id`
+/// returns on Linux.
+#[cfg(target_os = "linux")]
+fn randr_frame(monitors: &[x11rb::protocol::randr::MonitorInfo], output: u32) -> Option<CaptureFrame> {
+    let monitor = monitors.iter().find(|monitor| monitor.outputs.contains(&output))?;
+    Some(CaptureFrame {
+        x: f64::from(monitor.x),
+        y: f64::from(monitor.y),
+        width: f64::from(monitor.width),
+        height: f64::from(monitor.height),
+    })
 }
 
 /// Where a capture sits on screen, so the tool text can tell the model how an
@@ -199,7 +257,9 @@ fn solid_colour(image: &RgbaImage) -> Option<[u8; 3]> {
 /// The mapping line every screenshot/zoom result carries. Screen coordinates on
 /// Windows and X11 are the physical pixels `xcap` captures (on Windows because
 /// the process is per-monitor DPI aware, see `use_physical_pixels`), so a
-/// full-size capture maps 1:1 and only downscaling changes the ratio.
+/// full-size capture maps 1:1 and only downscaling changes the ratio. A scaled
+/// Wayland session is the exception: its Xwayland screen, which XTEST clicks
+/// in, need not match the compositor's physical pixels (see `display_frames`).
 pub fn mapping_text(capture: &Capture, label: &str) -> String {
     let sx = f64::from(capture.pixel_width) / capture.frame.width.max(1.0);
     let sy = f64::from(capture.pixel_height) / capture.frame.height.max(1.0);
@@ -240,12 +300,7 @@ fn capture_display_inner(index: usize, max_width: u32, format: CaptureFormat) ->
             monitors.len()
         ))
     })?;
-    let frame = CaptureFrame {
-        x: f64::from(monitor.x().unwrap_or(0)),
-        y: f64::from(monitor.y().unwrap_or(0)),
-        width: f64::from(monitor.width().unwrap_or(0)),
-        height: f64::from(monitor.height().unwrap_or(0)),
-    };
+    let frame = display_frames(&monitors)[index];
     let image = monitor
         .capture_image()
         .map_err(|error| DesktopError::new(format!("failed to capture display: {error}")))?;
@@ -281,26 +336,21 @@ fn capture_region_inner(
     let monitors = Monitor::all()
         .map_err(|error| DesktopError::new(format!("failed to enumerate displays: {error}")))?;
     let (cx, cy) = ((left + right) / 2.0, (top + bottom) / 2.0);
-    let monitor = monitors
+    let frames = display_frames(&monitors);
+    let (monitor, display) = monitors
         .iter()
-        .find(|monitor| {
-            let mx = f64::from(monitor.x().unwrap_or(0));
-            let my = f64::from(monitor.y().unwrap_or(0));
-            let mw = f64::from(monitor.width().unwrap_or(0));
-            let mh = f64::from(monitor.height().unwrap_or(0));
-            cx >= mx && cx < mx + mw && cy >= my && cy < my + mh
-        })
-        .or_else(|| monitors.first())
+        .zip(frames.iter().copied())
+        .find(|(_, d)| cx >= d.x && cx < d.x + d.width && cy >= d.y && cy < d.y + d.height)
+        .or_else(|| monitors.first().zip(frames.first().copied()))
         .ok_or_else(|| DesktopError::new("no display contains that region — call list_displays"))?;
-    let mx = f64::from(monitor.x().unwrap_or(0));
-    let my = f64::from(monitor.y().unwrap_or(0));
+    let (mx, my) = (display.x, display.y);
     let image = monitor
         .capture_image()
         .map_err(|error| DesktopError::new(format!("failed to capture display: {error}")))?;
-    // The capture is in physical pixels; screen coordinates may be logical on a
-    // scaled display, so derive the ratio from the image itself.
-    let ratio_x = f64::from(image.width()) / f64::from(monitor.width().unwrap_or(image.width())).max(1.0);
-    let ratio_y = f64::from(image.height()) / f64::from(monitor.height().unwrap_or(image.height())).max(1.0);
+    // The capture is in physical pixels; screen coordinates may not be (a
+    // scaled Xwayland screen, say), so derive the ratio from the image itself.
+    let ratio_x = f64::from(image.width()) / if display.width > 0.0 { display.width } else { f64::from(image.width()) };
+    let ratio_y = f64::from(image.height()) / if display.height > 0.0 { display.height } else { f64::from(image.height()) };
     let px0 = (((left - mx) * ratio_x).floor().max(0.0) as u32).min(image.width().saturating_sub(1));
     let py0 = (((top - my) * ratio_y).floor().max(0.0) as u32).min(image.height().saturating_sub(1));
     let px1 = (((right - mx) * ratio_x).ceil().max(0.0) as u32).min(image.width());
@@ -458,5 +508,39 @@ mod tests {
         let png = encode_image(RgbaImage::new(80, 20), 0, CaptureFormat::Png).expect("encodes");
         let decoded = image::load_from_memory(&png).expect("decodes");
         assert_eq!((decoded.width(), decoded.height()), (80, 20));
+    }
+
+    /// #41: GNOME at 150% runs Xwayland at 5120x2880 for a 3840x2160 panel;
+    /// the frame must be the X screen XTEST clicks in, not xcap's 3413x1920.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_display_frame_is_the_randr_monitor_driving_its_output() {
+        use x11rb::protocol::randr::MonitorInfo;
+        let monitor = |x, width, outputs: Vec<u32>| MonitorInfo {
+            name: 0,
+            primary: false,
+            automatic: true,
+            x,
+            y: 0,
+            width,
+            height: 2880,
+            width_in_millimeters: 0,
+            height_in_millimeters: 0,
+            outputs,
+        };
+        let monitors = [monitor(0, 5120, vec![71]), monitor(5120, 2560, vec![72, 73])];
+        let frame = super::randr_frame(&monitors, 73).expect("found");
+        assert_eq!(frame, super::CaptureFrame { x: 5120.0, y: 0.0, width: 2560.0, height: 2880.0 });
+        assert_eq!(super::randr_frame(&monitors, 71).map(|frame| frame.width), Some(5120.0));
+        assert_eq!(super::randr_frame(&monitors, 99), None);
+
+        let capture = super::Capture {
+            bytes: Vec::new(),
+            frame: super::randr_frame(&monitors, 71).expect("found"),
+            pixel_width: 3840,
+            pixel_height: 2160,
+            solid: None,
+        };
+        assert!(super::mapping_text(&capture, "display 0").contains("0.750 px per screen unit"));
     }
 }
