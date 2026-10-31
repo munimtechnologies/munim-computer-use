@@ -49,7 +49,7 @@ const FALLBACK_PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "mt-desktop";
 const SERVER_TITLE: &str = "Munim Computer Use";
 const SERVER_WEBSITE: &str = "https://munimtech.com/munim-computer-use";
-const SERVER_VERSION: &str = "0.9.2";
+const SERVER_VERSION: &str = "0.9.3";
 
 /// Keeps the agent pointer up for the duration of a `tools/call`, then
 /// schedules a fade once Computer Use tools stop for the task.
