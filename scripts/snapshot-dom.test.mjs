@@ -107,8 +107,12 @@ try {
   const start = source.includes("function isElementVisibleInPage(") ? "function isElementVisibleInPage(" : "const SNAPSHOT_JS =";
   const declaration = source.slice(source.indexOf(start), source.indexOf("\nasync function snapshot("));
   const expression = vm.runInNewContext(declaration + "\nSNAPSHOT_JS");
-  const clickDeclaration = source.slice(source.indexOf("const CLICK_JS ="), source.indexOf("\n/// Click a snapshotted element"));
-  const click = vm.runInNewContext(clickDeclaration + "\nCLICK_JS");
+  // The in-page press a background tab gets (CLICK_JS before 0.9.2).
+  const [clickName, clickEnd] = source.includes("const CLICK_EVENTS_JS =")
+    ? ["CLICK_EVENTS_JS", "\nasync function evaluateValue("]
+    : ["CLICK_JS", "\n/// Click a snapshotted element"];
+  const clickDeclaration = source.slice(source.indexOf(`const ${clickName} =`), source.indexOf(clickEnd));
+  const click = vm.runInNewContext(clickDeclaration + `\n${clickName}`);
   const snapshot = (options = {}) => evaluate(expression.slice(0, -2) + `(${JSON.stringify(options)})`);
   const set = (html) => evaluate(`document.body.innerHTML = ${JSON.stringify(html)}; true`);
   const buttons = (count, prefix = "Background") => Array.from({ length: count }, (_, i) => `<button>${prefix} ${i}</button>`).join("");
@@ -270,7 +274,7 @@ try {
     });
     vm.runInContext(
       between(start, "async function clickAt") +
-      between("const CLICK_JS", "/// Click a snapshotted") +
+      clickDeclaration +
       between("const sleep =", "/**\n * The page's readable text"), context,
     );
     const extension = (code) => vm.runInContext(code, context);
@@ -291,7 +295,7 @@ try {
       })()`);
       const initial = await extension("snapshot(1)");
       const index = initial.elements.find((el) => el.label === "Open dialog").i;
-      assert.equal((await evaluate(extension(`CLICK_JS(${index})`))).ok, true);
+      assert.equal((await evaluate(extension(`${clickName}(${index})`))).ok, true);
     };
     await openDelayedDialog();
     const before = Date.now();
