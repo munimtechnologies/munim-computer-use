@@ -3283,6 +3283,16 @@ func toolBrowserClick(_ args: [String: Any]) -> String {
     // composited, so a desktop overlay at guessed screen coords would lie.
     return bridgeText(browserSessionCall("click", withReturnState(params, args), args: args)) { payload in
         var line = "clicked in tab \(tabId)"
+        // Which element an indexed click pressed and how, so a click the page
+        // ignored can be told from one that went to a stale index.
+        if let target = payload["target"] as? String {
+            if payload["route"] as? String == "input" {
+                line += " — \(target), with real mouse input"
+            } else {
+                let why = payload["why"] as? String ?? "real input could not reach it"
+                line += " — \(target), as page events (\(why))"
+            }
+        }
         if let cursor = payload["cursor"] as? [String: Any] {
             if cursor["ok"] as? Bool == true {
                 let glow = cursor["hasGlow"] as? Bool == true ? "glow" : "no-glow"
@@ -4612,7 +4622,7 @@ func advertisedToolDefs() -> [[String: Any]] {
 
 // MARK: - Server identity
 
-let serverVersion = "0.9.1"
+let serverVersion = "0.9.2"
 /// Protocol revisions this server speaks. A client asking for one gets it
 /// echoed back; anything else gets the oldest, which every client understands.
 let supportedProtocolVersions: Set<String> = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]

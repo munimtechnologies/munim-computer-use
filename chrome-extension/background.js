@@ -1019,49 +1019,139 @@ async function hideCursor(tabId) {
   }
 }
 
-const CLICK_JS = (index) => `(() => {
+/// Find a snapshotted element, bring it to the middle of the view, and say
+/// whether real input can reach it: only in a tab Chrome is showing, and only
+/// when the element itself is what a press at its centre would hit. When it
+/// can, a probe records which trusted events land on it, so the click can
+/// check its hover reached the element before pressing anything.
+const CLICK_TARGET_JS = (index) => `(() => {
   const el = document.querySelector('[data-cu-idx="${index}"]');
   if (!el) return { ok: false, reason: 'element ${index} is no longer on the page' };
-  el.scrollIntoView({ block: 'center', inline: 'nearest' });
+  // Instant, so a page with smooth scrolling is not measured mid-flight.
+  el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
   const r = el.getBoundingClientRect();
-  const cx = r.left + r.width / 2;
-  const cy = r.top + r.height / 2;
-  const opts = { bubbles: true, cancelable: true, composed: true, view: window,
-                 clientX: cx, clientY: cy, button: 0 };
-  el.dispatchEvent(new PointerEvent('pointerover', opts));
-  el.dispatchEvent(new MouseEvent('mouseover', opts));
-  el.dispatchEvent(new PointerEvent('pointerdown', opts));
-  el.dispatchEvent(new MouseEvent('mousedown', opts));
-  el.focus?.();
-  el.dispatchEvent(new PointerEvent('pointerup', opts));
-  el.dispatchEvent(new MouseEvent('mouseup', opts));
-  el.click();
-  return { ok: true, tag: el.tagName.toLowerCase(), href: el.href || null, x: cx, y: cy };
+  const x = r.left + r.width / 2;
+  const y = r.top + r.height / 2;
+  const label = (el.getAttribute('aria-label') || el.innerText || el.getAttribute('title') || '')
+    .replace(/\\s+/g, ' ').trim().slice(0, 60);
+  const hit = document.elementFromPoint(x, y);
+  const shown = document.visibilityState === 'visible';
+  const reachable = shown && !!hit && (hit === el || el.contains(hit));
+  const found = { ok: true, tag: el.tagName.toLowerCase(), label, href: el.href || null, x, y, reachable };
+  window.__cuClickProbe?.done();
+  delete window.__cuClickProbe;
+  if (!reachable) return { ...found, why: shown ? 'another element covers it' : 'the tab is in the background' };
+  const seen = { hover: false, press: false };
+  const kinds = { pointerover: 'hover', pointermove: 'hover', mousemove: 'hover', pointerdown: 'press', mousedown: 'press' };
+  const listener = (e) => { if (e.isTrusted && e.composedPath().includes(el)) seen[kinds[e.type]] = true; };
+  for (const type in kinds) addEventListener(type, listener, true);
+  window.__cuClickProbe = { seen, done: () => { for (const type in kinds) removeEventListener(type, listener, true); } };
+  return found;
 })()`;
 
-/// Click a snapshotted element by invoking it in the page.
+/// What the click probe has seen; `finish` also removes it. Gone means the
+/// document it was installed in is gone too: the press navigated.
+const CLICK_PROBE_JS = (finish) => `(() => {
+  const probe = window.__cuClickProbe;
+  if (!probe) return { gone: true };
+  if (${finish}) { probe.done(); delete window.__cuClickProbe; }
+  return { ...probe.seen };
+})()`;
+
+/// The press as page events, for a tab real input cannot reach. Carries what
+/// a real mouse press carries (button state, pointer type, a click count), so
+/// controls that check those (menus that open only when buttons === 1) still
+/// respond; and, like a real press, a cancelled pointerdown suppresses the
+/// mouse events and a cancelled mousedown keeps focus where it was.
+const CLICK_EVENTS_JS = (index) => `(() => {
+  const el = document.querySelector('[data-cu-idx="${index}"]');
+  if (!el) return { ok: false, reason: 'element ${index} is no longer on the page' };
+  const r = el.getBoundingClientRect();
+  const x = r.left + r.width / 2;
+  const y = r.top + r.height / 2;
+  const base = { bubbles: true, cancelable: true, composed: true, view: window, clientX: x, clientY: y,
+                 screenX: screenX + x, screenY: screenY + outerHeight - innerHeight + y, button: 0, buttons: 0 };
+  const pointer = { pointerId: 1, pointerType: 'mouse', isPrimary: true, width: 1, height: 1 };
+  const fire = (Type, type, init) => el.dispatchEvent(new Type(type, { ...base, ...init }));
+  fire(PointerEvent, 'pointerover', pointer);
+  fire(PointerEvent, 'pointerenter', { ...pointer, bubbles: false, cancelable: false });
+  fire(MouseEvent, 'mouseover', {});
+  fire(MouseEvent, 'mouseenter', { bubbles: false, cancelable: false });
+  fire(PointerEvent, 'pointermove', pointer);
+  fire(MouseEvent, 'mousemove', {});
+  const mouse = fire(PointerEvent, 'pointerdown', { ...pointer, buttons: 1, pressure: 0.5 });
+  if (mouse && fire(MouseEvent, 'mousedown', { buttons: 1, detail: 1 })) el.focus?.();
+  fire(PointerEvent, 'pointerup', pointer);
+  if (mouse) fire(MouseEvent, 'mouseup', { detail: 1 });
+  // A dispatched click still runs the element's activation (links follow,
+  // checkboxes toggle); el.click() would say detail 0 and no pointer type.
+  fire(PointerEvent, 'click', { ...pointer, detail: 1 });
+  return { ok: true };
+})()`;
+
+async function evaluateValue(tabId, expression, failure) {
+  const res = await send(tabId, "Runtime.evaluate", { expression, returnByValue: true, userGesture: true });
+  if (res?.exceptionDetails) throw new Error(res.exceptionDetails.text || failure);
+  return res?.result?.value || {};
+}
+
+/// Click a snapshotted element.
 ///
-/// Coordinate dispatch is unreliable here: a background tab is not composited,
-/// so hit-testing a point finds nothing and the click silently does nothing.
-/// Driving the node directly works regardless of whether the tab is rendered,
-/// which is the whole point of working in a tab the user is not looking at.
+/// In a tab Chrome is showing, this is a real press through the DevTools input
+/// pipeline: trusted events, exactly as a person's mouse makes them. A
+/// background tab is not composited, so Chrome drops real input sent to it;
+/// there the press is played as page events on the node itself instead, which
+/// works whether or not the tab is rendered, the whole point of working in a
+/// tab the user is not looking at. `route` says which one ran, and `target`
+/// which element it was, so an ignored click can be told from a stale index.
 async function clickElement(tabId, index) {
-  // The index is spliced into the script CLICK_JS runs in the page, so only a
-  // plain snapshot index may reach it: anything else would run as page script.
+  // The index is spliced into the scripts that run in the page, so only a
+  // plain snapshot index may reach them: anything else would run as page script.
   if (!Number.isInteger(index) || index < 0) {
     throw new Error("index must be an element index from browser_snapshot");
   }
-  const res = await send(tabId, "Runtime.evaluate", {
-    expression: CLICK_JS(index),
-    returnByValue: true,
-    userGesture: true,
-  });
-  if (res?.exceptionDetails) throw new Error(res.exceptionDetails.text || "click failed");
-  const value = res.result.value || {};
-  if (!value.ok) throw new Error(value.reason || "click failed");
-  const cursor = await paintCursor(tabId, value.x, value.y);
+  const found = await evaluateValue(tabId, CLICK_TARGET_JS(index), "click failed");
+  if (!found.ok) throw new Error(found.reason || "click failed");
+  const { x, y } = found;
+  let route = "page-events";
+  let why = found.why;
+  if (found.reachable) {
+    try {
+      // Hover first and check it reached the element: a press at a point the
+      // page reads differently (zoom, a layout shift) would hit something else.
+      await send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none", buttons: 0, pointerType: "mouse" });
+      if ((await evaluateValue(tabId, CLICK_PROBE_JS(false), "click failed")).hover) {
+        const press = { x, y, button: "left", clickCount: 1, pointerType: "mouse" };
+        await send(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...press, buttons: 1 });
+        await send(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...press, buttons: 0 });
+        // A press that navigated took the probe (or the whole context) with
+        // it. Otherwise not pressed means not delivered, so the page events
+        // below are not a second click.
+        const seen = await evaluateValue(tabId, CLICK_PROBE_JS(true), "click failed").catch(() => ({ gone: true }));
+        if (seen.press || seen.gone) route = "input";
+        else why = "real input did not reach it";
+      } else {
+        why = "real input landed somewhere else";
+      }
+    } finally {
+      await evaluateValue(tabId, CLICK_PROBE_JS(true), "click failed").catch(() => {});
+    }
+  }
+  if (route !== "input") {
+    const fired = await evaluateValue(tabId, CLICK_EVENTS_JS(index), "click failed");
+    if (!fired.ok) throw new Error(fired.reason || "click failed");
+  }
+  const cursor = await paintCursor(tabId, x, y);
   await markTab(tabId);
-  return { ...value, cursor };
+  return {
+    ok: true, tag: found.tag, href: found.href, x, y, route,
+    ...(route === "input" ? {} : { why }),
+    target: describeTarget(index, found), cursor,
+  };
+}
+
+function describeTarget(index, { tag, label }) {
+  return `[${index}] ${tag}${label ? ` "${label}"` : ""}`;
 }
 
 async function typeText(tabId, text) {

@@ -92,6 +92,20 @@ const pages = {
     </form>
     <a href="/next">Next page</a>`,
   "/next": "<title>Next</title><h1>You made it</h1><button>Continue</button>",
+  // Issue #42: a menu that, like Gmail's, opens only for a press that carries
+  // the left button's state. Every press event is logged with its metadata.
+  "/press": `<title>Press</title><button id="more" aria-label="More message options">More</button>
+    <div id="menu" role="menu" hidden><div role="menuitem">Report</div></div><script>
+    window.presses = [];
+    const more = document.getElementById('more');
+    more.addEventListener('pointerdown', (e) => presses.push(['pointerdown', e.isTrusted, e.buttons, e.pointerType]));
+    more.addEventListener('mousedown', (e) => {
+      presses.push(['mousedown', e.isTrusted, e.buttons, e.detail]);
+      if (e.buttons === 1) document.getElementById('menu').hidden = false;
+    });
+    more.addEventListener('mouseup', (e) => presses.push(['mouseup', e.isTrusted, e.buttons, e.detail]));
+    more.addEventListener('click', (e) => presses.push(['click', e.isTrusted, e.detail, e.pointerType]));
+  </script>`,
 };
 const site = http.createServer((req, res) => {
   const body = pages[req.url.split("?")[0]];
@@ -560,6 +574,44 @@ check("snapshot pagination reaches all controls with stable global indices", asy
     assert.equal(result.isError, true);
     assert.match(result.text, /offset must|limit must/);
   }
+});
+
+let pressTab;
+const atPress = (url) => url === `${base}/press`;
+check("a background-tab click carries a real press's button state (#42)", async () => {
+  pressTab = Number(/tab_id=(\d+)/.exec(await ok("browser_open_tab", { url: `${base}/press` }))[1]);
+  await ok("browser_select_tab", { tab_id: tab });
+  const snapshot = await ok("browser_snapshot", { tab_id: pressTab });
+  const index = Number(/\[(\d+)\] button "More message options"/.exec(snapshot)[1]);
+  const text = await ok("browser_click", { tab_id: pressTab, index, return_state: true, wait_for_selector: "[role=menuitem]", wait_timeout_ms: 3000 });
+  assert.ok(text.startsWith(`clicked in tab ${pressTab} — [${index}] button "More message options", as page events (the tab is in the background)`), text);
+  assert.match(text, /readiness: met/);
+  assert.deepEqual(await evaluateIn(atPress, "presses"), [
+    ["pointerdown", false, 1, "mouse"],
+    ["mousedown", false, 1, 1],
+    ["mouseup", false, 0, 1],
+    ["click", false, 1, "mouse"],
+  ]);
+});
+
+// Headless Chrome reports every tab hidden, the front one too, so only a
+// headed run has a tab real input can reach. browser_select_tab only switches
+// when the user is already on an agent tab, so bring it up as a person would.
+if (argv.includes("--headed")) check("a click in a shown tab is real mouse input (#42)", async () => {
+  await ok("browser_navigate", { tab_id: pressTab, url: `${base}/press` });
+  await evaluateIn(atPress, {}, "Page.bringToFront");
+  const snapshot = await ok("browser_snapshot", { tab_id: pressTab });
+  const index = Number(/\[(\d+)\] button "More message options"/.exec(snapshot)[1]);
+  const text = await ok("browser_click", { tab_id: pressTab, index, return_state: true, wait_for_selector: "[role=menuitem]", wait_timeout_ms: 3000 });
+  assert.ok(text.startsWith(`clicked in tab ${pressTab} — [${index}] button "More message options", with real mouse input`), text);
+  assert.match(text, /readiness: met/);
+  assert.deepEqual(await evaluateIn(atPress, "presses"), [
+    ["pointerdown", true, 1, "mouse"],
+    ["mousedown", true, 1, 1],
+    ["mouseup", true, 0, 1],
+    ["click", true, 1, "mouse"],
+  ]);
+  await ok("browser_close_tab", { tab_id: pressTab });
 });
 
 let failed = 0;

@@ -1145,7 +1145,7 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
             .or_else(|| args.get("index").and_then(Value::as_i64))
             .unwrap_or(-1);
             let line = match other {
-                "click" => format!("clicked in tab {tab}"),
+                "click" => format!("clicked in tab {tab}{}", describe_click_route(result)),
                 "type" => format!(
                     "typed {} characters into tab {tab}",
                     args.get("text").and_then(Value::as_str).unwrap_or("").chars().count()
@@ -1184,6 +1184,22 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
                 ),
                 None => line,
             }
+        }
+    }
+}
+
+/// Which element an indexed click pressed and how, so a click the page ignored
+/// can be told from one that went to a stale index. Coordinate clicks, and
+/// extensions older than 0.9.2, report neither.
+fn describe_click_route(result: &Value) -> String {
+    let Some(target) = result.get("target").and_then(Value::as_str) else {
+        return String::new();
+    };
+    match result.get("route").and_then(Value::as_str) {
+        Some("input") => format!(" — {target}, with real mouse input"),
+        _ => {
+            let why = result.get("why").and_then(Value::as_str).unwrap_or("real input could not reach it");
+            format!(" — {target}, as page events ({why})")
         }
     }
 }
@@ -1497,6 +1513,21 @@ mod tests {
         assert!(text.starts_with("clicked in tab 5"), "{text}");
         assert!(text.contains("page after the action"), "{text}");
         assert!(text.contains("[0] button \"Go\""), "{text}");
+    }
+
+    #[test]
+    fn an_indexed_click_says_what_it_pressed_and_how() {
+        let args = json!({ "tab_id": 5, "index": 12 });
+        let real = describe("click", &json!({ "route": "input", "target": "[12] div \"More\"" }), &args);
+        assert_eq!(real, "clicked in tab 5 — [12] div \"More\", with real mouse input");
+        let events = describe(
+            "click",
+            &json!({ "route": "page-events", "why": "the tab is in the background", "target": "[12] div \"More\"" }),
+            &args,
+        );
+        assert_eq!(events, "clicked in tab 5 — [12] div \"More\", as page events (the tab is in the background)");
+        // An older extension sends neither.
+        assert_eq!(describe("click", &json!({}), &args), "clicked in tab 5");
     }
 
     #[test]

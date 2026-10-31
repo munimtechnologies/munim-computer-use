@@ -649,7 +649,8 @@ test("a readiness evaluation error is not reported as a failed click", async () 
   pageEval = (_method, params) => {
     const expression = params.expression ?? "";
     if (expression.includes("data-cu-idx=\"3\"")) {
-      clicks++;
+      // The lookup, then the press itself.
+      if (expression.includes("'pointerdown'")) clicks++;
       return { result: { value: { ok: true, x: 5, y: 5 } } };
     }
     if (expression.includes("visibleSelectorInPage")) return { result: { value: { error: "invalid CSS selector" } } };
@@ -668,7 +669,8 @@ test("a readiness transport failure preserves the successful action and current 
   pageEval = (_method, params) => {
     const expression = params.expression ?? "";
     if (expression.includes("data-cu-idx=\"3\"")) {
-      clicks++;
+      // The lookup, then the press itself.
+      if (expression.includes("'pointerdown'")) clicks++;
       return { result: { value: { ok: true, x: 5, y: 5 } } };
     }
     if (expression.includes("visibleSelectorInPage")) throw new Error("readiness transport unavailable");
@@ -728,6 +730,84 @@ test("a click index that is not a plain number never reaches the page as script"
   }
   assert.ok(!evaluated.some((expression) => expression.includes("leaked")), "the payload was evaluated");
   pageEval = () => ({ result: { value: {} } });
+});
+
+/**
+ * Play a page for an indexed click: `found` is what the element lookup says,
+ * `seen` what the probe saw after the hover and after the press. Records the
+ * real input sent and whether the press was played as page events.
+ */
+function playClick({ found, hover = true, press = true, gone = false }) {
+  const log = { input: [], pageEvents: 0 };
+  let probes = 0;
+  pageEval = (method, params) => {
+    if (method === "Input.dispatchMouseEvent") {
+      log.input.push(params.type);
+      return {};
+    }
+    const expression = params.expression ?? "";
+    if (expression.includes("scrollIntoView")) return { result: { value: { ok: true, tag: "div", label: "More", x: 5, y: 6, ...found } } };
+    if (expression.includes("window.__cuClickProbe")) {
+      probes += 1;
+      if (probes === 1) return { result: { value: { hover } } };
+      return { result: { value: gone && probes === 2 ? { gone: true } : { hover, press } } };
+    }
+    if (expression.includes("'pointerdown'")) {
+      log.pageEvents += 1;
+      return { result: { value: { ok: true } } };
+    }
+    return { result: { value: {} } };
+  };
+  return log;
+}
+
+test("a click in a shown tab is a real press once the hover reached the element", async () => {
+  const log = playClick({ found: { reachable: true } });
+  const result = await callAndWait("click", { tabId: pageTab, index: 4 });
+  assert.deepEqual(log.input, ["mouseMoved", "mousePressed", "mouseReleased"]);
+  assert.equal(log.pageEvents, 0, "the press was played twice");
+  assert.equal(result.route, "input");
+  assert.equal(result.target, '[4] div "More"');
+  pageEval = () => ({ result: { value: {} } });
+});
+
+test("a click in a background tab plays the press as page events", async () => {
+  const log = playClick({ found: { reachable: false, why: "the tab is in the background" } });
+  const result = await callAndWait("click", { tabId: pageTab, index: 4 });
+  assert.deepEqual(log.input, [], "real input sent to a tab Chrome drops it for");
+  assert.equal(log.pageEvents, 1);
+  assert.equal(result.route, "page-events");
+  assert.equal(result.why, "the tab is in the background");
+  pageEval = () => ({ result: { value: {} } });
+});
+
+test("a hover that lands elsewhere never presses there", async () => {
+  const log = playClick({ found: { reachable: true }, hover: false });
+  const result = await callAndWait("click", { tabId: pageTab, index: 4 });
+  assert.deepEqual(log.input, ["mouseMoved"]);
+  assert.equal(log.pageEvents, 1);
+  assert.equal(result.why, "real input landed somewhere else");
+  pageEval = () => ({ result: { value: {} } });
+});
+
+test("an undelivered press falls back once, a press that navigated does not", async () => {
+  let log = playClick({ found: { reachable: true }, press: false });
+  let result = await callAndWait("click", { tabId: pageTab, index: 4 });
+  assert.equal(log.pageEvents, 1);
+  assert.equal(result.route, "page-events");
+  log = playClick({ found: { reachable: true }, gone: true });
+  result = await callAndWait("click", { tabId: pageTab, index: 4 });
+  assert.equal(log.pageEvents, 0, "a link was followed and then clicked again");
+  assert.equal(result.route, "input");
+  pageEval = () => ({ result: { value: {} } });
+});
+
+test("page events carry a real press's button state and pointer type", () => {
+  const script = vm.runInContext("CLICK_EVENTS_JS(4)", extensionContext);
+  assert.match(script, /'pointerdown', \{ \.\.\.pointer, buttons: 1/);
+  assert.match(script, /'mousedown', \{ buttons: 1, detail: 1 \}/);
+  assert.match(script, /pointerType: 'mouse'/);
+  assert.match(script, /'click', \{ \.\.\.pointer, detail: 1 \}/);
 });
 
 test("return_state does not read a blocked site the action landed on", async () => {
