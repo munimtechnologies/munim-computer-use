@@ -1044,6 +1044,7 @@ fn normalise(_command: &str, args: &Value) -> Value {
         ("return_state", "returnState"),
         ("wait_for_selector", "waitForSelector"),
         ("wait_timeout_ms", "waitTimeoutMs"),
+        ("bring_to_front", "bringToFront"),
     ] {
         if let Some(value) = args.get(from) {
             map.insert(to.into(), value.clone());
@@ -1055,6 +1056,30 @@ fn normalise(_command: &str, args: &Value) -> Value {
     // Keep `index` in the wire params for commands that still accept it; select_tab
     // / close_tab resolve index → tabId in `BrowserBridge::params_for` before dispatch.
     params
+}
+
+/// What browser_select_tab actually did (#43). The extension only shows an
+/// agent tab on its own when the user is already looking at one of the
+/// agent's tabs, so "switched" would often be false: say whether the tab is
+/// now the window's visible tab, and how to show it when it is not.
+fn describe_select(tab: i64, result: &Value) -> String {
+    match result.get("activated").and_then(Value::as_bool) {
+        Some(true) if result.get("windowFocused").and_then(Value::as_bool) == Some(true) => {
+            format!("tab {tab} is now the visible tab and its Chrome window is in front")
+        }
+        Some(true) => format!("tab {tab} is now the visible tab in its window"),
+        Some(false) => format!(
+            "tab {tab} was NOT brought to front: the user is on one of their own tabs in that window, \
+             so it stays in the background (browser_list_tabs still shows their tab as active). \
+             browser_snapshot, browser_click, browser_type and browser_press_key work on it as it is; \
+             pass bring_to_front=true to show it anyway, for example before native keyboard input or a screenshot"
+        ),
+        // An extension older than 0.9.3 does not report the outcome.
+        None => format!(
+            "asked Chrome to select tab {tab}; this browser extension is too old to report whether it became \
+             visible — check browser_list_tabs, or update the extension"
+        ),
+    }
 }
 
 /// Render a reply as the tool text the macOS server produces.
@@ -1167,7 +1192,7 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
                     "navigated tab {tab} to {}",
                     args.get("url").and_then(Value::as_str).unwrap_or("")
                 ),
-                "select_tab" => format!("switched the agent group to tab {tab}"),
+                "select_tab" => describe_select(tab, result),
                 // An adopted tab comes back as a release, so say what happened.
                 "close_tab" if result.get("released").is_some() => {
                     format!("tab {tab} was the user's — released it instead of closing")
@@ -1847,7 +1872,18 @@ mod tests {
         // "click ok" tells a model nothing; these mirror the macOS wording.
         let tab = json!({ "tab_id": 9 });
         assert_eq!(describe("click", &json!({}), &tab), "clicked in tab 9");
-        assert_eq!(describe("select_tab", &json!({}), &tab), "switched the agent group to tab 9");
+        assert!(describe("select_tab", &json!({}), &tab).starts_with("asked Chrome to select tab 9"));
+        assert_eq!(
+            describe("select_tab", &json!({ "tabId": 9, "activated": true }), &tab),
+            "tab 9 is now the visible tab in its window"
+        );
+        let background = describe("select_tab", &json!({ "tabId": 9, "activated": false }), &tab);
+        assert!(background.starts_with("tab 9 was NOT brought to front"), "{background}");
+        assert!(background.contains("bring_to_front=true"), "{background}");
+        assert_eq!(
+            describe("select_tab", &json!({ "tabId": 9, "activated": true, "windowFocused": true }), &tab),
+            "tab 9 is now the visible tab and its Chrome window is in front"
+        );
         assert_eq!(describe("close_tab", &json!({}), &tab), "closed tab 9");
         assert_eq!(
             describe("press", &json!({}), &json!({ "tab_id": 9, "key": "Enter" })),

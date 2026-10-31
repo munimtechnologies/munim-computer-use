@@ -614,6 +614,25 @@ if (argv.includes("--headed")) check("a click in a shown tab is real mouse input
   await ok("browser_close_tab", { tab_id: pressTab });
 });
 
+// #43: the reply must agree with browser_list_tabs about which tab is shown.
+check("browser_select_tab says whether the tab became visible, and bring_to_front shows it (#43)", async () => {
+  const shown = Number(/tab_id=(\d+)/.exec(await ok("browser_open_tab", { url: `${base}/press` }))[1]);
+  const isActive = async () =>
+    new RegExp(`^\\* tab_id=${shown}\\b`, "m").test(await ok("browser_list_tabs", { all: true }));
+  const first = await ok("browser_select_tab", { tab_id: shown });
+  if (first.startsWith(`tab ${shown} was NOT brought to front`)) {
+    assert.match(first, /bring_to_front=true/);
+    assert.equal(await isActive(), false, "the reply said not shown, the tab list says active");
+  } else {
+    assert.ok(first.startsWith(`tab ${shown} is now the visible tab`), first);
+    assert.equal(await isActive(), true, "the reply said shown, the tab list says inactive");
+  }
+  const forced = await ok("browser_select_tab", { tab_id: shown, bring_to_front: true });
+  assert.ok(forced.startsWith(`tab ${shown} is now the visible tab and its Chrome window is in front`), forced);
+  assert.equal(await isActive(), true, "bring_to_front left the tab inactive");
+  await ok("browser_close_tab", { tab_id: shown });
+});
+
 let failed = 0;
 for (const [name, body] of checks) {
   try {

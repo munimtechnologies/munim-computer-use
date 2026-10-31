@@ -132,6 +132,31 @@ func isModal(_ facts: AXFacts) -> Bool {
         || facts.subrole.map { dialogSubroles.contains($0) } == true
 }
 
+/// How a dialog is named in the dialog note (the Rust server's `dialog_label`).
+func dialogLabel(_ role: String, _ name: String?, in window: String? = nil) -> String {
+    let role = role.hasPrefix("AX") ? String(role.dropFirst(2)) : role
+    let name = (name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    var label: String
+    if name.isEmpty {
+        label = "an unnamed \(role)"
+    } else {
+        let short = String(name.prefix(80))
+        label = "\(role) \"\(short)\(short.count < name.count ? "…" : "")\""
+    }
+    if let window { label += " in \(window)" }
+    return label
+}
+
+/// The dialog note naming the dialogs that scoped the outline (#44), worded as
+/// the Rust server's `dialog_note`.
+func dialogNote(_ names: [String]) -> String {
+    if names.isEmpty {
+        return "note: a dialog is open — only its controls are listed; dismiss it (for example with Escape) to reach the window behind"
+    }
+    return "note: a dialog is open — only its controls are listed: \(names.joined(separator: ", ")); "
+        + "dismiss it (for example with Escape) to reach the window behind"
+}
+
 /// The windows a dialog leaves usable: an app-modal alert or a modal window
 /// blocks every other window of the app, so only it is read. A dialog-like
 /// window that is not modal (an inspector, an About box) only counts when it is
@@ -180,6 +205,10 @@ final class OutlineWalk {
     var skipped = 0
     /// Line ranges of dialogs, sheets and popovers found inside the window.
     var modalRanges: [Range<Int>] = []
+    /// What each of those dialogs is, keyed by its range's first line (#44).
+    var modalLabels: [Int: String] = [:]
+    /// The dialogs `narrowToDialogs` kept, named for the dialog note.
+    var dialogNames: [String] = []
     /// Enabled, labelled, actionable controls of the app itself. Zero means the
     /// app describes itself poorly, and its text is worth reading with OCR.
     var appControls = 0
@@ -219,6 +248,9 @@ final class OutlineWalk {
         let isInteractive = interactiveRoles.contains(role) || !actions.isEmpty
         let label = facts.label
         let modalStart = depth > 1 && isModal(facts) ? lines.count : nil
+        if let modalStart {
+            modalLabels[modalStart] = dialogLabel(facts.subrole ?? role, label)
+        }
 
         // Emit a node only if it carries information: something actionable, or text.
         // Pure layout containers are traversed but not printed, which keeps the
@@ -295,7 +327,10 @@ final class OutlineWalk {
         let ranges = modalRanges.filter { $0.lowerBound >= start && !$0.isEmpty }
         guard !ranges.isEmpty else { return false }
         var keep = IndexSet()
-        for range in ranges { keep.insert(integersIn: range) }
+        for range in ranges {
+            keep.insert(integersIn: range)
+            if let name = modalLabels[range.lowerBound] { dialogNames.append(name) }
+        }
         lines = Array(lines[..<start]) + keep.sorted().map { lines[$0] }
         return true
     }

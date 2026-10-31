@@ -1157,17 +1157,24 @@ impl Desktop for LinuxDesktop {
         // since nothing else takes input until it is dismissed.
         let dialogs = walk.blocking_dialogs();
         let scoped = !dialogs.is_empty();
+        // Which dialogs scoped the read, named in the note (#44).
+        let mut blockers = Vec::new();
         if scoped {
             self.registry.clear();
             walk = Walk::new(*options, false);
             for dialog in dialogs {
+                if let Ok(proxy) = self.proxy(&dialog) {
+                    let title = block_on(proxy.name()).unwrap_or_default();
+                    let role = block_on(proxy.get_role()).map(|role| format!("{role:?}")).unwrap_or_else(|_| "Dialog".into());
+                    blockers.push(outline::dialog_label(&role, &title, None));
+                }
                 self.walk(&mut walk, &dialog, 0, None, false);
             }
         }
 
         let mut lines = vec![name];
         if scoped {
-            lines.push(outline::DIALOG_NOTE.to_string());
+            lines.push(outline::dialog_note(&blockers));
         }
         if options.ocr == OcrMode::Always {
             lines.push("note: OCR is not available on Linux".to_string());

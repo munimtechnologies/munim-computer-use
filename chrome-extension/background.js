@@ -1923,15 +1923,26 @@ const handlers = {
     // one thing openTab's `active:false` exists to prevent. Everything the
     // agent needs (insertText, dispatchKeyEvent, Page.captureScreenshot) works
     // on a background tab, so focus only moves when the user is already
-    // looking at an agent tab; otherwise the switch is recorded silently and
-    // the user keeps typing where they were.
+    // looking at an agent tab; otherwise the tab stays in the background and
+    // the reply says so (#43). `bringToFront` is the explicit opt-in for the
+    // cases that need the tab truly shown (native keyboard input, screenshot):
+    // it activates the tab and raises its window.
     const target = await chrome.tabs.get(p.tabId);
     const [active] = await chrome.tabs.query({ active: true, windowId: target.windowId });
+    const alreadyActive = active?.id === p.tabId;
     const userIsOnAgentTab = active?.id !== undefined && tabOwner.get(active.id) === clientId;
-    if (userIsOnAgentTab) {
+    const force = p.bringToFront === true;
+    if (!alreadyActive && (force || userIsOnAgentTab)) {
       await chrome.tabs.update(p.tabId, { active: true });
     }
-    return { tabId: p.tabId, activated: userIsOnAgentTab };
+    if (force) await chrome.windows.update(target.windowId, { focused: true });
+    const [now] = await chrome.tabs.query({ active: true, windowId: target.windowId });
+    return {
+      tabId: p.tabId,
+      activated: now?.id === p.tabId,
+      windowFocused: force,
+      userTabActive: !(now?.id !== undefined && tabOwner.get(now.id) === clientId),
+    };
   },
   close_all_tabs: async (p) => closeAllTabs(requireClientId(p)),
   close_tab: async (p) => {

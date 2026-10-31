@@ -784,7 +784,7 @@ fn all_tool_defs() -> Value {
         },
         {
             "name": "browser_select_tab",
-            "description": "Make one of the agent's tabs the visible one in its window, for example before capturing it with screenshot. browser_snapshot, browser_click and browser_type work on background tabs, so most tasks never need this. The agent's group lives in the user's Chrome window, so this changes which tab that window shows; use it sparingly. The user's own tabs are never selected.",
+            "description": "Make one of the agent's tabs the visible one in its window, for example before native keyboard input or a screenshot. browser_snapshot, browser_click, browser_type and browser_press_key work on background tabs, so most tasks never need this. The agent's tabs live in the user's Chrome window, so by default the tab is only shown when the user is already looking at one of the agent's tabs; otherwise it stays in the background, the user keeps their tab, and the reply says it was not brought to front. Pass bring_to_front=true to show it and raise its window regardless; that takes the window from the user, so use it sparingly. The user's own tabs are never selected.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -797,6 +797,10 @@ fn all_tool_defs() -> Value {
                     "tab_id": {
                         "type": "integer",
                         "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs"
+                    },
+                    "bring_to_front": {
+                        "type": "boolean",
+                        "description": "Show the tab and raise its Chrome window even when the user is on one of their own tabs. Default false: the tab is only shown when the user is already on an agent tab."
                     },
                     "index": {
                         "type": "integer",

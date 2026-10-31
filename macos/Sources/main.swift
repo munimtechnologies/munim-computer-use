@@ -1191,6 +1191,7 @@ func toolGetAppState(_ args: [String: Any]) -> String {
     // Narrow to one window. "agent" is the Chrome window this server owns, which
     // keeps the tree (and any clicks derived from it) off the user's own tabs.
     var dialogOpen = false
+    var dialogNames: [String] = []
     if let scope = args["window"] {
         if let name = scope as? String, name == "agent" {
             guard let agent = Chrome.agentAXWindow() else {
@@ -1212,6 +1213,10 @@ func toolGetAppState(_ args: [String: Any]) -> String {
         if !blocking.isEmpty, blocking.count < all.count {
             windows = windows.filter { entry in blocking.contains { CFEqual($0, entry.element) } }
             dialogOpen = true
+            dialogNames = windows.map { entry in
+                dialogLabel(axString(entry.element, kAXSubroleAttribute as String) ?? "Window",
+                            axString(entry.element, kAXTitleAttribute as String), in: "window \(entry.offset)")
+            }
         }
     }
 
@@ -1254,7 +1259,10 @@ func toolGetAppState(_ args: [String: Any]) -> String {
         }
         stillBuilding = walk.appControls == 0
     }
-    if narrowed { dialogOpen = true }
+    if narrowed {
+        dialogOpen = true
+        dialogNames += walk.dialogNames
+    }
     // Watched from here on, so return_state can tell background notifications apart.
     _ = AXEventMonitor.shared.watch(app.processIdentifier)
     AXEventMonitor.shared.watchWebAreas(walk.webAreas, pid: app.processIdentifier)
@@ -1269,7 +1277,7 @@ func toolGetAppState(_ args: [String: Any]) -> String {
         header += "\nnote: this app builds its accessibility tree on request and is still doing so; call get_app_state again in a few seconds"
     }
     if dialogOpen {
-        header += "\nnote: a dialog is open — only its controls are listed; dismiss it (for example with Escape) to reach the window behind"
+        header += "\n" + dialogNote(dialogNames)
     }
 
     // Apps that describe themselves poorly (Spotify, games, canvases) get their
@@ -1335,6 +1343,9 @@ func filterAppState(_ lines: [String], query: String, limit: Int, incomplete: Bo
             + "that point were not searched; read a smaller part of it (a dialog, or one window) to search the rest"
     }
     if count == 0 {
+        // The section headers still say what was read (#44).
+        let sections = lines.filter { $0.hasPrefix("── ") }
+        if !sections.isEmpty { out += "\n\n" + sections.joined(separator: "\n") }
         if incomplete {
             return out + "\n\n(no match among the elements read; the search is incomplete, so this does not mean the control is absent)"
         }
@@ -3089,13 +3100,35 @@ func toolBrowserListTabs(_ args: [String: Any]) -> String {
     }
 }
 
+/// What browser_select_tab actually did (#43). The extension only shows an
+/// agent tab on its own when the user is already looking at one of the
+/// agent's tabs, so "switched" would often be false. Worded as the Windows and
+/// Linux server words it.
+func describeSelectTab(_ tabId: Int, _ payload: [String: Any]) -> String {
+    guard let activated = payload["activated"] as? Bool else {
+        return "asked Chrome to select tab \(tabId); this browser extension is too old to report whether it became "
+            + "visible — check browser_list_tabs, or update the extension"
+    }
+    if activated {
+        return payload["windowFocused"] as? Bool == true
+            ? "tab \(tabId) is now the visible tab and its Chrome window is in front"
+            : "tab \(tabId) is now the visible tab in its window"
+    }
+    return "tab \(tabId) was NOT brought to front: the user is on one of their own tabs in that window, "
+        + "so it stays in the background (browser_list_tabs still shows their tab as active). "
+        + "browser_snapshot, browser_click, browser_type and browser_press_key work on it as it is; "
+        + "pass bring_to_front=true to show it anyway, for example before native keyboard input or a screenshot"
+}
+
 func toolBrowserSelectTab(_ args: [String: Any]) -> String {
     if BrowserBridge.shared.isConnected {
         guard let tabId = args["tab_id"] as? Int ?? args["index"] as? Int else {
             return "error: missing required argument 'tab_id'"
         }
-        return bridgeText(browserSessionCall("select_tab", ["tabId": tabId], args: args)) { _ in
-            "switched the agent group to tab \(tabId)"
+        var params: [String: Any] = ["tabId": tabId]
+        if let force = args["bring_to_front"] as? Bool { params["bringToFront"] = force }
+        return bridgeText(browserSessionCall("select_tab", params, args: args)) { payload in
+            describeSelectTab(tabId, payload)
         }
     }
     guard let index = args["index"] as? Int else { return "error: missing required argument 'index'" }
@@ -4179,7 +4212,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "browser_select_tab",
-        "description": "Make one of the agent's tabs the visible one in its window, for example before capturing it with screenshot. browser_snapshot, browser_click and browser_type work on background tabs, so most tasks never need this. The agent's group lives in the user's Chrome window, so this changes which tab that window shows; use it sparingly. The user's own tabs are never selected.",
+        "description": "Make one of the agent's tabs the visible one in its window, for example before native keyboard input or a screenshot. browser_snapshot, browser_click, browser_type and browser_press_key work on background tabs, so most tasks never need this. The agent's tabs live in the user's Chrome window, so by default the tab is only shown when the user is already looking at one of the agent's tabs; otherwise it stays in the background, the user keeps their tab, and the reply says it was not brought to front. Pass bring_to_front=true to show it and raise its window regardless; that takes the window from the user, so use it sparingly. The user's own tabs are never selected.",
         "inputSchema": [
             "type": "object",
             "properties": [
@@ -4192,6 +4225,10 @@ let toolDefs: [[String: Any]] = [
                 "tab_id": [
                     "type": "integer",
                     "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs",
+                ],
+                "bring_to_front": [
+                    "type": "boolean",
+                    "description": "Show the tab and raise its Chrome window even when the user is on one of their own tabs. Default false: the tab is only shown when the user is already on an agent tab.",
                 ],
                 "index": [
                     "type": "integer",
