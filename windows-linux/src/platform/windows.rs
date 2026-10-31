@@ -944,6 +944,32 @@ impl WindowsDesktop {
             .collect()
     }
 
+    /// Whether a dialog found during the walk still blocks its window when
+    /// read again live: it still exists, is still a modal dialog, and is on
+    /// screen inside the window. UIA trees (Chrome's above all, right after a
+    /// tab switch) can hand back a dialog that is already gone or hidden; that
+    /// one must not scope the read to nothing (#44).
+    fn dialog_still_blocks(window: HWND, dialog: &UIElement) -> bool {
+        let live = Node::live(dialog.clone());
+        if !live.dialog || live.offscreen {
+            return false;
+        }
+        let Some(bounds) = live.bounds.filter(Bounds::has_area) else {
+            return false;
+        };
+        let mut rect = RECT::default();
+        if unsafe { GetWindowRect(window, &mut rect) }.is_err() {
+            return true;
+        }
+        let frame = Bounds::from_edges(
+            f64::from(rect.left),
+            f64::from(rect.top),
+            f64::from(rect.right),
+            f64::from(rect.bottom),
+        );
+        bounds.overlaps(&frame)
+    }
+
     /// Run OCR on one of `pid`'s windows (the largest when `window` is None).
     fn read_text(pid: u32, window: Option<HWND>) -> std::result::Result<Vec<OcrText>, String> {
         let wanted = window.map(|window| window.0 as usize as u32);
@@ -970,6 +996,19 @@ struct Node {
     in_tree: bool,
 }
 
+/// Whether an element inside a window blocks the rest of it. A modal window
+/// does. So does an element that calls itself a dialog, unless its
+/// WindowPattern says it is not modal: Chrome exposes every web
+/// `role="dialog"` that way, and a cookie banner or a toast that is a
+/// non-modal dialog blocks nothing, so it must not hide the page (#44).
+fn is_blocking_dialog(control_type: &str, window_pattern: bool, modal: bool, is_dialog: bool) -> bool {
+    if window_pattern {
+        modal && (control_type == "Window" || is_dialog)
+    } else {
+        is_dialog
+    }
+}
+
 fn variant_bool(value: uiautomation::Result<Variant>) -> bool {
     value.ok().and_then(|value| TryInto::<bool>::try_into(value).ok()).unwrap_or(false)
 }
@@ -991,10 +1030,12 @@ impl Node {
             .get_cached_control_type()
             .map(|kind| format!("{kind:?}"))
             .unwrap_or_else(|_| "Unknown".to_string());
-        let modal = variant_bool(element.get_cached_property_value(UIProperty::IsWindowPatternAvailable))
-            && variant_bool(element.get_cached_property_value(UIProperty::WindowIsModal));
-        let dialog = (control_type == "Window" && modal)
-            || variant_bool(element.get_cached_property_value(UIProperty::IsDialog));
+        let dialog = is_blocking_dialog(
+            &control_type,
+            variant_bool(element.get_cached_property_value(UIProperty::IsWindowPatternAvailable)),
+            variant_bool(element.get_cached_property_value(UIProperty::WindowIsModal)),
+            variant_bool(element.get_cached_property_value(UIProperty::IsDialog)),
+        );
         Self {
             name: element.get_cached_name().unwrap_or_default(),
             value: element
@@ -1022,9 +1063,12 @@ impl Node {
             .get_control_type()
             .map(|kind| format!("{kind:?}"))
             .unwrap_or_else(|_| "Unknown".to_string());
-        let modal = variant_bool(element.get_property_value(UIProperty::IsWindowPatternAvailable))
-            && variant_bool(element.get_property_value(UIProperty::WindowIsModal));
-        let dialog = (control_type == "Window" && modal) || element.is_dialog().unwrap_or(false);
+        let dialog = is_blocking_dialog(
+            &control_type,
+            variant_bool(element.get_property_value(UIProperty::IsWindowPatternAvailable)),
+            variant_bool(element.get_property_value(UIProperty::WindowIsModal)),
+            element.is_dialog().unwrap_or(false),
+        );
         Self {
             name: element.get_name().unwrap_or_default(),
             value: element
@@ -1051,6 +1095,24 @@ impl Node {
     /// they are never skipped as off screen and start a clip of their own.
     fn floats(&self) -> bool {
         self.dialog || matches!(self.control_type.as_str(), "Menu" | "ToolTip" | "Window")
+    }
+}
+
+#[cfg(test)]
+mod dialog_tests {
+    use super::is_blocking_dialog;
+
+    #[test]
+    fn a_dialog_that_says_it_is_not_modal_blocks_nothing() {
+        // Chrome: <dialog> opened with showModal(), or role=dialog aria-modal=true.
+        assert!(is_blocking_dialog("Window", true, true, true));
+        // Chrome: role=dialog without aria-modal (a cookie banner) — #44.
+        assert!(!is_blocking_dialog("Window", true, false, true));
+        // A modal window that does not set IsDialog still blocks.
+        assert!(is_blocking_dialog("Window", true, true, false));
+        // A provider without WindowPattern: IsDialog is all there is to go on.
+        assert!(is_blocking_dialog("Pane", false, false, true));
+        assert!(!is_blocking_dialog("Pane", false, false, false));
     }
 }
 
@@ -1604,9 +1666,18 @@ impl Desktop for WindowsDesktop {
         // whole outline, not each window.
         let mut walk = Walk::new(*options, !scoped);
         let mut sections: Vec<(String, usize)> = Vec::new();
+        // Which dialogs scoped the read, named in the note (#44).
+        let mut blockers: Vec<String> = Vec::new();
         for window in &windows {
             let Some(root) = self.window_node(window.hwnd) else { continue };
             let window = WindowInfo { title: root.name.clone(), ..window.clone() };
+            if scoped {
+                blockers.push(outline::dialog_label(
+                    "Window",
+                    &window.title,
+                    Some(&format!("window_id={}", window_id(window.hwnd))),
+                ));
+            }
             sections.push((
                 format!("── window {}: \"{}\"  window_id={}", window.index, window.title, window_id(window.hwnd)),
                 walk.rows.len(),
@@ -1615,47 +1686,73 @@ impl Desktop for WindowsDesktop {
         }
 
         // A dialog inside a window (a XAML ContentDialog, a modal web dialog)
-        // blocks it the same way. Start again, listing only the dialogs.
+        // blocks that window the same way. Start again, listing only the
+        // dialogs of each window that has one; the app's other windows (a
+        // second Chrome window, say) take input as before and stay whole (#44).
         let mut ocr_window = scoped.then(|| windows[0].hwnd);
         let mut ocr_clip: Option<Bounds> = None;
-        if !walk.dialogs.is_empty() {
-            let dialogs = std::mem::take(&mut walk.dialogs);
+        let dialogs: Vec<(WindowInfo, UIElement)> = std::mem::take(&mut walk.dialogs)
+            .into_iter()
+            .filter(|(window, dialog)| Self::dialog_still_blocks(window.hwnd, dialog))
+            .collect();
+        if !dialogs.is_empty() {
             self.registry.clear();
             walk = Walk::new(*options, false);
             sections.clear();
+            blockers.clear();
             scoped = true;
-            for (window, dialog) in dialogs {
-                let root = match &self.batch {
-                    Some(batch) => {
-                        dialog
-                            .build_updated_cache(&batch.tree)
-                            .map(Node::in_tree)
-                            .or_else(|_| dialog.build_updated_cache(&batch.request).map(Node::cached))
-                            .unwrap_or_else(|_| Node::live(dialog))
-                    }
-                    None => Node::live(dialog),
-                };
-                if ocr_window.is_none() {
-                    ocr_window = Some(window.hwnd);
-                    ocr_clip = root.bounds.filter(Bounds::has_area);
+            for window in &windows {
+                let in_window: Vec<&(WindowInfo, UIElement)> =
+                    dialogs.iter().filter(|(owner, _)| owner.hwnd == window.hwnd).collect();
+                if in_window.is_empty() {
+                    let Some(root) = self.window_node(window.hwnd) else { continue };
+                    let window = WindowInfo { title: root.name.clone(), ..window.clone() };
+                    sections.push((
+                        format!("── window {}: \"{}\"  window_id={}", window.index, window.title, window_id(window.hwnd)),
+                        walk.rows.len(),
+                    ));
+                    self.walk_root(&mut walk, &root, &window);
+                    continue;
                 }
-                sections.push((
-                    format!(
-                        "── window {}: \"{}\"  window_id={} — dialog \"{}\"",
-                        window.index,
-                        window.title,
-                        window_id(window.hwnd),
-                        truncate(&root.name, 120)
-                    ),
-                    walk.rows.len(),
-                ));
-                self.walk_root(&mut walk, &root, &window);
+                for (window, dialog) in in_window {
+                    let dialog = dialog.clone();
+                    let root = match &self.batch {
+                        Some(batch) => {
+                            dialog
+                                .build_updated_cache(&batch.tree)
+                                .map(Node::in_tree)
+                                .or_else(|_| dialog.build_updated_cache(&batch.request).map(Node::cached))
+                                .unwrap_or_else(|_| Node::live(dialog))
+                        }
+                        None => Node::live(dialog),
+                    };
+                    if ocr_window.is_none() {
+                        ocr_window = Some(window.hwnd);
+                        ocr_clip = root.bounds.filter(Bounds::has_area);
+                    }
+                    blockers.push(outline::dialog_label(
+                        &root.control_type,
+                        &root.name,
+                        Some(&format!("window {} (window_id={})", window.index, window_id(window.hwnd))),
+                    ));
+                    sections.push((
+                        format!(
+                            "── window {}: \"{}\"  window_id={} — dialog \"{}\"",
+                            window.index,
+                            window.title,
+                            window_id(window.hwnd),
+                            truncate(&root.name, 120)
+                        ),
+                        walk.rows.len(),
+                    ));
+                    self.walk_root(&mut walk, &root, window);
+                }
             }
         }
 
         let mut notes = Vec::new();
         if scoped {
-            notes.push(outline::DIALOG_NOTE.to_string());
+            notes.push(outline::dialog_note(&blockers));
         }
         let mut ocr_rows = Vec::new();
         let run_ocr = match options.ocr {

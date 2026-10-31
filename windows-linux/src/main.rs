@@ -722,6 +722,13 @@ fn filter_app_state(outline: &str, query: &str, limit: usize) -> String {
         ));
     }
     if count == 0 {
+        // The section headers still say what was read: which window, and
+        // which dialog scoped the read (#44).
+        let sections: Vec<&str> = body.iter().copied().filter(|line| line.starts_with("── ")).collect();
+        if !sections.is_empty() {
+            out.push_str("\n\n");
+            out.push_str(&sections.join("\n"));
+        }
         out.push_str(if incomplete {
             "\n\n(no match among the elements read; the search is incomplete, so this does not mean the control is absent)"
         } else if skipped_offscreen {
@@ -1048,6 +1055,17 @@ mod tests {
         assert!(filtered.contains("[e2] Text \"Get Lucky\""), "{filtered}");
         assert!(filtered.contains("1 matching element"), "{filtered}");
         assert!(!filtered.contains("[e1]") && !filtered.contains("[e3]"), "{filtered}");
+    }
+
+    // #44: a query that matches nothing must not hide which dialog scoped the read.
+    #[test]
+    fn app_state_filter_without_a_match_still_names_the_dialog() {
+        let outline = "Chrome (pid 1), 1 window(s)\nnote: a dialog is open — only its controls are listed: Window \"Confirm\" in window 0; dismiss it (for example with Escape) to reach the window behind\n\n── window 0: \"Doc - Google Chrome\"  window_id=7 — dialog \"Confirm\"\n  [e1] Button \"Keep\"";
+        let filtered = super::filter_app_state(outline, "USC disposable", 800);
+        assert!(filtered.contains("0 matching elements"), "{filtered}");
+        assert!(filtered.contains("Window \"Confirm\" in window 0"), "{filtered}");
+        assert!(filtered.contains("── window 0: \"Doc - Google Chrome\"  window_id=7 — dialog \"Confirm\""), "{filtered}");
+        assert!(filtered.ends_with("(no elements match; drop the query or scroll the content into view)"), "{filtered}");
     }
 
     // #33: window_id routes to activate_window, which only Windows implements.

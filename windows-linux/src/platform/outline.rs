@@ -129,6 +129,35 @@ pub fn offscreen_line(skipped: usize) -> String {
 /// Header line when a modal dialog scoped the outline to its own controls.
 pub const DIALOG_NOTE: &str = "note: a dialog is open — only its controls are listed; dismiss it (for example with Escape) to reach the window behind";
 
+/// The dialog note naming the dialogs that scoped the outline (#44), so a
+/// model can tell which dialog blocks the app before it dismisses anything,
+/// and so the claim survives a `query` that matches none of its controls.
+pub fn dialog_note(dialogs: &[String]) -> String {
+    if dialogs.is_empty() {
+        return DIALOG_NOTE.to_string();
+    }
+    format!(
+        "note: a dialog is open — only its controls are listed: {}; dismiss it (for example with Escape) to reach the window behind",
+        dialogs.join(", ")
+    )
+}
+
+/// How a dialog is named in the dialog note: its role and name, and the window
+/// it blocks.
+pub fn dialog_label(role: &str, name: &str, window: Option<&str>) -> String {
+    let name = name.trim();
+    let mut label = if name.is_empty() {
+        format!("an unnamed {role}")
+    } else {
+        let short: String = name.chars().take(80).collect();
+        format!("{role} \"{short}{}\"", if short.len() < name.len() { "…" } else { "" })
+    };
+    if let Some(window) = window {
+        label.push_str(&format!(" in {window}"));
+    }
+    label
+}
+
 /// What an id pointed at when `get_app_state` handed it out. Only the name is
 /// kept, not the value, so typing into a field does not invalidate its id.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -459,6 +488,15 @@ mod tests {
             "… 42 off-screen elements skipped; scroll, or pass offscreen=true to list them"
         );
         assert!(DIALOG_NOTE.starts_with("note: a dialog is open — only its controls are listed"));
+        assert_eq!(dialog_note(&[]), DIALOG_NOTE);
+        let label = dialog_label("Window", "Confirm discard", Some("window 0 (window_id=12)"));
+        assert_eq!(label, "Window \"Confirm discard\" in window 0 (window_id=12)");
+        assert_eq!(
+            dialog_note(&[label]),
+            "note: a dialog is open — only its controls are listed: Window \"Confirm discard\" in window 0 (window_id=12); \
+             dismiss it (for example with Escape) to reach the window behind"
+        );
+        assert_eq!(dialog_label("Dialog", "  ", None), "an unnamed Dialog");
     }
 
     #[test]
