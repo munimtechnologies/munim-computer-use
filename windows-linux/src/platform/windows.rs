@@ -46,6 +46,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::agent_cursor::AgentCursor;
 use super::outline::{self, Bounds, Fingerprint, Listed, OcrMode, OcrText, truncate};
+use super::typed;
 use super::{Desktop, DesktopError, Point, Result, ScrollDirection, StateOptions, format_app_list};
 use crate::apps;
 use crate::identity;
@@ -330,6 +331,12 @@ impl WindowsDesktop {
         None
     }
 
+    /// The control keystrokes will reach: the focused element, once the
+    /// target is in front.
+    fn typing_field(&self) -> Option<UIElement> {
+        self.automation.get_focused_element().ok()
+    }
+
     /// A password field the agent must not write into (UIA `IsPassword`),
     /// unless the user opted in.
     fn refuses_secure_input(element: &UIElement) -> bool {
@@ -503,8 +510,11 @@ impl WindowsDesktop {
     /// deliver the tail of the burst to the user's window.
     /// The user's keys held meanwhile are replayed after, into their window.
     fn give_foreground_back(&self, lent: Lent, keys: usize) {
-        let settle = (40 + keys as u64 / 4).min(1500);
-        std::thread::sleep(std::time::Duration::from_millis(settle));
+        // type_text passes 0: it has already waited for its keys to land.
+        if keys > 0 {
+            let settle = (40 + keys as u64 / 4).min(1500);
+            std::thread::sleep(std::time::Duration::from_millis(settle));
+        }
         if !lent.previous.0.is_null() && unsafe { IsWindow(Some(lent.previous)) }.as_bool() {
             if self.activate(lent.previous) {
                 // Keys that reach a window before it has handled its
@@ -1433,6 +1443,66 @@ fn text_inputs(text: &str) -> Vec<INPUT> {
     inputs
 }
 
+/// What a field holds, through UI Automation, for checking typed text. Never
+/// a password field: its value is not read at all, let alone compared.
+fn read_field(field: &UIElement) -> Option<String> {
+    if field.is_password().unwrap_or(true) {
+        return None;
+    }
+    if let Ok(value) = field.get_pattern::<UIValuePattern>().and_then(|pattern| pattern.get_value()) {
+        return Some(value);
+    }
+    field
+        .get_pattern::<UITextPattern>()
+        .and_then(|pattern| pattern.get_document_range())
+        .and_then(|range| range.get_text(-1))
+        .ok()
+}
+
+/// The fixed pause the foreground used to be held for after a burst, now the
+/// least time to watch a field that does not yet hold the text.
+fn typing_settle(text: &str) -> std::time::Duration {
+    std::time::Duration::from_millis((40 + text.chars().count() as u64 / 4).min(1500))
+}
+
+/// Watch `field` until it holds `text` or a budget scaled to the text runs
+/// out. There is no "stopped changing" shortcut: a browser fills in its
+/// accessibility tree only once the page's main thread is free, so while a
+/// slow page works through the burst the value can sit still for a second or
+/// more and then jump to the whole text. Anything short of verified waits at
+/// least `settle`, the fixed pause typing always had.
+fn await_typed(field: Option<&UIElement>, text: &str, before: Option<&str>, settle: std::time::Duration) -> typed::TypedCheck {
+    use std::time::{Duration, Instant};
+    let start = Instant::now();
+    let unverified = |check| {
+        if let Some(rest) = settle.checked_sub(start.elapsed()) {
+            std::thread::sleep(rest);
+        }
+        check
+    };
+    let mut last = field.and_then(read_field);
+    let (Some(field), Some(_)) = (field, &last) else {
+        return unverified(typed::check_typed(text, before, None));
+    };
+    let budget = Duration::from_millis((1500 + text.chars().count() as u64 * 10).min(6000));
+    loop {
+        let check = typed::check_typed(text, before, last.as_deref());
+        match check {
+            typed::TypedCheck::Verified => return check,
+            // Nothing waiting can change (a Tab in the text, say).
+            typed::TypedCheck::Unverified(_) => return unverified(check),
+            typed::TypedCheck::Incomplete { .. } if start.elapsed() >= budget => return check,
+            typed::TypedCheck::Incomplete { .. } => {}
+        }
+        std::thread::sleep(Duration::from_millis(40));
+        // A read that fails now and then (a browser rebuilding its tree) is
+        // not a change; keep the last value seen.
+        if let Some(now) = read_field(field) {
+            last = Some(now);
+        }
+    }
+}
+
 /// Send keystrokes in as few `SendInput` calls as possible. Each call is
 /// atomic: the user's own keys cannot land in the middle of it.
 fn send_inputs(inputs: &[INPUT]) -> Result<()> {
@@ -1954,6 +2024,7 @@ impl Desktop for WindowsDesktop {
         // Remote control types into whatever the viewer has focused: they
         // just clicked there, and nobody else is at this keyboard.
         if identity::remote_control() {
+            let mut named = None;
             if let Some(id) = element
                 && let Target::Element { element: target, .. } = self.resolve(id)?
             {
@@ -1962,9 +2033,13 @@ impl Desktop for WindowsDesktop {
                     return Ok(super::secure_field_handback(id));
                 }
                 let _ = target.set_focus();
+                named = Some(target);
             }
+            let field = named.or_else(|| self.typing_field());
+            let before = field.as_ref().and_then(read_field);
             send_inputs(&text_inputs(text))?;
-            return Ok(format!("typed {} characters", text.chars().count()));
+            let check = await_typed(field.as_ref(), text, before.as_deref(), typing_settle(text));
+            return Ok(typed::describe_typed(text.chars().count(), "", &check));
         }
 
         // Keystrokes only reach the foreground window, and that is usually the
@@ -1974,6 +2049,10 @@ impl Desktop for WindowsDesktop {
         super::user_keys::wait_for_pause();
         let previous = unsafe { GetForegroundWindow() };
         let mut window = self.input_window.map(|raw| HWND(raw as *mut _));
+        // The element the agent named is the field to check, not whatever
+        // ends up focused: keys that land in another window must not read as
+        // having reached it.
+        let mut named = None;
         if let Some(id) = element {
             match self.resolve(id)? {
                 // OCR text has no focus to take: click it, as a person would.
@@ -1998,17 +2077,39 @@ impl Desktop for WindowsDesktop {
                         .map_err(|error| DesktopError::new(format!("could not focus e{id}: {error}")))?;
                     self.input_window = Some(owner.0 as isize);
                     window = Some(owner);
+                    named = Some(target);
                 }
             }
         }
         let lent = self.borrow_foreground(window, previous)?;
         let receiving = unsafe { GetForegroundWindow() };
-        let sent = send_inputs(&text_inputs(text));
+        // Where the keys will land, read before and after: the system taking
+        // the keystrokes is not the app having handled them (#47).
+        let field = named.or_else(|| self.typing_field());
+        let before = field.as_ref().and_then(read_field);
+        let inputs = text_inputs(text);
+        let mark = super::user_keys::agent_keys_mark();
+        let sent = send_inputs(&inputs);
+        // Keep the target in front until every key has been routed (the tail
+        // of a burst still being routed would go to the user's window), then
+        // until its field holds the text: an app that loses the foreground
+        // can drop keys it has not handled yet.
+        let check = match &sent {
+            Ok(()) => {
+                if let Some(mark) = mark {
+                    let limit = std::time::Duration::from_millis((500 + inputs.len() as u64 * 2).min(5000));
+                    super::user_keys::wait_routed(mark, inputs.len() as u64, limit);
+                }
+                await_typed(field.as_ref(), text, before.as_deref(), typing_settle(text))
+            }
+            Err(_) => typed::TypedCheck::Unverified("not sent"),
+        };
         if let Some(lent) = lent {
-            self.give_foreground_back(lent, text.chars().count());
+            // await_typed already waited out the settle, or saw the text arrive.
+            self.give_foreground_back(lent, 0);
         }
         sent?;
-        Ok(format!("typed {} characters into {}", text.chars().count(), describe_window(receiving)))
+        Ok(typed::describe_typed(text.chars().count(), &describe_window(receiving), &check))
     }
 
     fn press_key(&mut self, key: &str, modifiers: &[String]) -> Result<String> {
