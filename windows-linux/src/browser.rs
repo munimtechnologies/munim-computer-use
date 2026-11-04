@@ -1103,11 +1103,16 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
                 .filter(|url| !url.is_empty() && *url != "about:blank")
                 .or_else(|| args.get("url").and_then(Value::as_str))
                 .unwrap_or("about:blank");
-            if title.is_empty() {
+            let mut line = if title.is_empty() {
                 format!("opened {url} in the agent tab group (tab_id={tab})")
             } else {
                 format!("opened tab_id={tab} — {title}  [{url}]")
+            };
+            // The tab opened but is not in the group (#59): say both.
+            if let Some(note) = result.get("note").and_then(Value::as_str) {
+                line = format!("opened {url} as tab_id={tab} — {note}");
             }
+            line
         }
         "list_tabs" => describe_tabs(result),
         "use_tab" => {

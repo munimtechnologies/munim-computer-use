@@ -319,16 +319,62 @@ async function ensureGroup(clientId, tabId) {
     return state.groupId;
 }
 
+/// The normal browser window an agent tab belongs in: the task's group's, or
+/// the one the user was last in. Only normal windows hold tab groups; a
+/// popup, or an installed web app's window, refuses them (#59).
+async function normalWindowFor(clientId) {
+  const groupId = clientState(clientId).groupId;
+  if (groupId !== null) {
+    try {
+      const group = await chrome.tabGroups.get(groupId);
+      const win = await chrome.windows.get(group.windowId);
+      if (win.type === "normal") return win.id;
+    } catch {
+      // The group is gone; ensureGroup makes a new one.
+    }
+  }
+  try {
+    return (await chrome.windows.getLastFocused({ windowTypes: ["normal"] }))?.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
 async function openTab(clientId, url) {
+  const windowId = await normalWindowFor(clientId);
   // active:false is the whole point — the user stays on whatever they were doing.
-  const tab = await chrome.tabs.create({ url: url || "about:blank", active: false });
+  const created = await chrome.tabs.create({
+    url: url || "about:blank",
+    active: false,
+    ...(windowId !== null ? { windowId } : {}),
+  });
+  // The tab exists from here on: own it before anything else can fail, so a
+  // failure below still leaves it the task's, closed with the task's cleanup.
   const state = clientState(clientId);
-  state.tabs.add(tab.id);
-  tabOwner.set(tab.id, clientId);
-  await ensureGroup(clientId, tab.id);
+  state.tabs.add(created.id);
+  tabOwner.set(created.id, clientId);
   await persistOwnedState();
-  keepBadged(tab.id);
-  return { tabId: tab.id, url: tab.url, title: tab.title, clientId };
+  keepBadged(created.id);
+  let tab = created;
+  let note = null;
+  try {
+    // An installed web app can capture the URL into its own window (an
+    // installed LinkedIn app, say). Bring the tab back to a normal window.
+    tab = await chrome.tabs.get(created.id);
+    const win = await chrome.windows.get(tab.windowId);
+    if (win.type !== "normal" && windowId !== null) {
+      await chrome.tabs.move(tab.id, { windowId, index: -1 });
+      tab = await chrome.tabs.get(tab.id);
+    }
+    await ensureGroup(clientId, tab.id);
+  } catch (error) {
+    // Opening worked; only the group did not. Say so instead of failing a
+    // call whose tab is already open (#59).
+    note =
+      `the tab is open, but Chrome would not add it to the agent's tab group ` +
+      `(${error?.message || error}). It is still this task's tab and is closed with it`;
+  }
+  return { tabId: tab.id, url: tab.url, title: tab.title, clientId, ...(note ? { grouped: false, note } : {}) };
 }
 
 /// Pages replace their favicon on load (Spotify, YouTube, …). Re-apply the
