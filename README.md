@@ -554,3 +554,18 @@ The server is developed here. [MT Code](https://github.com/munimtechnologies/mtc
 Designed and built by [Munim Technologies](https://munimtech.com) (Munim, Inc.) for MT Code. On-screen pruning, dialog scoping, notification-based settling, OCR fallback, menu shortcuts and window parking follow [arc-cua](https://github.com/shhivv/arc-cua) (MIT). Copyright 2026 Munim, Inc. Licensed under the Apache License 2.0; see `LICENSE`.
 
 Comparison sources: [Codex Computer Use](https://openai.com/index/codex-for-almost-everything/), [its docs](https://developers.openai.com/codex/app/computer-use), [its Windows notes](https://learn.chatgpt.com/docs/computer-use) and [MacStories on how it reads apps](https://www.macstories.net/notes/openais-new-codex-app-has-the-best-computer-use-feature-ive-ever-tested/) · [Cua Driver](https://github.com/trycua/cua) and [its tool reference](https://cua.ai/docs/cua-driver/reference/mcp-tools) · [OpenAI Agents API computer use](https://developers.openai.com/api/docs/guides/agents-api/tools/computer-use) · [Anthropic computer-use demo](https://github.com/anthropics/anthropic-quickstarts/tree/main/computer-use-demo) · [CursorTouch/Windows-MCP](https://github.com/CursorTouch/Windows-MCP) · [CursorTouch/MacOS-MCP](https://github.com/CursorTouch/MacOS-MCP) · [QwenLM/open-computer-use](https://github.com/QwenLM/open-computer-use) · [zavora-ai/computer-use-mcp](https://github.com/zavora-ai/computer-use-mcp) · [mediar-ai/mcp-server-macos-use](https://github.com/mediar-ai/mcp-server-macos-use) · [deploymenttheory/windows-mcp-server](https://github.com/deploymenttheory/windows-mcp-server) · [nuphus-mcp](https://github.com/mrpulor-gh/nuphus-mcp) · [computer-control-mcp](https://github.com/AB498/computer-control-mcp) · [microsoft/playwright-mcp](https://github.com/microsoft/playwright-mcp)
+
+### Tab load and resource pressure
+
+Each task may explicitly open at most five agent-created tabs at once. A sixth
+`browser_open_tab` is rejected before creating a tab; no existing tab or draft is
+automatically closed. Close only completed tabs whose results have been verified
+and whose drafts are no longer needed. Use fewer than five if Chrome struggles.
+Adopted user tabs are excluded from this group budget. Page-created popups are
+not prevented by this guard, and concurrent tasks share the machine's resources.
+
+A successful tab-selection response confirms Chrome's active-tab metadata, not
+that the page has rendered. Debugger errors include available tab lifecycle
+metadata without automatically activating or reloading the tab. Neither this
+metadata nor a timeout proves memory pressure or whether a business action
+succeeded. Re-observe before repeating an uncertain action.

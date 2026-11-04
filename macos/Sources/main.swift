@@ -3111,8 +3111,8 @@ func describeSelectTab(_ tabId: Int, _ payload: [String: Any]) -> String {
     }
     if activated {
         return payload["windowFocused"] as? Bool == true
-            ? "tab \(tabId) is now the visible tab and its Chrome window is in front"
-            : "tab \(tabId) is now the visible tab in its window"
+            ? "tab \(tabId) is reported active by Chrome and its window was brought to front; page rendering is not verified"
+            : "tab \(tabId) is reported active by Chrome; page rendering is not verified"
     }
     return "tab \(tabId) was NOT brought to front: the user is on one of their own tabs in that window, "
         + "so it stays in the background (browser_list_tabs still shows their tab as active). "

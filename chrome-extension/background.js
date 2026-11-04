@@ -313,9 +313,21 @@ async function ensureGroup(clientId, tabId) {
     return state.groupId;
 }
 
+// Bound explicit opens in each task's group. Never close a draft to make room.
+const MAX_OPEN_AGENT_TABS = 5;
 async function openTab(clientId, url) {
-  // active:false is the whole point — the user stays on whatever they were doing.
-  const tab = await chrome.tabs.create({ url: url || "about:blank", active: false });
+  const existing = await listTabs(clientId);
+  const grouped = existing.tabs.filter((tab) => !tab.adopted);
+  if (grouped.length >= MAX_OPEN_AGENT_TABS) {
+    throw new Error(
+      `task tab limit reached (${grouped.length}/${MAX_OPEN_AGENT_TABS}); no tab was opened. Use list_tabs and close only finished tabs with no unsaved drafts before opening another. Use fewer tabs if Chrome is under memory pressure.`,
+    );
+  }
+  // active:false is the whole point ï¿½ the user stays on whatever they were doing.
+  const tab = await chrome.tabs.create({
+    url: url || "about:blank",
+    active: false,
+  });
   const state = clientState(clientId);
   state.tabs.add(tab.id);
   tabOwner.set(tab.id, clientId);
@@ -625,10 +637,24 @@ async function send(tabId, method, params = {}) {
   // leaving an injected script (or a site's event handler) running forever.
   const bounded =
     method === "Runtime.evaluate" ? { timeout: 4000, ...params } : params;
-  return debuggerDeadline(
-    chrome.debugger.sendCommand({ tabId }, method, bounded),
-    method,
-  );
+  try {
+    return await debuggerDeadline(
+      chrome.debugger.sendCommand({ tabId }, method, bounded),
+      method,
+    );
+  } catch (error) {
+    // Browser-process lifecycle metadata can remain available when a renderer
+    // cannot answer. Observe only: never activate, reload, or discard a draft.
+    const tab = await debuggerDeadline(
+      chrome.tabs.get(tabId),
+      "tab metadata",
+    ).catch(() => null);
+    const flag = (key) =>
+      typeof tab?.[key] === "boolean" ? String(tab[key]) : "unknown";
+    throw new Error(
+      `${error.message}; tab ${tabId}: status=${tab?.status || "unknown"}, frozen=${flag("frozen")}, discarded=${flag("discarded")}. Lifecycle metadata does not establish the cause; preserve drafts and reduce tab load if Chrome is resource constrained.`,
+    );
+  }
 }
 
 /** Shared by snapshots and explicit readiness checks, serialized into the page. */

@@ -679,7 +679,7 @@ test("a readiness transport failure preserves the successful action and current 
   const result = await callAndWait("click", { tabId: pageTab, index: 3, returnState: true, waitForSelector: "#ready", waitTimeoutMs: 300 });
   assert.equal(result.ok, true);
   assert.equal(result.readiness.status, "error");
-  assert.equal(result.readiness.error, "readiness transport unavailable");
+  assert.match(result.readiness.error, /^readiness transport unavailable; tab \d+: status=unknown, frozen=unknown, discarded=unknown/);
   assert.equal(result.snapshot.title, "Current");
   assert.equal(clicks, 1);
   pageEval = () => ({ result: { value: {} } });
@@ -1194,6 +1194,75 @@ test("a stalled click rejects, releases its task queue and never resumes late ac
     extensionContext.clearTimeout = originalClear;
     pageEval = () => ({ result: { value: {} } });
     await call("close_all_tabs", { sessionId: "timeout-note" });
+  }
+});
+
+test("explicit opens stop at five without closing drafts; freeing one slot permits another", async () => {
+  const sessionId = "bounded-tabs";
+  const opened = [];
+  for (let n = 0; n < 5; n++)
+    opened.push(
+      await call("open_tab", { url: "https://shop.example/draft", sessionId }),
+    );
+  const before = tabs.size;
+  const removedBefore = removed.length;
+  const error = await refuses("open_tab", {
+    url: "https://shop.example/sixth",
+    sessionId,
+  });
+  assert.match(error, /task tab limit reached \(5\/5\)/);
+  assert.equal(
+    tabs.size,
+    before,
+    "rejected open must not create a hidden extra tab",
+  );
+  assert.equal(
+    removed.length,
+    removedBefore,
+    "rejection must not close a draft",
+  );
+  assert.equal((await call("list_tabs", { sessionId })).tabs.length, 5);
+  await call("close_tab", { tabId: opened[0].tabId, sessionId });
+  await call("open_tab", {
+    url: "https://shop.example/replacement",
+    sessionId,
+  });
+  assert.equal((await call("list_tabs", { sessionId })).tabs.length, 5);
+  const other = await call("open_tab", {
+    url: "https://shop.example/other-task",
+    sessionId: "bounded-other",
+  });
+  assert.ok(other.tabId, "one full task must not block another task");
+  await call("close_all_tabs", { sessionId });
+  await call("close_all_tabs", { sessionId: "bounded-other" });
+});
+
+test("renderer failure reports lifecycle metadata without activating or destroying a tab", async () => {
+  const sessionId = "lifecycle-read";
+  const owned = await call("open_tab", {
+    url: "https://shop.example/draft",
+    sessionId,
+  });
+  const tab = tabs.get(owned.tabId);
+  Object.assign(tab, { status: "complete", frozen: true, discarded: false });
+  const activeBefore = [...tabs.values()].map((t) => [t.id, t.active]);
+  const removedBefore = removed.length;
+  pageEval = () => {
+    throw new Error("renderer unavailable");
+  };
+  try {
+    const error = await refuses("snapshot", { tabId: owned.tabId, sessionId });
+    assert.match(error, /status=complete, frozen=true, discarded=false/);
+    assert.match(error, /does not establish the cause/);
+    assert.deepEqual(
+      [...tabs.values()].map((t) => [t.id, t.active]),
+      activeBefore,
+    );
+    assert.equal(removed.length, removedBefore);
+    assert.ok(tabs.has(owned.tabId));
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId });
   }
 });
 
