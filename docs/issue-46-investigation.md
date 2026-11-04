@@ -76,3 +76,14 @@ Validation: the new real-Chromium shadow-modal regression fails on the unchanged
 source (`page` versus expected `modal`) and passes with the fix. The complete
 Chromium suite, 61 extension tests, native action-contract test, tool parity,
 release build and 155 native unit tests passed during this investigation.
+
+## Upstream reconciliation
+
+Upstream subsequently merged its shadow-root fix in `5ffb8d7` (PR #48) and
+Windows typing/readback fix in `4778cac` (PR #49). PR #51 now builds on those
+commits rather than retaining a competing shadow-root implementation. Its page
+scripts use upstream's shared `pageDomInPage` helper, preserving slots, shadow
+text reading and skipped-frame reporting. The remaining additions are offset
+blocking-backdrop scoping, debugger liveness/recovery, tab-load prevention and
+honest rendering-status diagnostics. Historical capture details above describe
+the implementation at the time of that capture, not a second current helper.

@@ -3022,6 +3022,7 @@ func describeReadiness(_ payload: [String: Any]) -> String {
     var line = "readiness: \(status) (\(condition), \(elapsed) ms)"
     if let selector = readiness["selector"] as? String { line += " selector=\(selector)" }
     if let error = readiness["error"] as? String { line += " — \(error)" }
+    if let frames = readiness["frames"] as? Int, frames > 0 { line += " — not searched: \(framesPhrase(frames))" }
     return line + "; only the stated condition was checked, not general app readiness. Re-observe with browser_snapshot before repeating a non-idempotent action.\n"
 }
 
@@ -3195,6 +3196,14 @@ func bridgeText(_ result: BridgeOutcome, _ describe: ([String: Any]) -> String) 
     }
 }
 
+/// Snapshots and selector waits see the page and its open shadow roots, not
+/// the documents inside frames; say how many visible frames were left out.
+func framesPhrase(_ frames: Int) -> String { frames == 1 ? "1 embedded frame" : "\(frames) embedded frames" }
+
+func framesNote(_ frames: Int) -> String {
+    "note: \(framesPhrase(frames)) on the page \(frames == 1 ? "was" : "were") not searched — controls inside a frame are not listed here; take a screenshot to see them"
+}
+
 func describeSnapshot(_ payload: [String: Any]) -> String {
     let elements = payload["elements"] as? [[String: Any]] ?? []
     var lines = ["\(payload["title"] as? String ?? "?")  [\(payload["url"] as? String ?? "")]"]
@@ -3206,6 +3215,7 @@ func describeSnapshot(_ payload: [String: Any]) -> String {
         if payload["truncated"] as? Bool == true, let next = payload["nextOffset"] as? Int {
             lines.append("truncated — continue with browser_snapshot offset=\(next), limit=\(limit) (same tab_id/session_id; unchanged UI keeps indices)")
         }
+        if let frames = payload["frames"] as? Int, frames > 0 { lines.append(framesNote(frames)) }
     }
     for element in elements {
         let index = element["i"] as? Int ?? -1
@@ -4306,7 +4316,7 @@ let toolDefs: [[String: Any]] = [
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 2000,
-                    "description": "Wait for any visible element matching this CSS selector in the top-level document and its open shadow roots (not child frames or closed shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI.",
+                    "description": "Wait for any visible element matching this CSS selector in the page, including open shadow roots (web components); child frames are not searched, and a timeout says how many were visible. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI.",
                 ],
                 "wait_timeout_ms": [
                     "type": "integer",
@@ -4404,7 +4414,7 @@ let toolDefs: [[String: Any]] = [
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 2000,
-                    "description": "Wait for any visible element matching this CSS selector in the top-level document and its open shadow roots (not child frames or closed shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI.",
+                    "description": "Wait for any visible element matching this CSS selector in the page, including open shadow roots (web components); child frames are not searched, and a timeout says how many were visible. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI.",
                 ],
                 "wait_timeout_ms": [
                     "type": "integer",
@@ -4451,7 +4461,7 @@ let toolDefs: [[String: Any]] = [
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 2000,
-                    "description": "Wait for any visible element matching this CSS selector in the top-level document and its open shadow roots (not child frames or closed shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI.",
+                    "description": "Wait for any visible element matching this CSS selector in the page, including open shadow roots (web components); child frames are not searched, and a timeout says how many were visible. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI.",
                 ],
                 "wait_timeout_ms": [
                     "type": "integer",
@@ -4553,7 +4563,7 @@ let toolDefs: [[String: Any]] = [
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 2000,
-                    "description": "Wait for any visible element matching this CSS selector in the top-level document and its open shadow roots (not child frames or closed shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI.",
+                    "description": "Wait for any visible element matching this CSS selector in the page, including open shadow roots (web components); child frames are not searched, and a timeout says how many were visible. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI.",
                 ],
                 "wait_timeout_ms": [
                     "type": "integer",
@@ -4622,7 +4632,7 @@ let toolDefs: [[String: Any]] = [
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 2000,
-                    "description": "Wait for any visible element matching this CSS selector in the top-level document and its open shadow roots (not child frames or closed shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI.",
+                    "description": "Wait for any visible element matching this CSS selector in the page, including open shadow roots (web components); child frames are not searched, and a timeout says how many were visible. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI.",
                 ],
                 "wait_timeout_ms": [
                     "type": "integer",

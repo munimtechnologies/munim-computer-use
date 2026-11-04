@@ -323,7 +323,7 @@ async function openTab(clientId, url) {
       `task tab limit reached (${grouped.length}/${MAX_OPEN_AGENT_TABS}); no tab was opened. Use list_tabs and close only finished tabs with no unsaved drafts before opening another. Use fewer tabs if Chrome is under memory pressure.`,
     );
   }
-  // active:false is the whole point ï¿½ the user stays on whatever they were doing.
+  // active:false keeps the user on whatever they were doing.
   const tab = await chrome.tabs.create({
     url: url || "about:blank",
     active: false,
@@ -665,7 +665,9 @@ function isElementVisibleInPage(el) {
   // Do not extend this exception to containers: a faded-out dialog is not ready.
   const transparentControl = el.matches('input,button,select,textarea');
   let escapedInert = false;
-  for (let node = el; node; node = node.parentElement || node.getRootNode()?.host) {
+  // Walk the flat tree (slot, then shadow host), so a hidden host or a hidden
+  // slot hides the shadow content and slotted children it renders.
+  for (let node = el; node; node = node.assignedSlot || node.parentElement || node.parentNode?.host || null) {
     if (node.hidden || node.getAttribute("aria-hidden")?.toLowerCase() === "true") return false;
     if (node.inert && !escapedInert) return false;
     // Native showModal() escapes ancestor inertness, not its own inert subtrees.
@@ -678,53 +680,83 @@ function isElementVisibleInPage(el) {
   return style.visibility !== "hidden" && style.visibility !== "collapse";
 }
 
-/** Query the document and its open shadow roots, preserving root-local CSS. */
-function queryOpenRoots(selector, root = document) {
-  const matches = [...root.querySelectorAll(selector)];
-  if (root.shadowRoot)
-    matches.push(...queryOpenRoots(selector, root.shadowRoot));
-  for (const host of root.querySelectorAll("*")) {
-    if (host.shadowRoot)
-      matches.push(...queryOpenRoots(selector, host.shadowRoot));
-  }
-  return matches;
-}
-
-function containsComposed(parent, child) {
-  for (
-    let node = child;
-    node;
-    node = node.parentElement || node.getRootNode()?.host
-  ) {
-    if (node === parent) return true;
-  }
-  return false;
-}
-
-function deepElementFromPoint(x, y) {
-  let hit = document.elementFromPoint(x, y);
-  for (;;) {
-    const inner = hit?.shadowRoot?.elementFromPoint(x, y);
-    if (!inner || inner === hit) return hit;
-    hit = inner;
-  }
+/**
+ * DOM lookups that reach into open shadow roots, serialized into the page.
+ * Sites render dialogs inside web components (LinkedIn's invitation dialog
+ * lives in the shadow root of `#interop-outlet`), where document-level
+ * queries, `contains` and hit tests stop at the host. Closed shadow roots and
+ * child frames stay out of reach, so results count the visible frames they
+ * could not search.
+ */
+function pageDomInPage() {
+  // Matches in a document, shadow root or element, then in every open shadow
+  // root inside it, nested ones included.
+  const queryAll = (root, selector) => {
+    const out = [...root.querySelectorAll(selector)];
+    const visit = (scope) => {
+      for (const el of scope.querySelectorAll("*")) {
+        if (!el.shadowRoot) continue;
+        out.push(...el.shadowRoot.querySelectorAll(selector));
+        visit(el.shadowRoot);
+      }
+    };
+    if (root.shadowRoot) {
+      out.push(...root.shadowRoot.querySelectorAll(selector));
+      visit(root.shadowRoot);
+    }
+    visit(root);
+    return out;
+  };
+  const parent = (node) => node.assignedSlot || node.parentElement || node.parentNode?.host || null;
+  // Whether `node` renders inside `ancestor`, across shadow boundaries and slots.
+  const contains = (ancestor, node) => {
+    if (!ancestor || !node) return false;
+    if (ancestor.contains(node)) return true;
+    for (let at = parent(node); at; at = parent(at)) if (at === ancestor) return true;
+    return false;
+  };
+  // Everything painted at a point, topmost first, with each shadow host's
+  // own painted content ahead of the host itself.
+  const stack = (x, y) => {
+    const expand = (root) => {
+      const out = [];
+      for (const el of root.elementsFromPoint(x, y) || []) {
+        if (root !== document && el.getRootNode() !== root) continue;
+        if (el.shadowRoot && el.shadowRoot !== root) out.push(...expand(el.shadowRoot));
+        out.push(el);
+      }
+      return out;
+    };
+    return expand(document);
+  };
+  // The element a press at a point would land on, not its shadow host.
+  const hit = (x, y) => {
+    let at = document.elementFromPoint(x, y);
+    while (at?.shadowRoot) {
+      const inner = at.shadowRoot.elementFromPoint(x, y);
+      if (!inner || inner === at || inner.getRootNode() !== at.shadowRoot) break;
+      at = inner;
+    }
+    return at;
+  };
+  const byIndex = (index) => queryAll(document, '[data-cu-idx="' + index + '"]')[0] || null;
+  const byId = (from, id) => from.getRootNode().getElementById?.(id) || document.getElementById(id);
+  return { queryAll, contains, stack, hit, byIndex, byId };
 }
 
 /// A compact outline of the interactive elements on the page, with ids the
 /// agent can click. Mirrors the accessibility-tree tools on the desktop side.
 const SNAPSHOT_JS = `((options = {}) => {
-  const query = ${queryOpenRoots.toString()};
-  const contains = ${containsComposed.toString()};
-  const hitAt = ${deepElementFromPoint.toString()};
   const offset = options.offset ?? 0;
   const limit = options.limit ?? 250;
   const out = [];
   const sel = 'a,button,input,textarea,select,cfc-select,mat-option,[role=button],[role=link],[role=textbox],[role=combobox],[role=listbox],[role=option],[role=menu],[role=menuitem],[aria-haspopup],[contenteditable=true],summary';
   let i = 0;
+  const dom = (${pageDomInPage.toString()})();
   // Clear the previous snapshot's indices first. An element hidden since then
   // would otherwise keep its old number, and querySelector, which returns the
   // first match, could send a click or a credential fill to it instead.
-  for (const old of query('[data-cu-idx]')) old.removeAttribute('data-cu-idx');
+  for (const old of dom.queryAll(document, '[data-cu-idx]')) old.removeAttribute('data-cu-idx');
   // Accessibility-hidden/inert ancestors are not actionable. Do not use viewport
   // intersection here: indexed click scrolls reachable offscreen controls into view.
   const visible = ${isElementVisibleInPage.toString()};
@@ -732,7 +764,7 @@ const SNAPSHOT_JS = `((options = {}) => {
   // For custom dialogs, use paint order at their visible centre, not DOM order
   // or raw z-index (which is only meaningful inside a stacking context).
   // Modeless native dialogs and explicit aria-modal=false keep page controls.
-  const dialogs = Array.from(query('dialog:modal,[role=dialog]:not([aria-modal=false i]),[role=alertdialog]:not([aria-modal=false i]),[aria-modal=true i]')).filter((dialog) => {
+  const dialogs = Array.from(dom.queryAll(document, 'dialog:modal,[role=dialog]:not([aria-modal=false i]),[role=alertdialog]:not([aria-modal=false i]),[aria-modal=true i]')).filter((dialog) => {
     if (!visible(dialog)) return false;
     if (dialog.matches('dialog:modal,[aria-modal=true i]')) return true;
     // An implicit ARIA dialog is not automatically modal. Preserve full-page
@@ -740,36 +772,35 @@ const SNAPSHOT_JS = `((options = {}) => {
     const x = innerWidth / 2, y = innerHeight / 2;
     const r = dialog.getBoundingClientRect();
     if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) {
-      const painted = [hitAt(x, y)].filter(Boolean);
-      if (!painted.length || contains(dialog, painted[0])) return true;
+      const painted = dom.stack(x, y);
+      if (!painted.length || dom.contains(dialog, painted[0])) return true;
     }
-    // A blocking backdrop can cover the viewport while its dialog sits near
-    // the top. Require a fixed, painted ancestor instead of treating every
-    // focused dialog (including modeless chat widgets) as modal.
-    for (let node = dialog.parentElement || dialog.getRootNode()?.host;
-         node; node = node.parentElement || node.getRootNode()?.host) {
+    // A fixed blocking backdrop can cover the viewport while the dialog is
+    // near the top. Focus alone must not make a modeless widget modal.
+    for (let node = dialog.assignedSlot || dialog.parentElement || dialog.parentNode?.host;
+         node; node = node.assignedSlot || node.parentElement || node.parentNode?.host) {
       const box = node.getBoundingClientRect();
       const style = getComputedStyle(node);
       if (style.position !== 'fixed' || style.pointerEvents === 'none' ||
           box.left > 1 || box.top > 1 || box.right < innerWidth - 1 || box.bottom < innerHeight - 1) continue;
-      const hit = hitAt(x, y);
-      if (hit && contains(node, hit)) return true;
+      const hit = dom.hit(x, y);
+      if (hit && dom.contains(node, hit)) return true;
     }
     return false;
   });
   const native = dialogs.filter((dialog) => dialog.matches(':modal'));
   // Keep nested custom dialogs inside the native top layer eligible too.
-  const candidates = dialogs.filter((dialog) => !native.length || native.some((layer) => contains(layer, dialog))).reverse();
+  const candidates = dialogs.filter((dialog) => !native.length || native.some((layer) => dom.contains(layer, dialog))).reverse();
   let modal = null;
   for (const candidate of candidates) {
     const r = candidate.getBoundingClientRect();
     const left = Math.max(0, r.left), right = Math.min(innerWidth, r.right);
     const top = Math.max(0, r.top), bottom = Math.min(innerHeight, r.bottom);
     if (left >= right || top >= bottom) continue;
-    const painted = [hitAt((left + right) / 2, (top + bottom) / 2)].filter(Boolean);
+    const painted = dom.stack((left + right) / 2, (top + bottom) / 2);
     // The first dialog in the hit-test stack wins, including nested dialogs.
     for (const hit of painted) {
-      const owner = candidates.find((dialog) => contains(dialog, hit));
+      const owner = candidates.find((dialog) => dom.contains(dialog, hit));
       if (owner) { modal = owner; break; }
     }
     if (modal) break;
@@ -787,32 +818,41 @@ const SNAPSHOT_JS = `((options = {}) => {
   // the topmost element at its own centre.
   const floating = [];
   if (modal) {
-    for (const owner of query('[aria-controls],[aria-owns]', modal)) {
+    for (const owner of dom.queryAll(modal, '[aria-controls],[aria-owns]')) {
       const ids = ((owner.getAttribute('aria-controls') || '') + ' ' + (owner.getAttribute('aria-owns') || '')).split(/\s+/);
       for (const id of ids) {
-        const root = id && owner.getRootNode().getElementById(id);
-        if (root && !contains(modal, root)) floating.push(root);
+        const root = id && dom.byId(owner, id);
+        if (root && !dom.contains(modal, root)) floating.push(root);
       }
     }
     try {
-      for (const pop of query(':popover-open')) {
-        if (!contains(modal, pop) && !contains(pop, modal)) floating.push(pop);
+      for (const pop of dom.queryAll(document, ':popover-open')) {
+        if (!dom.contains(modal, pop) && !dom.contains(pop, modal)) floating.push(pop);
       }
     } catch {}
   }
   const bounds = modal ? modal.getBoundingClientRect() : null;
   const inScope = (el) => {
-    if (!modal || contains(modal, el)) return true;
-    if (floating.some((root) => contains(root, el))) return true;
+    if (!modal || dom.contains(modal, el)) return true;
+    if (floating.some((root) => dom.contains(root, el))) return true;
     const r = el.getBoundingClientRect();
     const x = r.left + r.width / 2, y = r.top + r.height / 2;
     if (x < Math.max(0, bounds.left) || y < Math.max(0, bounds.top) ||
         x >= Math.min(innerWidth, bounds.right) || y >= Math.min(innerHeight, bounds.bottom)) return false;
-    const hit = hitAt(x, y);
-    return !!hit && (hit === el || contains(el, hit));
+    window.__cuClickStage = 'hit-test';
+  const hit = dom.hit(x, y);
+    return !!hit && (hit === el || dom.contains(el, hit));
   };
-  for (const el of query(sel)) {
+  let frames = 0;
+  for (const el of dom.queryAll(document, sel + ',iframe,frame')) {
     if (!inScope(el) || !visible(el)) continue;
+    // A frame's controls are its own document's, which this does not search.
+    // Count the ones big enough to hold a form, not tracking pixels or ads.
+    if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
+      const r = el.getBoundingClientRect();
+      if (r.width >= 100 && r.height >= 40) frames++;
+      continue;
+    }
     const index = i++;
     // Tag the full selected scope so indices stay global and earlier pages remain
     // actionable when paging an unchanged UI. Only label/serialize this page.
@@ -837,7 +877,7 @@ const SNAPSHOT_JS = `((options = {}) => {
   }
   const end = Math.min(i, offset + out.length);
   return { title: document.title, url: location.href, elements: out,
-    scope: modal ? 'modal' : 'page', total: i, offset, limit,
+    scope: modal ? 'modal' : 'page', total: i, offset, limit, frames,
     truncated: end < i, nextOffset: end < i ? end : null };
 })()`;
 
@@ -1128,8 +1168,8 @@ async function hideCursor(tabId) {
 /// can, a probe records which trusted events land on it, so the click can
 /// check its hover reached the element before pressing anything.
 const CLICK_TARGET_JS = (index) => `(() => {
-  const query = ${queryOpenRoots.toString()};
-  const el = query('[data-cu-idx="${index}"]')[0];
+  const dom = (${pageDomInPage.toString()})();
+  const el = dom.byIndex(${index});
   if (!el) return { ok: false, reason: 'element ${index} is no longer on the page' };
   // Instant, so a page with smooth scrolling is not measured mid-flight.
   window.__cuClickStage = 'scroll';
@@ -1139,10 +1179,9 @@ const CLICK_TARGET_JS = (index) => `(() => {
   const y = r.top + r.height / 2;
   const label = (el.getAttribute('aria-label') || el.innerText || el.getAttribute('title') || '')
     .replace(/\\s+/g, ' ').trim().slice(0, 60);
-  window.__cuClickStage = 'hit-test';
-  const hit = (${deepElementFromPoint.toString()})(x, y);
+  const hit = dom.hit(x, y);
   const shown = document.visibilityState === 'visible';
-  const reachable = shown && !!hit && (hit === el || el.contains(hit));
+  const reachable = shown && !!hit && (hit === el || dom.contains(el, hit));
   const found = { ok: true, tag: el.tagName.toLowerCase(), label, href: el.href || null, x, y, reachable };
   window.__cuClickProbe?.done();
   delete window.__cuClickProbe;
@@ -1170,8 +1209,7 @@ const CLICK_PROBE_JS = (finish) => `(() => {
 /// respond; and, like a real press, a cancelled pointerdown suppresses the
 /// mouse events and a cancelled mousedown keeps focus where it was.
 const CLICK_EVENTS_JS = (index) => `(() => {
-  const query = ${queryOpenRoots.toString()};
-  const el = query('[data-cu-idx="${index}"]')[0];
+  const el = (${pageDomInPage.toString()})().byIndex(${index});
   if (!el) return { ok: false, reason: 'element ${index} is no longer on the page' };
   const r = el.getBoundingClientRect();
   const x = r.left + r.width / 2;
@@ -1588,17 +1626,26 @@ function testsValueAttribute(selector) {
   return /\[\s*(?:[\w*-]*\|)?value\s*(?:[~|^$*]?=|\])/i.test(plain);
 }
 
-/** A visible match in the document or an open shadow root; frames are excluded. */
-function visibleSelectorInPage(selector, visible, query = document.querySelectorAll.bind(document)) {
+/**
+ * A visible match in the top-level document or an open shadow root inside it,
+ * not arbitrary application readiness. A selector is matched within each
+ * root, so it cannot name a host and something in its shadow tree at once.
+ * Child frames are not searched; `frames` counts the visible ones so a
+ * timeout can say so.
+ */
+function visibleSelectorInPage(selector, visible, dom) {
   let matches;
   try {
-    matches = query(selector);
+    matches = dom.queryAll(document, selector);
   } catch {
     return { error: "invalid CSS selector" };
   }
-  return {
-    met: [...matches].some(visible),
-  };
+  if (matches.some(visible)) return { met: true };
+  const frames = dom.queryAll(document, "iframe,frame").filter((frame) => {
+    const r = frame.getBoundingClientRect();
+    return r.width >= 100 && r.height >= 40 && visible(frame);
+  }).length;
+  return { met: false, frames };
 }
 
 /** Poll an explicit condition, including delayed same-document rendering. */
@@ -1619,7 +1666,7 @@ async function waitForReadiness(p) {
     let res;
     try {
       res = await send(p.tabId, "Runtime.evaluate", {
-        expression: `(${visibleSelectorInPage.toString()})(${JSON.stringify(p.waitForSelector)}, ${isElementVisibleInPage.toString()}, ${queryOpenRoots.toString()})`,
+        expression: `(${visibleSelectorInPage.toString()})(${JSON.stringify(p.waitForSelector)}, ${isElementVisibleInPage.toString()}, (${pageDomInPage.toString()})())`,
         returnByValue: true,
       });
     } catch (error) {
@@ -1633,7 +1680,7 @@ async function waitForReadiness(p) {
     const value = res?.result?.value;
     if (value?.error) return outcome("error", { error: value.error });
     if (value?.met === true) return outcome("met");
-    if (Date.now() >= deadline) return outcome("timeout");
+    if (Date.now() >= deadline) return outcome("timeout", value?.frames ? { frames: value.frames } : {});
     await sleep(Math.min(100, deadline - Date.now()));
   }
 }
@@ -1664,17 +1711,28 @@ async function withState(p, result) {
  * so the model can see the structure; everything else is innerText, which
  * respects CSS visibility and includes content scrolled out of view.
  */
-function readPageInPage(includeLinks) {
+function readPageInPage(includeLinks, dom) {
   const root = document.body;
   const out = { title: document.title, url: location.href, text: "", links: [] };
   if (!root) return out;
   const heads = new Map();
-  for (const h of root.querySelectorAll("h1,h2,h3,h4,h5,h6")) {
+  for (const h of dom.queryAll(root, "h1,h2,h3,h4,h5,h6")) {
     const t = (h.innerText || "").replace(/\s+/g, " ").trim();
     if (t && !heads.has(t)) heads.set(t, Number(h.tagName[1]));
   }
+  // innerText stops at shadow roots, so a web component's own text (a dialog
+  // rendered inside one) follows the page's: one block per open shadow root,
+  // from its rendered children only (a hidden one's innerText is its source).
+  const blocks = [root.innerText || ""];
+  for (const host of dom.queryAll(root, "*")) {
+    if (!host.shadowRoot) continue;
+    const shown = [...host.shadowRoot.children].filter((child) =>
+      child.checkVisibility ? child.checkVisibility() : child.getClientRects().length > 0);
+    const text = shown.map((child) => child.innerText || "").join("\n").trim();
+    if (text) blocks.push(text);
+  }
   const lines = [];
-  for (const raw of (root.innerText || "").split("\n")) {
+  for (const raw of blocks.join("\n\n").split("\n")) {
     const line = raw.replace(/[ \t ]+/g, " ").trim();
     if (!line) {
       if (lines.length && lines[lines.length - 1] !== "") lines.push("");
@@ -1686,7 +1744,7 @@ function readPageInPage(includeLinks) {
   out.text = lines.join("\n").trim();
   if (includeLinks) {
     const seen = new Set();
-    for (const a of root.querySelectorAll("a[href]")) {
+    for (const a of dom.queryAll(root, "a[href]")) {
       const href = a.href;
       if (!/^https?:/.test(href) || seen.has(href)) continue;
       const label = (a.innerText || a.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim().slice(0, 90);
@@ -1734,7 +1792,7 @@ const READ_MAX_CHARS = 200000;
 
 async function readPage(tabId, { query, maxChars, offset, includeLinks } = {}) {
   const res = await send(tabId, "Runtime.evaluate", {
-    expression: `(${readPageInPage.toString()})(${includeLinks === true})`,
+    expression: `(${readPageInPage.toString()})(${includeLinks === true}, (${pageDomInPage.toString()})())`,
     returnByValue: true,
   });
   if (res?.exceptionDetails) throw new Error(res.exceptionDetails.text || "could not read the page");
@@ -1902,11 +1960,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 /** Describe snapshot elements by index, inside the page, for the credential prompt. */
-function describeFieldsInPage(indices, query = document.querySelectorAll.bind(document)) {
+function describeFieldsInPage(indices, dom) {
   return indices.map((index) => {
-    const el = query(`[data-cu-idx="${index}"]`)[0];
+    const el = dom.byIndex(index);
     if (!el) return { index, found: false };
-    const byId = el.id ? el.getRootNode().querySelector(`label[for="${CSS.escape(el.id)}"]`) : null;
+    const byId = el.id ? el.getRootNode().querySelector?.(`label[for="${CSS.escape(el.id)}"]`) : null;
     const label = (el.getAttribute("aria-label") || byId?.innerText || el.closest("label")?.innerText ||
       el.getAttribute("placeholder") || el.getAttribute("name") || el.getAttribute("autocomplete") || "")
       .replace(/\s+/g, " ").trim().slice(0, 60);
@@ -1919,11 +1977,11 @@ function describeFieldsInPage(indices, query = document.querySelectorAll.bind(do
  * Put values into snapshot elements the way typing would, so frameworks that
  * listen for input events (React, Vue) see the change. Runs inside the page.
  */
-function fillFieldsInPage(entries, query = document.querySelectorAll.bind(document)) {
+function fillFieldsInPage(entries, dom) {
   const filled = [];
   const missing = [];
   for (const { index, value } of entries) {
-    const el = query(`[data-cu-idx="${index}"]`)[0];
+    const el = dom.byIndex(index);
     if (!el) {
       missing.push(index);
       continue;
@@ -1963,7 +2021,7 @@ async function requestCredentials(clientId, p) {
   const tab = await chrome.tabs.get(p.tabId);
   const url = tab.url || "";
   const described = await send(p.tabId, "Runtime.evaluate", {
-    expression: `(${describeFieldsInPage.toString()})(${JSON.stringify(indices)}, ${queryOpenRoots.toString()})`,
+    expression: `(${describeFieldsInPage.toString()})(${JSON.stringify(indices)}, (${pageDomInPage.toString()})())`,
     returnByValue: true,
   });
   if (described?.exceptionDetails) throw new Error("could not inspect the page's fields");
@@ -2007,7 +2065,7 @@ async function requestCredentials(clientId, p) {
     .filter((field) => typeof answer.values[field.index] === "string")
     .map((field) => ({ index: field.index, value: answer.values[field.index] }));
   const res = await send(p.tabId, "Runtime.evaluate", {
-    expression: `(${fillFieldsInPage.toString()})(${JSON.stringify(entries)}, ${queryOpenRoots.toString()})`,
+    expression: `(${fillFieldsInPage.toString()})(${JSON.stringify(entries)}, (${pageDomInPage.toString()})())`,
     returnByValue: true,
     userGesture: true,
   });

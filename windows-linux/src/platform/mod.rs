@@ -20,6 +20,7 @@ mod ocr;
 pub mod outline;
 #[cfg(windows)]
 pub mod session;
+pub mod typed;
 #[cfg(windows)]
 mod user_keys;
 #[cfg(windows)]

@@ -1250,8 +1250,21 @@ fn describe_readiness(result: &Value) -> String {
     if let Some(error) = readiness.get("error").and_then(Value::as_str) {
         line.push_str(&format!(" — {error}"));
     }
+    if let Some(frames) = readiness.get("frames").and_then(Value::as_u64).filter(|&n| n > 0) {
+        line.push_str(&format!(" — not searched: {}", frames_phrase(frames)));
+    }
     line.push_str("; only the stated condition was checked, not general app readiness. Re-observe with browser_snapshot before repeating a non-idempotent action.\n");
     line
+}
+
+/// Snapshots and selector waits see the page and its open shadow roots, not
+/// the documents inside frames; say how many visible frames were left out.
+fn frames_phrase(frames: u64) -> String {
+    if frames == 1 { "1 embedded frame".to_string() } else { format!("{frames} embedded frames") }
+}
+
+fn frames_note(frames: u64) -> String {
+    format!("note: {} on the page {} not searched — controls inside a frame are not listed here; take a screenshot to see them", frames_phrase(frames), if frames == 1 { "was" } else { "were" })
 }
 
 /// browser_read: the page text, and where to continue if it was cut off.
@@ -1391,6 +1404,9 @@ fn describe_snapshot(result: &Value) -> String {
             if let Some(next) = result.get("nextOffset").and_then(Value::as_u64) {
                 lines.push(format!("truncated — continue with browser_snapshot offset={next}, limit={limit} (same tab_id/session_id; unchanged UI keeps indices)"));
             }
+        }
+        if let Some(frames) = result.get("frames").and_then(Value::as_u64).filter(|&n| n > 0) {
+            lines.push(frames_note(frames));
         }
     }
     for element in result
@@ -1807,6 +1823,16 @@ mod tests {
         // Releasing only must not claim a group was removed.
         let rendered = describe("close_all_tabs", &json!({ "closed": 0, "released": 1 }), &json!({}));
         assert!(!rendered.contains("removed the tab group"), "{rendered}");
+    }
+
+    #[test]
+    fn frames_the_extension_could_not_search_are_named() {
+        let snapshot = describe("snapshot", &json!({ "title": "Profile", "elements": [], "total": 0, "frames": 2, "readiness": {
+            "status": "timeout", "condition": "visible_selector", "selector": "[role=dialog]", "elapsedMs": 3000, "frames": 1 } }), &json!({}));
+        assert!(snapshot.contains("note: 2 embedded frames on the page were not searched"), "{snapshot}");
+        assert!(snapshot.contains("selector=[role=dialog] — not searched: 1 embedded frame;"), "{snapshot}");
+        let plain = describe("snapshot", &json!({ "title": "Profile", "elements": [], "total": 0, "frames": 0 }), &json!({}));
+        assert!(!plain.contains("embedded frame"), "{plain}");
     }
 
     #[test]

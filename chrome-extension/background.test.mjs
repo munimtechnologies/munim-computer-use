@@ -567,8 +567,8 @@ test("read with a query keeps matching lines, their neighbours and their heading
 test("return_state attaches a fresh snapshot to an action", async () => {
   pageEval = (method, params) => {
     const expression = params.expression ?? "";
-    if (expression.includes("data-cu-idx=\"3\"")) return { result: { value: { ok: true, tag: "button", x: 5, y: 5 } } };
-    if (expression.includes("query(sel)")) {
+    if (expression.includes("byIndex(3)")) return { result: { value: { ok: true, tag: "button", x: 5, y: 5 } } };
+    if (expression.includes("queryAll(document, sel")) {
       return { result: { value: { title: "After", url: "https://shop.example/next", elements: [{ i: 0, tag: "a", label: "Next" }] } } };
     }
     return { result: { value: {} } };
@@ -590,8 +590,8 @@ test("every stateful action forwards an explicit wait and preserves its successf
         observations++;
         return { result: { value: { met: observations >= 2 } } };
       }
-      if (expression.includes("data-cu-idx=\"3\"")) return { result: { value: { ok: true, tag: "button", x: 5, y: 5 } } };
-      if (expression.includes("query(sel)")) return { result: { value: { title: "Ready", elements: [] } } };
+      if (expression.includes("byIndex(3)")) return { result: { value: { ok: true, tag: "button", x: 5, y: 5 } } };
+      if (expression.includes("queryAll(document, sel")) return { result: { value: { title: "Ready", elements: [] } } };
       return { result: { value: {} } };
     };
     const result = await callAndWait(command, { tabId: pageTab, ...args, returnState: true, waitForSelector: "#ready", waitTimeoutMs: 1000 });
@@ -606,7 +606,7 @@ test("snapshot waits without another action, including an immediate timeout", as
   let actions = 0;
   pageEval = (method, params) => {
     const expression = params.expression ?? "";
-    if (method.startsWith("Input.") || expression.includes("data-cu-idx=\"")) actions++;
+    if (method.startsWith("Input.") || expression.includes(".byIndex(")) actions++;
     if (expression.includes("visibleSelectorInPage")) return { result: { value: { met: false } } };
     return { result: { value: { title: "Current", elements: [] } } };
   };
@@ -648,7 +648,7 @@ test("a readiness evaluation error is not reported as a failed click", async () 
   let clicks = 0;
   pageEval = (_method, params) => {
     const expression = params.expression ?? "";
-    if (expression.includes("data-cu-idx=\"3\"")) {
+    if (expression.includes("byIndex(3)")) {
       // The lookup, then the press itself.
       if (expression.includes("'pointerdown'")) clicks++;
       return { result: { value: { ok: true, x: 5, y: 5 } } };
@@ -668,7 +668,7 @@ test("a readiness transport failure preserves the successful action and current 
   let clicks = 0;
   pageEval = (_method, params) => {
     const expression = params.expression ?? "";
-    if (expression.includes("data-cu-idx=\"3\"")) {
+    if (expression.includes("byIndex(3)")) {
       // The lookup, then the press itself.
       if (expression.includes("'pointerdown'")) clicks++;
       return { result: { value: { ok: true, x: 5, y: 5 } } };
@@ -817,12 +817,12 @@ test("return_state does not read a blocked site the action landed on", async () 
   let snapshots = 0;
   pageEval = (method, params) => {
     const expression = params.expression ?? "";
-    if (expression.includes("data-cu-idx=\"2\"")) {
+    if (expression.includes("byIndex(2)")) {
       // The click follows a link into a blocked site.
       tab.url = "https://www.bank.example/accounts";
       return { result: { value: { ok: true, tag: "a", x: 5, y: 5 } } };
     }
-    if (expression.includes("query(sel)")) {
+    if (expression.includes("queryAll(document, sel")) {
       snapshots += 1;
       return { result: { value: { title: "Accounts", url: tab.url, elements: [] } } };
     }
@@ -868,7 +868,7 @@ test("a debugger session Chrome ended is attached again on the next command", as
 test("snapshot forwards bounded pagination and refuses malformed options before evaluation", async () => {
   const expressions = [];
   pageEval = (method, params) => {
-    if (params.expression?.includes("query(sel)")) expressions.push(params.expression);
+    if (params.expression?.includes("queryAll(document, sel")) expressions.push(params.expression);
     return { result: { value: {} } };
   };
   await call("snapshot", { tabId: pageTab, offset: 250, limit: 20 });
@@ -898,7 +898,6 @@ test("a snapshot clears indices an earlier snapshot left on now-hidden elements"
       tagName: tag.toUpperCase(),
       innerText: tag,
       matches: () => false,
-      getRootNode: () => document,
       hidden,
       getAttribute: (name) => attributes.get(name) ?? null,
       setAttribute: (name, value) => attributes.set(name, String(value)),
@@ -1155,7 +1154,7 @@ test("a stalled click rejects, releases its task queue and never resumes late ac
         late = resolve;
       });
     }
-    if ((params.expression || "").includes("query(sel)"))
+    if ((params.expression || "").includes("const offset = options.offset"))
       return { result: { value: { title: "Recovered", elements: [] } } };
     return { result: { value: {} } };
   };

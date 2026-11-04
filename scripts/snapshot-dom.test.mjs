@@ -17,7 +17,7 @@ const option = (name) => {
   return at >= 0 ? process.argv[at + 1] : undefined;
 };
 const suite = option("--suite") || "all";
-assert.ok(["all", "snapshot", "readiness", "audit-r1", "audit-r2", "audit-r3"].includes(suite), "invalid --suite");
+assert.ok(["all", "snapshot", "readiness", "shadow", "audit-r1", "audit-r2", "audit-r3"].includes(suite), "invalid --suite");
 const chromePath = option("--chrome");
 if (!chromePath) throw new Error("provide --chrome <Chrome for Testing binary>");
 if (suite === "all" || suite === "audit-r3") {
@@ -112,7 +112,11 @@ try {
     ? ["CLICK_EVENTS_JS", "\nasync function evaluateValue("]
     : ["CLICK_JS", "\n/// Click a snapshotted element"];
   const clickDeclaration = source.slice(source.indexOf(`const ${clickName} =`), source.indexOf(clickEnd));
-  const click = vm.runInNewContext(declaration + clickDeclaration + `\n${clickName}`);
+  // The shadow-root-aware lookups the page scripts share (none before #46).
+  const domDeclaration = source.includes("function pageDomInPage(")
+    ? source.slice(source.indexOf("function pageDomInPage("), source.indexOf("\n/// A compact outline")) : "";
+  const domArgument = domDeclaration ? `, (${vm.runInNewContext(domDeclaration + "; pageDomInPage").toString()})()` : "";
+  const click = vm.runInNewContext(domDeclaration + clickDeclaration + `\n${clickName}`);
   const snapshot = (options = {}) => evaluate(expression.slice(0, -2) + `(${JSON.stringify(options)})`);
   const set = (html) => evaluate(`document.body.innerHTML = ${JSON.stringify(html)}; true`);
   const buttons = (count, prefix = "Background") => Array.from({ length: count }, (_, i) => `<button>${prefix} ${i}</button>`).join("");
@@ -130,7 +134,7 @@ try {
       const root = document.getElementById('interop-outlet').attachShadow({mode:'open'});
       root.innerHTML = '<div><div role="dialog" style="position:fixed;inset:20%;background:white"><button id="note">Add a note</button><button>Send without a note</button><div id="nested"></div></div></div>';
       root.getElementById('nested').attachShadow({mode:'open'}).innerHTML = '<button>Nested control</button>';
-      root.getElementById('note').onclick = () => { window.noteClicks = (window.noteClicks || 0) + 1; };
+      root.getElementById('note').onclick = () => { window.offsetNoteClicks = (window.offsetNoteClicks || 0) + 1; };
     })()`);
     await evaluate(`(() => {
       const root = document.getElementById('interop-outlet').shadowRoot;
@@ -147,7 +151,7 @@ try {
     const targetScript = vm.runInNewContext(declaration + clickDeclaration + '\n' + source.slice(source.indexOf('const CLICK_TARGET_JS'), source.indexOf('const CLICK_PROBE_JS')) + '\nCLICK_TARGET_JS');
     assert.equal((await evaluate(targetScript(0))).ok, true);
     assert.equal((await evaluate(click(0))).ok, true);
-    assert.equal(await evaluate('window.noteClicks'), 1);
+    assert.equal(await evaluate('window.offsetNoteClicks'), 1);
     await evaluate(`document.getElementById('interop-outlet').shadowRoot.querySelector('[role=dialog]').insertAdjacentHTML('beforeend', '<textarea aria-label="Note"></textarea>')`);
     const withNote = await snapshot();
     const noteIndex = withNote.elements.find(el => el.tag === 'textarea').i;
@@ -271,6 +275,110 @@ try {
 
   }
 
+
+  if (suite === "all" || suite === "shadow") {
+    // #46: LinkedIn renders its invitation dialog inside the open shadow root
+    // of #interop-outlet, over the profile's own Connect/Message buttons.
+    // Document-level queries and hit tests stop at the host, so the snapshot
+    // listed the background and a wait for [role=dialog] timed out.
+    assert.ok(domDeclaration, "the extension has no shadow-root-aware page lookups");
+    const pageDom = `(${vm.runInNewContext(domDeclaration + "; pageDomInPage").toString()})()`;
+    const profile = '<main><h1>Alex Example</h1><button id="connect">Connect</button><button id="message">Message</button><button>More</button></main><div id="interop-outlet"></div>';
+    const invitation = '<div style="position:fixed;inset:0;background:rgba(0,0,0,.6)"><div role="dialog" aria-labelledby="invite-title" style="position:fixed;top:25%;left:25%;width:50%;height:50%;background:white"><h2 id="invite-title">Add a note to your invitation?</h2><button aria-label="Dismiss">x</button><button id="add-note">Add a note</button><button id="send">Send without a note</button></div></div>';
+    const openInvitation = (delay = 0) => evaluate(`(() => {
+      const open = () => {
+        const outlet = document.getElementById('interop-outlet');
+        const root = outlet.shadowRoot || outlet.attachShadow({ mode: 'open' });
+        root.innerHTML = ${JSON.stringify(invitation)};
+      };
+      if (${delay}) setTimeout(open, ${delay}); else open();
+      return true;
+    })()`);
+    await set(profile);
+    await evaluate(`document.getElementById('connect').onclick = () => (window.backgroundClicks = (window.backgroundClicks || 0) + 1); true`);
+    const before = await snapshot();
+    assert.deepEqual(before.elements.map((el) => el.label), ["Connect", "Message", "More"]);
+    const staleConnect = before.elements.find((el) => el.label === "Connect").i;
+    await openInvitation();
+    const blocked = await snapshot();
+    console.log(`shadow dialog: scope=${blocked.scope}; labels=${blocked.elements.map((el) => el.label).join(", ")}`);
+    assert.equal(blocked.scope, "modal");
+    assert.deepEqual(blocked.elements.map((el) => el.label), ["Dismiss", "Add a note", "Send without a note"]);
+    assert.equal(blocked.total, 3);
+    console.log("PASS a dialog in an open shadow root scopes the snapshot to its controls");
+
+    // Background controls are not indexed while the dialog blocks them, and
+    // the index Connect had a snapshot ago now names a dialog control.
+    assert.equal(await evaluate("document.getElementById('connect').hasAttribute('data-cu-idx')"), false);
+    await evaluate(`document.getElementById('interop-outlet').shadowRoot.getElementById('add-note').onclick = () => (window.noteClicks = (window.noteClicks || 0) + 1); true`);
+    assert.equal((await evaluate(click(staleConnect))).ok, true);
+    assert.equal(await evaluate("window.backgroundClicks"), undefined, "a stale index clicked the blocked background");
+    const addNote = blocked.elements.find((el) => el.label === "Add a note");
+    assert.equal((await evaluate(click(addNote.i))).ok, true);
+    assert.equal(await evaluate("window.noteClicks"), 1);
+    assert.equal((await evaluate(click(blocked.total))).ok, false, "an index past the snapshot must not resolve");
+    assert.equal(await evaluate("window.backgroundClicks"), undefined);
+    // A press at the button's centre lands on it, not on the shadow host.
+    assert.equal(await evaluate(`(() => {
+      const dom = ${pageDom};
+      const target = dom.byIndex(${addNote.i});
+      const r = target.getBoundingClientRect();
+      return dom.hit(r.left + r.width / 2, r.top + r.height / 2) === target;
+    })()`), true);
+    console.log("PASS blocked background controls cannot be clicked; shadow controls click and hit-test by index");
+
+    // A background tab can lack a hit-test stack; the shadow dialog still wins.
+    await evaluate('globalThis.savedHitTest = document.elementsFromPoint; document.elementsFromPoint = () => []; true');
+    assert.equal((await snapshot()).scope, "modal");
+    await evaluate('document.elementsFromPoint = globalThis.savedHitTest; delete globalThis.savedHitTest; true');
+    console.log("PASS shadow dialog without a hit-test stack");
+
+    // Readiness searches the same roots the snapshot does.
+    const visible = vm.runInNewContext(declaration + "; isElementVisibleInPage");
+    const selectorCode = source.slice(source.indexOf("function visibleSelectorInPage("), source.indexOf("/** Poll an explicit condition"));
+    const selector = vm.runInNewContext(selectorCode + "; visibleSelectorInPage");
+    const ready = (target) => evaluate(`(${selector.toString()})(${JSON.stringify(target)}, ${visible.toString()}, ${pageDom})`);
+    assert.equal((await ready("[role='dialog']")).met, true);
+    assert.equal((await ready("#send")).met, true);
+    await set(profile);
+    assert.equal((await ready("[role='dialog']")).met, false);
+    console.log("PASS wait_for_selector matches inside open shadow roots");
+
+    // browser_read: innerText skips shadow content, so the dialog's text was
+    // missing from the page text too. It must appear once, after the page's.
+    await openInvitation();
+    const readCode = source.slice(source.indexOf("function readPageInPage("), source.indexOf("\n/**\n * Keep the lines"));
+    const read = await evaluate(`(${vm.runInNewContext(readCode + "; readPageInPage").toString()})(false, ${pageDom})`);
+    assert.equal(read.text.split("Add a note to your invitation?").length, 2, read.text);
+    assert.ok(read.text.indexOf("Connect") < read.text.indexOf("Add a note to your invitation?"), read.text);
+    console.log("PASS browser_read includes a shadow root's rendered text once");
+
+    // Slotted light children render inside the shadow dialog; nested shadow
+    // roots are searched; a hidden host hides everything it renders.
+    await set('<button>Page</button><x-modal><button>Slotted</button></x-modal><div id="hidden-host" hidden></div>');
+    await evaluate(`(() => {
+      const host = document.querySelector('x-modal');
+      host.attachShadow({ mode: 'open' }).innerHTML = '<div role="dialog" aria-modal="true" style="position:fixed;inset:0;background:white"><slot></slot><x-inner></x-inner></div>';
+      host.shadowRoot.querySelector('x-inner').attachShadow({ mode: 'open' }).innerHTML = '<button>Nested shadow</button>';
+      document.getElementById('hidden-host').attachShadow({ mode: 'open' }).innerHTML = '<button>Hidden host</button>';
+      return true;
+    })()`);
+    const slotted = await snapshot();
+    assert.equal(slotted.scope, "modal");
+    assert.deepEqual(slotted.elements.map((el) => el.label).sort(), ["Nested shadow", "Slotted"]);
+    console.log("PASS slotted and nested-shadow controls belong to the dialog; a hidden host hides its shadow");
+
+    // Frames are not searched; say how many there were rather than imply none.
+    await set('<button>Page</button><iframe style="width:300px;height:200px" srcdoc="<button>In frame</button>"></iframe><iframe style="width:1px;height:1px"></iframe>');
+    const framed = await snapshot();
+    assert.equal(framed.frames, 1);
+    assert.deepEqual(framed.elements.map((el) => el.label), ["Page"]);
+    const missing = await ready("#nowhere");
+    assert.equal(missing.met, false);
+    assert.equal(missing.frames, 1);
+    console.log("PASS snapshot and readiness report the visible frames they could not search");
+  }
+
   if (suite === "all" || suite === "audit-r1") {
     await set('<nav><a href="#a">Home</a><a href="#b">Pricing</a><button>Sign in</button></nav><main><button id="buy">Buy now</button></main><div role="dialog" style="position:fixed;left:0;right:0;bottom:0;height:80px;background:white"><button>Accept cookies</button></div>');
     const banner = await snapshot();
@@ -300,7 +408,7 @@ try {
     const visible = vm.runInNewContext(declaration + "; isElementVisibleInPage");
     const selectorCode = source.slice(source.indexOf("function visibleSelectorInPage("), source.indexOf("/** Poll an explicit condition"));
     const selector = vm.runInNewContext(selectorCode + "; visibleSelectorInPage");
-    const ready = (target) => evaluate(`(${selector.toString()})(${JSON.stringify(target)}, ${visible.toString()})`);
+    const ready = (target) => evaluate(`(${selector.toString()})(${JSON.stringify(target)}, ${visible.toString()}${domArgument})`);
     assert.equal((await ready("#toggle")).met, true);
     await set('<button>Page action</button><div id="transparent-dialog" role="dialog" aria-modal="true" style="position:fixed;inset:0;opacity:0"><button>Hidden modal control</button></div>');
     assert.equal((await snapshot()).scope, "page", "a fully transparent dialog is not a visible modal");

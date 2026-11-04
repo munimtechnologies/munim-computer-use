@@ -27,7 +27,9 @@ extension. No typing or Send action followed in that reproduction.
   shadow-root textarea did not reproduce the stall. It would be incorrect to
   claim that shadow DOM, focus handling, or Windows native injection caused it.
 - Issue 47: a separate `type_text`/Windows SendInput path; this reproduction
-  stalled before text injection. This change does not resolve issue 47.
+  stalled before text injection. This queue correction did not resolve issue 47.
+  Upstream has since merged its native typing/readback correction in `4778cac`
+  (PR #49), now included as the base of the reconciled PR #51.
 
 ## Durable liveness correction
 
