@@ -716,7 +716,7 @@ impl LinuxDesktop {
                     Some((
                         name.unwrap_or_default(),
                         role.unwrap_or(Role::Invalid),
-                        children.unwrap_or_default(),
+                        children.ok(),
                         state.ok(),
                         extents,
                         screen,
@@ -743,7 +743,7 @@ impl LinuxDesktop {
         let row = matches!(role, Role::ListItem | Role::TreeItem | Role::TableRow | Role::TableCell);
         // A showing leaf that is not a row is not checked against the view:
         // its container already was, and leaves are most of a tree.
-        let bounds = if depth > 0 && (!children.is_empty() || row || floats || not_showing) {
+        let bounds = if depth > 0 && (children.as_ref().is_none_or(|children| !children.is_empty()) || row || floats || not_showing) {
             extents.map(|(x, y, width, height)| Bounds::new(f64::from(x), f64::from(y), f64::from(width), f64::from(height)))
         } else {
             None
@@ -845,8 +845,29 @@ impl LinuxDesktop {
         // round trip per row.
         let ordered = matches!(role, Role::List | Role::ListBox | Role::Table | Role::Tree | Role::TreeTable);
         let mut seen_visible = false;
-        let total = children.len();
-        for (index, child) in children.into_iter().enumerate() {
+        // AT-SPI refuses GetChildren past 65,536 children (a 20,000-file
+        // folder in a four-column tree view). Those are walked one index at a
+        // time instead, which stops at the bottom of the view like the rest.
+        let by_index = match &children {
+            Some(_) => None,
+            None => self
+                .proxy(element)
+                .ok()
+                .and_then(|proxy| block_on(proxy.child_count()).ok())
+                .map(|count| count.max(0) as usize)
+                .filter(|count| *count > 0),
+        };
+        let mut children = children.unwrap_or_default().into_iter();
+        let total = by_index.unwrap_or(children.len());
+        for index in 0..total {
+            let child = match by_index {
+                Some(_) => self
+                    .proxy(element)
+                    .ok()
+                    .and_then(|proxy| block_on(proxy.get_child_at_index(index as i32)).ok()),
+                None => children.next(),
+            };
+            let Some(child) = child else { break };
             if walk.visited >= limits.max_elements {
                 walk.rows.push(format!(
                     "{}… truncated at {} elements — raise max_elements or target a child",
