@@ -611,7 +611,7 @@ function isElementVisibleInPage(el) {
   // Do not extend this exception to containers: a faded-out dialog is not ready.
   const transparentControl = el.matches('input,button,select,textarea');
   let escapedInert = false;
-  for (let node = el; node; node = node.parentElement) {
+  for (let node = el; node; node = node.parentElement || node.getRootNode()?.host) {
     if (node.hidden || node.getAttribute("aria-hidden")?.toLowerCase() === "true") return false;
     if (node.inert && !escapedInert) return false;
     // Native showModal() escapes ancestor inertness, not its own inert subtrees.
@@ -624,9 +624,44 @@ function isElementVisibleInPage(el) {
   return style.visibility !== "hidden" && style.visibility !== "collapse";
 }
 
+/** Query the document and its open shadow roots, preserving root-local CSS. */
+function queryOpenRoots(selector, root = document) {
+  const matches = [...root.querySelectorAll(selector)];
+  if (root.shadowRoot)
+    matches.push(...queryOpenRoots(selector, root.shadowRoot));
+  for (const host of root.querySelectorAll("*")) {
+    if (host.shadowRoot)
+      matches.push(...queryOpenRoots(selector, host.shadowRoot));
+  }
+  return matches;
+}
+
+function containsComposed(parent, child) {
+  for (
+    let node = child;
+    node;
+    node = node.parentElement || node.getRootNode()?.host
+  ) {
+    if (node === parent) return true;
+  }
+  return false;
+}
+
+function deepElementFromPoint(x, y) {
+  let hit = document.elementFromPoint(x, y);
+  for (;;) {
+    const inner = hit?.shadowRoot?.elementFromPoint(x, y);
+    if (!inner || inner === hit) return hit;
+    hit = inner;
+  }
+}
+
 /// A compact outline of the interactive elements on the page, with ids the
 /// agent can click. Mirrors the accessibility-tree tools on the desktop side.
 const SNAPSHOT_JS = `((options = {}) => {
+  const query = ${queryOpenRoots.toString()};
+  const contains = ${containsComposed.toString()};
+  const hitAt = ${deepElementFromPoint.toString()};
   const offset = options.offset ?? 0;
   const limit = options.limit ?? 250;
   const out = [];
@@ -635,7 +670,7 @@ const SNAPSHOT_JS = `((options = {}) => {
   // Clear the previous snapshot's indices first. An element hidden since then
   // would otherwise keep its old number, and querySelector, which returns the
   // first match, could send a click or a credential fill to it instead.
-  for (const old of document.querySelectorAll('[data-cu-idx]')) old.removeAttribute('data-cu-idx');
+  for (const old of query('[data-cu-idx]')) old.removeAttribute('data-cu-idx');
   // Accessibility-hidden/inert ancestors are not actionable. Do not use viewport
   // intersection here: indexed click scrolls reachable offscreen controls into view.
   const visible = ${isElementVisibleInPage.toString()};
@@ -643,7 +678,7 @@ const SNAPSHOT_JS = `((options = {}) => {
   // For custom dialogs, use paint order at their visible centre, not DOM order
   // or raw z-index (which is only meaningful inside a stacking context).
   // Modeless native dialogs and explicit aria-modal=false keep page controls.
-  const dialogs = Array.from(document.querySelectorAll('dialog:modal,[role=dialog]:not([aria-modal=false i]),[role=alertdialog]:not([aria-modal=false i]),[aria-modal=true i]')).filter((dialog) => {
+  const dialogs = Array.from(query('dialog:modal,[role=dialog]:not([aria-modal=false i]),[role=alertdialog]:not([aria-modal=false i]),[aria-modal=true i]')).filter((dialog) => {
     if (!visible(dialog)) return false;
     if (dialog.matches('dialog:modal,[aria-modal=true i]')) return true;
     // An implicit ARIA dialog is not automatically modal. Preserve full-page
@@ -651,22 +686,22 @@ const SNAPSHOT_JS = `((options = {}) => {
     const x = innerWidth / 2, y = innerHeight / 2;
     const r = dialog.getBoundingClientRect();
     if (x < r.left || x >= r.right || y < r.top || y >= r.bottom) return false;
-    const painted = document.elementsFromPoint(x, y);
-    return !painted.length || dialog.contains(painted[0]);
+    const painted = [hitAt(x, y)].filter(Boolean);
+    return !painted.length || contains(dialog, painted[0]);
   });
   const native = dialogs.filter((dialog) => dialog.matches(':modal'));
   // Keep nested custom dialogs inside the native top layer eligible too.
-  const candidates = dialogs.filter((dialog) => !native.length || native.some((layer) => layer.contains(dialog))).reverse();
+  const candidates = dialogs.filter((dialog) => !native.length || native.some((layer) => contains(layer, dialog))).reverse();
   let modal = null;
   for (const candidate of candidates) {
     const r = candidate.getBoundingClientRect();
     const left = Math.max(0, r.left), right = Math.min(innerWidth, r.right);
     const top = Math.max(0, r.top), bottom = Math.min(innerHeight, r.bottom);
     if (left >= right || top >= bottom) continue;
-    const painted = document.elementsFromPoint((left + right) / 2, (top + bottom) / 2);
+    const painted = [hitAt((left + right) / 2, (top + bottom) / 2)].filter(Boolean);
     // The first dialog in the hit-test stack wins, including nested dialogs.
     for (const hit of painted) {
-      const owner = candidates.find((dialog) => dialog.contains(hit));
+      const owner = candidates.find((dialog) => contains(dialog, hit));
       if (owner) { modal = owner; break; }
     }
     if (modal) break;
@@ -684,31 +719,31 @@ const SNAPSHOT_JS = `((options = {}) => {
   // the topmost element at its own centre.
   const floating = [];
   if (modal) {
-    for (const owner of modal.querySelectorAll('[aria-controls],[aria-owns]')) {
+    for (const owner of query('[aria-controls],[aria-owns]', modal)) {
       const ids = ((owner.getAttribute('aria-controls') || '') + ' ' + (owner.getAttribute('aria-owns') || '')).split(/\s+/);
       for (const id of ids) {
-        const root = id && document.getElementById(id);
-        if (root && !modal.contains(root)) floating.push(root);
+        const root = id && owner.getRootNode().getElementById(id);
+        if (root && !contains(modal, root)) floating.push(root);
       }
     }
     try {
-      for (const pop of document.querySelectorAll(':popover-open')) {
-        if (!modal.contains(pop) && !pop.contains(modal)) floating.push(pop);
+      for (const pop of query(':popover-open')) {
+        if (!contains(modal, pop) && !contains(pop, modal)) floating.push(pop);
       }
     } catch {}
   }
   const bounds = modal ? modal.getBoundingClientRect() : null;
   const inScope = (el) => {
-    if (!modal || modal.contains(el)) return true;
-    if (floating.some((root) => root.contains(el))) return true;
+    if (!modal || contains(modal, el)) return true;
+    if (floating.some((root) => contains(root, el))) return true;
     const r = el.getBoundingClientRect();
     const x = r.left + r.width / 2, y = r.top + r.height / 2;
     if (x < Math.max(0, bounds.left) || y < Math.max(0, bounds.top) ||
         x >= Math.min(innerWidth, bounds.right) || y >= Math.min(innerHeight, bounds.bottom)) return false;
-    const hit = document.elementFromPoint(x, y);
-    return !!hit && (hit === el || el.contains(hit));
+    const hit = hitAt(x, y);
+    return !!hit && (hit === el || contains(el, hit));
   };
-  for (const el of document.querySelectorAll(sel)) {
+  for (const el of query(sel)) {
     if (!inScope(el) || !visible(el)) continue;
     const index = i++;
     // Tag the full selected scope so indices stay global and earlier pages remain
@@ -1025,7 +1060,8 @@ async function hideCursor(tabId) {
 /// can, a probe records which trusted events land on it, so the click can
 /// check its hover reached the element before pressing anything.
 const CLICK_TARGET_JS = (index) => `(() => {
-  const el = document.querySelector('[data-cu-idx="${index}"]');
+  const query = ${queryOpenRoots.toString()};
+  const el = query('[data-cu-idx="${index}"]')[0];
   if (!el) return { ok: false, reason: 'element ${index} is no longer on the page' };
   // Instant, so a page with smooth scrolling is not measured mid-flight.
   el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
@@ -1034,7 +1070,7 @@ const CLICK_TARGET_JS = (index) => `(() => {
   const y = r.top + r.height / 2;
   const label = (el.getAttribute('aria-label') || el.innerText || el.getAttribute('title') || '')
     .replace(/\\s+/g, ' ').trim().slice(0, 60);
-  const hit = document.elementFromPoint(x, y);
+  const hit = (${deepElementFromPoint.toString()})(x, y);
   const shown = document.visibilityState === 'visible';
   const reachable = shown && !!hit && (hit === el || el.contains(hit));
   const found = { ok: true, tag: el.tagName.toLowerCase(), label, href: el.href || null, x, y, reachable };
@@ -1064,7 +1100,8 @@ const CLICK_PROBE_JS = (finish) => `(() => {
 /// respond; and, like a real press, a cancelled pointerdown suppresses the
 /// mouse events and a cancelled mousedown keeps focus where it was.
 const CLICK_EVENTS_JS = (index) => `(() => {
-  const el = document.querySelector('[data-cu-idx="${index}"]');
+  const query = ${queryOpenRoots.toString()};
+  const el = query('[data-cu-idx="${index}"]')[0];
   if (!el) return { ok: false, reason: 'element ${index} is no longer on the page' };
   const r = el.getBoundingClientRect();
   const x = r.left + r.width / 2;
@@ -1469,11 +1506,11 @@ function testsValueAttribute(selector) {
   return /\[\s*(?:[\w*-]*\|)?value\s*(?:[~|^$*]?=|\])/i.test(plain);
 }
 
-/** A visible match in the top-level document, not arbitrary application readiness. */
-function visibleSelectorInPage(selector, visible) {
+/** A visible match in the document or an open shadow root; frames are excluded. */
+function visibleSelectorInPage(selector, visible, query = document.querySelectorAll.bind(document)) {
   let matches;
   try {
-    matches = document.querySelectorAll(selector);
+    matches = query(selector);
   } catch {
     return { error: "invalid CSS selector" };
   }
@@ -1500,7 +1537,7 @@ async function waitForReadiness(p) {
     let res;
     try {
       res = await send(p.tabId, "Runtime.evaluate", {
-        expression: `(${visibleSelectorInPage.toString()})(${JSON.stringify(p.waitForSelector)}, ${isElementVisibleInPage.toString()})`,
+        expression: `(${visibleSelectorInPage.toString()})(${JSON.stringify(p.waitForSelector)}, ${isElementVisibleInPage.toString()}, ${queryOpenRoots.toString()})`,
         returnByValue: true,
       });
     } catch (error) {
@@ -1783,11 +1820,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 /** Describe snapshot elements by index, inside the page, for the credential prompt. */
-function describeFieldsInPage(indices) {
+function describeFieldsInPage(indices, query = document.querySelectorAll.bind(document)) {
   return indices.map((index) => {
-    const el = document.querySelector(`[data-cu-idx="${index}"]`);
+    const el = query(`[data-cu-idx="${index}"]`)[0];
     if (!el) return { index, found: false };
-    const byId = el.id ? document.querySelector(`label[for="${CSS.escape(el.id)}"]`) : null;
+    const byId = el.id ? el.getRootNode().querySelector(`label[for="${CSS.escape(el.id)}"]`) : null;
     const label = (el.getAttribute("aria-label") || byId?.innerText || el.closest("label")?.innerText ||
       el.getAttribute("placeholder") || el.getAttribute("name") || el.getAttribute("autocomplete") || "")
       .replace(/\s+/g, " ").trim().slice(0, 60);
@@ -1800,11 +1837,11 @@ function describeFieldsInPage(indices) {
  * Put values into snapshot elements the way typing would, so frameworks that
  * listen for input events (React, Vue) see the change. Runs inside the page.
  */
-function fillFieldsInPage(entries) {
+function fillFieldsInPage(entries, query = document.querySelectorAll.bind(document)) {
   const filled = [];
   const missing = [];
   for (const { index, value } of entries) {
-    const el = document.querySelector(`[data-cu-idx="${index}"]`);
+    const el = query(`[data-cu-idx="${index}"]`)[0];
     if (!el) {
       missing.push(index);
       continue;
@@ -1844,7 +1881,7 @@ async function requestCredentials(clientId, p) {
   const tab = await chrome.tabs.get(p.tabId);
   const url = tab.url || "";
   const described = await send(p.tabId, "Runtime.evaluate", {
-    expression: `(${describeFieldsInPage.toString()})(${JSON.stringify(indices)})`,
+    expression: `(${describeFieldsInPage.toString()})(${JSON.stringify(indices)}, ${queryOpenRoots.toString()})`,
     returnByValue: true,
   });
   if (described?.exceptionDetails) throw new Error("could not inspect the page's fields");
@@ -1888,7 +1925,7 @@ async function requestCredentials(clientId, p) {
     .filter((field) => typeof answer.values[field.index] === "string")
     .map((field) => ({ index: field.index, value: answer.values[field.index] }));
   const res = await send(p.tabId, "Runtime.evaluate", {
-    expression: `(${fillFieldsInPage.toString()})(${JSON.stringify(entries)})`,
+    expression: `(${fillFieldsInPage.toString()})(${JSON.stringify(entries)}, ${queryOpenRoots.toString()})`,
     returnByValue: true,
     userGesture: true,
   });

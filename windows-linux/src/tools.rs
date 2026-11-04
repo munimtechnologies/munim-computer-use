@@ -878,7 +878,7 @@ fn all_tool_defs() -> Value {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 2000,
-                        "description": "Wait for any visible element matching this CSS selector in the top-level document (not frames or shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
+                        "description": "Wait for any visible element matching this CSS selector in the top-level document and its open shadow roots (not child frames or closed shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
                     },
                     "wait_timeout_ms": {
                         "type": "integer",
@@ -976,7 +976,7 @@ fn all_tool_defs() -> Value {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 2000,
-                        "description": "Wait for any visible element matching this CSS selector in the top-level document (not frames or shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
+                        "description": "Wait for any visible element matching this CSS selector in the top-level document and its open shadow roots (not child frames or closed shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
                     },
                     "wait_timeout_ms": {
                         "type": "integer",
@@ -1023,7 +1023,7 @@ fn all_tool_defs() -> Value {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 2000,
-                        "description": "Wait for any visible element matching this CSS selector in the top-level document (not frames or shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
+                        "description": "Wait for any visible element matching this CSS selector in the top-level document and its open shadow roots (not child frames or closed shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
                     },
                     "wait_timeout_ms": {
                         "type": "integer",
@@ -1125,7 +1125,7 @@ fn all_tool_defs() -> Value {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 2000,
-                        "description": "Wait for any visible element matching this CSS selector in the top-level document (not frames or shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
+                        "description": "Wait for any visible element matching this CSS selector in the top-level document and its open shadow roots (not child frames or closed shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
                     },
                     "wait_timeout_ms": {
                         "type": "integer",
@@ -1194,7 +1194,7 @@ fn all_tool_defs() -> Value {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 2000,
-                        "description": "Wait for any visible element matching this CSS selector in the top-level document (not frames or shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
+                        "description": "Wait for any visible element matching this CSS selector in the top-level document and its open shadow roots (not child frames or closed shadow roots). On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
                     },
                     "wait_timeout_ms": {
                         "type": "integer",

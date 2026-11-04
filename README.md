@@ -340,14 +340,15 @@ the same wait **without performing an action**:
  "wait_for_selector": "[role=dialog] button", "wait_timeout_ms": 3000}
 ```
 
-The extension polls for any matching visible element in the top-level document,
+The extension polls for any matching visible element in the top-level document and its open shadow roots,
 independently of resource loading, including same-document rendering. It shares
 the snapshot's visibility rules: at least 2×2 CSS pixels; no hidden, aria-hidden,
 inert or fully transparent ancestor. Self-transparent native form controls remain
 available for styled upload/checkbox hit targets; transparent containers do not.
 This is not a guarantee of clickability or
-lack of occlusion. Frames and shadow
-roots are not searched. Choose a selector specific to the **new expected UI**;
+lack of occlusion. Child frames and closed shadow
+roots are not searched. CSS selectors are evaluated separately in each root; they
+do not cross a shadow boundary. Choose a selector specific to the **new expected UI**;
 an element already present can satisfy it immediately. No arbitrary page script
 is accepted, and a selector may not test the `value` attribute: React mirrors a
 controlled input's value there, password fields included, so a wait could

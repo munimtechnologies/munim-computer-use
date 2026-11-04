@@ -112,7 +112,7 @@ try {
     ? ["CLICK_EVENTS_JS", "\nasync function evaluateValue("]
     : ["CLICK_JS", "\n/// Click a snapshotted element"];
   const clickDeclaration = source.slice(source.indexOf(`const ${clickName} =`), source.indexOf(clickEnd));
-  const click = vm.runInNewContext(clickDeclaration + `\n${clickName}`);
+  const click = vm.runInNewContext(declaration + clickDeclaration + `\n${clickName}`);
   const snapshot = (options = {}) => evaluate(expression.slice(0, -2) + `(${JSON.stringify(options)})`);
   const set = (html) => evaluate(`document.body.innerHTML = ${JSON.stringify(html)}; true`);
   const buttons = (count, prefix = "Background") => Array.from({ length: count }, (_, i) => `<button>${prefix} ${i}</button>`).join("");
@@ -123,6 +123,34 @@ try {
     assert.deepEqual(modal.elements.map((el) => el.label), ["Domain", "Next", "Verify"]);
     assert.equal(modal.scope, "modal");
     console.log("PASS appended modal excludes 260 hidden background controls");
+    // LinkedIn's interop-outlet: invitation lives in a top-document open shadow root.
+    await set('<button id="background">Background</button><div id="interop-outlet"></div>');
+    await snapshot();
+    await evaluate(`(() => {
+      const root = document.getElementById('interop-outlet').attachShadow({mode:'open'});
+      root.innerHTML = '<div><div role="dialog" style="position:fixed;inset:20%;background:white"><button id="note">Add a note</button><button>Send without a note</button><div id="nested"></div></div></div>';
+      root.getElementById('nested').attachShadow({mode:'open'}).innerHTML = '<button>Nested control</button>';
+      root.getElementById('note').onclick = () => { window.noteClicks = (window.noteClicks || 0) + 1; };
+    })()`);
+    const shadow = await snapshot();
+    assert.equal(shadow.scope, 'modal');
+    assert.deepEqual(shadow.elements.map(el => el.label), ['Add a note','Send without a note','Nested control']);
+    assert.equal(await evaluate(`document.getElementById('background').hasAttribute('data-cu-idx')`), false);
+    const targetScript = vm.runInNewContext(declaration + clickDeclaration + '\n' + source.slice(source.indexOf('const CLICK_TARGET_JS'), source.indexOf('const CLICK_PROBE_JS')) + '\nCLICK_TARGET_JS');
+    assert.equal((await evaluate(targetScript(0))).ok, true);
+    assert.equal((await evaluate(click(0))).ok, true);
+    assert.equal(await evaluate('window.noteClicks'), 1);
+    await evaluate(`document.getElementById('interop-outlet').style.display = 'none'`);
+    await snapshot();
+    assert.equal(await evaluate(`document.getElementById('interop-outlet').shadowRoot.getElementById('note').hasAttribute('data-cu-idx')`), false);
+    assert.deepEqual((await snapshot()).elements.map(el => el.label), ['Background']);
+    await evaluate(`document.getElementById('interop-outlet').style.display = ''`);
+    await snapshot();
+    await evaluate(`document.getElementById('interop-outlet').shadowRoot.querySelector('[role=dialog]').remove()`);
+    await snapshot();
+    assert.equal(await evaluate(`document.getElementById('interop-outlet').shadowRoot.querySelector('[data-cu-idx]') === null`), true);
+    console.log('PASS LinkedIn open-shadow modal, nested controls, indexed click, host visibility and stale indices');
+    await set(`<main aria-hidden="true">${buttons(260)}</main><div role="dialog" aria-modal="true" style="position:fixed;inset:0;background:white"><input aria-label="Domain"><button>Next</button><button>Verify</button></div>`);
     // Keep evaluating the original target after activating a different tab.
     const foreground = await command("Target.createTarget", { url: "about:blank" });
     await command("Target.activateTarget", { targetId: foreground.targetId });
@@ -278,6 +306,12 @@ try {
       between("const sleep =", "/**\n * The page's readable text"), context,
     );
     const extension = (code) => vm.runInContext(code, context);
+    await set('<div id="interop-outlet"></div>');
+    await evaluate(`document.getElementById('interop-outlet').attachShadow({mode:'open'}).innerHTML = '<div role="dialog" style="position:fixed;inset:20%;background:white"><button>Add a note</button></div>'`);
+    assert.equal((await extension("waitForReadiness({tabId:1, waitForSelector:'[role=dialog]', waitTimeoutMs:0})")).status, 'met');
+    await evaluate(`document.getElementById('interop-outlet').inert = true`);
+    assert.equal((await extension("waitForReadiness({tabId:1, waitForSelector:'[role=dialog]', waitTimeoutMs:0})")).status, 'timeout');
+    console.log('PASS readiness searches open shadow roots and respects host inertness');
     const openDelayedDialog = async () => {
       await set(`<button id="open">Open dialog</button><main aria-hidden="true">${buttons(260)}</main>`);
       await evaluate(`(() => {
