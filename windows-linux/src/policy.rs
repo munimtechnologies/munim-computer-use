@@ -8,6 +8,12 @@
 //!   "sites": { "bank.example": "block", "mail.google.com": "ask", "*": "allow" } }
 //! ```
 //!
+//! `"foreground"` (one rule, not a map) says whether the agent may take the
+//! screen from the user: bring a window to the front, borrow the foreground
+//! for a keystroke, move the real pointer, or raise a Chrome tab's window.
+//! Under `block` those calls refuse with `foreground_required` and work that
+//! runs in the background still goes ahead; a tool argument cannot override it.
+//!
 //! Each rule is `allow`, `ask` (the user approves once per server process) or
 //! `block`. Apps match their name or id exactly, ignoring case; sites match a
 //! host and its subdomains, and the most specific pattern wins. `*` sets the
@@ -58,6 +64,8 @@ impl Rule {
 pub struct Policy {
     apps: Vec<(String, Rule)>,
     sites: Vec<(String, Rule)>,
+    /// Taking the foreground or the real pointer; unset means allow.
+    foreground: Option<Rule>,
     /// Why the file could not be used, when it exists but is not valid.
     error: Option<String>,
 }
@@ -66,7 +74,7 @@ impl Policy {
     pub fn parse(text: &str) -> std::result::Result<Self, String> {
         let root: Value = serde_json::from_str(text).map_err(|error| format!("not valid JSON: {error}"))?;
         let Some(root) = root.as_object() else {
-            return Err("the top level must be an object with \"apps\" and/or \"sites\"".into());
+            return Err("the top level must be an object with \"apps\", \"sites\" and/or \"foreground\"".into());
         };
         let section = |key: &str| -> std::result::Result<Vec<(String, Rule)>, String> {
             match root.get(key) {
@@ -83,7 +91,15 @@ impl Policy {
                 Some(_) => Err(format!("\"{key}\" must be an object of pattern → rule")),
             }
         };
-        Ok(Self { apps: section("apps")?, sites: section("sites")?, error: None })
+        let foreground = match root.get("foreground") {
+            None | Some(Value::Null) => None,
+            Some(rule) => Some(
+                rule.as_str()
+                    .and_then(Rule::parse)
+                    .ok_or("\"foreground\" must be \"allow\", \"ask\" or \"block\"")?,
+            ),
+        };
+        Ok(Self { apps: section("apps")?, sites: section("sites")?, foreground, error: None })
     }
 
     /// The rule for an app, matched on its name or id.
@@ -124,6 +140,15 @@ impl Policy {
 
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    /// Whether the agent may take the foreground or the real pointer. A broken
+    /// file blocks it, like everything else the file could have covered.
+    pub fn foreground_rule(&self) -> Rule {
+        if self.error.is_some() {
+            return Rule::Block;
+        }
+        self.foreground.unwrap_or(Rule::Allow)
     }
 }
 
@@ -211,6 +236,52 @@ pub fn check_app(name: &str, id: &str) -> Result<()> {
     }
 }
 
+/// Check the user's `"foreground"` rule before `action` (what is about to take
+/// the screen, in words) takes the foreground window or the real pointer. Called
+/// before anything moves, so a refusal leaves the user's screen as it was.
+/// Remote control is exempt: there the user is the one driving.
+pub fn check_foreground(action: &str) -> Result<()> {
+    if crate::identity::remote_control() {
+        return Ok(());
+    }
+    let policy = current();
+    match policy.foreground_rule() {
+        Rule::Allow => Ok(()),
+        Rule::Block => Err(foreground_required(action, policy.error())),
+        Rule::Ask => {
+            const KEY: &str = "\u{0}foreground";
+            if approved().lock().unwrap_or_else(|poison| poison.into_inner()).contains(KEY) {
+                return Ok(());
+            }
+            match confirm(
+                "Computer Use",
+                &format!(
+                    "Let the agent take over the screen?\n\nTo {action}, it needs to bring a window to the front or move your pointer. Your Computer Use policy asks first. Allowing it lasts until this agent session ends."
+                ),
+            ) {
+                Some(true) => {
+                    approved().lock().unwrap_or_else(|poison| poison.into_inner()).insert(KEY.to_string());
+                    Ok(())
+                }
+                Some(false) => Err(DesktopError::new(format!(
+                    "foreground_required: the user declined to let the agent take over the screen to {action}; nothing was done. Keep to actions that work in the background, or ask the user to do this step"
+                ))),
+                None => Err(foreground_required(action, None)),
+            }
+        }
+    }
+}
+
+fn foreground_required(action: &str, broken: Option<&str>) -> DesktopError {
+    let why = match broken {
+        Some(error) => format!("{error}, which keeps the agent in the background until it is fixed"),
+        None => "the user's Computer Use policy keeps the agent in the background (\"foreground\" is not \"allow\")".to_string(),
+    };
+    DesktopError::new(format!(
+        "foreground_required: to {action} the agent would have to take the foreground window or the real pointer, and {why}; nothing was done. Use an action that works in the background (an element_id click, set_value, the browser_* tools), or ask the user to do this step or change the rule"
+    ))
+}
+
 /// Seconds an approval prompt waits before counting as a refusal.
 #[cfg(any(windows, target_os = "linux"))]
 const PROMPT_TIMEOUT_SECS: u64 = 120;
@@ -291,6 +362,21 @@ mod tests {
         assert!(error.contains("\"allow\", \"ask\" or \"block\""), "{error}");
         assert!(Policy::parse("[]").is_err());
         assert!(Policy::parse("{not json").is_err());
+    }
+
+    #[test]
+    fn foreground_is_one_rule_that_defaults_to_allow() {
+        assert_eq!(Policy::parse("{}").unwrap().foreground_rule(), Rule::Allow);
+        assert_eq!(Policy::parse(r#"{"foreground": "block"}"#).unwrap().foreground_rule(), Rule::Block);
+        assert_eq!(Policy::parse(r#"{"foreground": "Ask", "apps": {}}"#).unwrap().foreground_rule(), Rule::Ask);
+        let error = Policy::parse(r#"{"foreground": "never"}"#).unwrap_err();
+        assert!(error.contains("\"foreground\" must be"), "{error}");
+        assert!(Policy::parse(r#"{"foreground": {"Chrome": "block"}}"#).is_err());
+        // A broken file keeps the agent in the background too.
+        let broken = Policy { error: Some("bad".into()), ..Policy::default() };
+        assert_eq!(broken.foreground_rule(), Rule::Block);
+        let message = super::foreground_required("bring Chrome to the front", None).to_string();
+        assert!(message.starts_with("foreground_required: to bring Chrome to the front"), "{message}");
     }
 
     #[test]

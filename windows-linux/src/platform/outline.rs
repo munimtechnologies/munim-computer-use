@@ -200,6 +200,40 @@ pub fn system_prompt_error(id: u32) -> DesktopError {
     ))
 }
 
+/// A window from another app that is on top where a click would land.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Cover {
+    /// The covering window's program file, such as `PowerToys.exe`.
+    pub program: Option<String>,
+    /// Its window class: identifies an overlay without reading its title,
+    /// which can hold private text.
+    pub class: String,
+    /// Always on top, so bringing the target forward cannot lift it above.
+    pub topmost: bool,
+    /// Whether the target's window is already the foreground window.
+    pub target_in_front: bool,
+}
+
+/// Why a coordinate action was refused: which window covers the point, and
+/// what can get past it (#50).
+pub fn covered_error(id: u32, x: f64, y: f64, cover: &Cover) -> DesktopError {
+    let program = cover.program.as_deref().unwrap_or("an app this server cannot identify");
+    let what = format!(
+        "{}window of {program} (class {})",
+        if cover.topmost { "an always-on-top " } else { "a " },
+        if cover.class.is_empty() { "unknown" } else { &cover.class }
+    );
+    let fix = if cover.topmost || cover.target_in_front {
+        "its app is already in front, so activate_app will not help: move or close that window, or use an \
+         action that works through accessibility (set_value, or type_text and press_key after focusing it)"
+    } else {
+        "bring its app forward with activate_app, or use an action that works through accessibility"
+    };
+    DesktopError::new(format!(
+        "e{id} is covered at ({x:.0}, {y:.0}) by {what}, so nothing was clicked; {fix}"
+    ))
+}
+
 /// When to read on-screen text with OCR (`get_app_state`'s `ocr`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OcrMode {
@@ -371,6 +405,18 @@ pub fn truncate(value: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_covered_click_names_the_window_on_top() {
+        let cover = Cover { program: Some("Overlay.exe".into()), class: "OverlayWnd".into(), topmost: true, target_in_front: true };
+        let message = covered_error(9, 1840.0, 62.4, &cover).to_string();
+        assert!(message.starts_with("e9 is covered at (1840, 62) by an always-on-top window of Overlay.exe (class OverlayWnd)"), "{message}");
+        assert!(message.contains("activate_app will not help"), "{message}");
+        let behind = Cover { program: None, class: String::new(), topmost: false, target_in_front: false };
+        let message = covered_error(3, 10.0, 20.0, &behind).to_string();
+        assert!(message.contains("a window of an app this server cannot identify (class unknown)"), "{message}");
+        assert!(message.contains("bring its app forward with activate_app"), "{message}");
+    }
+
     use super::*;
 
     fn b(x: f64, y: f64, w: f64, h: f64) -> Bounds {
