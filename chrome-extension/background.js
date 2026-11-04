@@ -685,9 +685,23 @@ const SNAPSHOT_JS = `((options = {}) => {
     // overlays, but never let a corner widget or bottom banner hide the page.
     const x = innerWidth / 2, y = innerHeight / 2;
     const r = dialog.getBoundingClientRect();
-    if (x < r.left || x >= r.right || y < r.top || y >= r.bottom) return false;
-    const painted = [hitAt(x, y)].filter(Boolean);
-    return !painted.length || contains(dialog, painted[0]);
+    if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) {
+      const painted = [hitAt(x, y)].filter(Boolean);
+      if (!painted.length || contains(dialog, painted[0])) return true;
+    }
+    // A blocking backdrop can cover the viewport while its dialog sits near
+    // the top. Require a fixed, painted ancestor instead of treating every
+    // focused dialog (including modeless chat widgets) as modal.
+    for (let node = dialog.parentElement || dialog.getRootNode()?.host;
+         node; node = node.parentElement || node.getRootNode()?.host) {
+      const box = node.getBoundingClientRect();
+      const style = getComputedStyle(node);
+      if (style.position !== 'fixed' || style.pointerEvents === 'none' ||
+          box.left > 1 || box.top > 1 || box.right < innerWidth - 1 || box.bottom < innerHeight - 1) continue;
+      const hit = hitAt(x, y);
+      if (hit && contains(node, hit)) return true;
+    }
+    return false;
   });
   const native = dialogs.filter((dialog) => dialog.matches(':modal'));
   // Keep nested custom dialogs inside the native top layer eligible too.

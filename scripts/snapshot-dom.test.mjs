@@ -132,6 +132,14 @@ try {
       root.getElementById('nested').attachShadow({mode:'open'}).innerHTML = '<button>Nested control</button>';
       root.getElementById('note').onclick = () => { window.noteClicks = (window.noteClicks || 0) + 1; };
     })()`);
+    await evaluate(`(() => {
+      const root = document.getElementById('interop-outlet').shadowRoot;
+      const dialog = root.querySelector('[role=dialog]');
+      const backdrop = document.createElement('div');
+      backdrop.style.cssText = 'position:fixed;inset:0;background:#0008';
+      dialog.style.cssText = 'position:absolute;left:30%;right:30%;top:20px;height:120px;background:white';
+      dialog.replaceWith(backdrop); backdrop.append(dialog);
+    })()`);
     const shadow = await snapshot();
     assert.equal(shadow.scope, 'modal');
     assert.deepEqual(shadow.elements.map(el => el.label), ['Add a note','Send without a note','Nested control']);
