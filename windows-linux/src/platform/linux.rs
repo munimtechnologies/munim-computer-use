@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use atspi::proxy::accessible::AccessibleProxy;
 use atspi::{connection::AccessibilityConnection, CoordType, Role, State};
-use futures_lite::future::block_on;
+use futures_lite::future::{block_on, zip};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
     AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask, GetKeyboardMappingReply,
@@ -142,11 +142,15 @@ impl LinuxDesktop {
         element: &ElementRef,
     ) -> Result<AccessibleProxy<'a>> {
         let connection = self.bus()?;
+        // No property cache: a cached proxy subscribes to PropertiesChanged
+        // and fetches every property when it is built, two extra bus round
+        // trips per element for the one property (Name) a read wants.
         block_on(
             AccessibleProxy::builder(connection.connection())
                 .destination(element.bus.clone())
                 .and_then(|builder| builder.path(element.path.clone()))
                 .map_err(|error| DesktopError::new(format!("bad element address: {error}")))?
+                .cache_properties(zbus::proxy::CacheProperties::No)
                 .build(),
         )
         .map_err(|error| DesktopError::new(format!("element is gone: {error}")))
@@ -169,18 +173,17 @@ impl LinuxDesktop {
         Ok(reference)
     }
 
-    /// An element's rectangle in the given coordinates, when it has one.
-    fn extents(&self, element: &ElementRef, coords: CoordType) -> Option<Bounds> {
-        let component = block_on(
+    /// A Component proxy for an element, built without a bus round trip.
+    fn component(&self, element: &ElementRef) -> Option<atspi::proxy::component::ComponentProxy<'_>> {
+        block_on(
             atspi::proxy::component::ComponentProxy::builder(self.bus().ok()?.connection())
                 .destination(element.bus.clone())
                 .and_then(|builder| builder.path(element.path.clone()))
                 .ok()?
+                .cache_properties(zbus::proxy::CacheProperties::No)
                 .build(),
         )
-        .ok()?;
-        let (x, y, width, height) = block_on(component.get_extents(coords)).ok()?;
-        Some(Bounds::new(f64::from(x), f64::from(y), f64::from(width), f64::from(height)))
+        .ok()
     }
 
     /// Screen rectangle centre of an element, via the Component interface.
@@ -191,6 +194,7 @@ impl LinuxDesktop {
                 .destination(element.bus.clone())
                 .and_then(|builder| builder.path(element.path.clone()))
                 .map_err(|error| DesktopError::new(format!("bad element address: {error}")))?
+                .cache_properties(zbus::proxy::CacheProperties::No)
                 .build(),
         )
         .map_err(|error| DesktopError::new(format!("element has no geometry: {error}")))?;
@@ -220,6 +224,7 @@ impl LinuxDesktop {
                 .destination(element.bus.clone())
                 .and_then(|builder| builder.path(element.path.clone()))
                 .map_err(|error| DesktopError::new(format!("bad element address: {error}")))?
+                .cache_properties(zbus::proxy::CacheProperties::No)
                 .build(),
         )
         .map_err(|error| DesktopError::new(format!("element is not editable: {error}")))?;
@@ -256,6 +261,7 @@ impl LinuxDesktop {
                 .destination(element.bus.clone())
                 .and_then(|builder| builder.path(element.path.clone()))
                 .map_err(|error| DesktopError::new(format!("bad element address: {error}")))?
+                .cache_properties(zbus::proxy::CacheProperties::No)
                 .build(),
         )
         .map_err(|error| DesktopError::new(format!("element exposes no text: {error}")))
@@ -291,6 +297,7 @@ impl LinuxDesktop {
                 .destination(element.bus.clone())
                 .and_then(|builder| builder.path(element.path.clone()))
                 .map_err(|error| DesktopError::new(format!("bad element address: {error}")))?
+                .cache_properties(zbus::proxy::CacheProperties::No)
                 .build(),
         )
         .map_err(|error| DesktopError::new(format!("element cannot take focus: {error}")))?;
@@ -379,6 +386,7 @@ impl LinuxDesktop {
                 .destination(element.bus.clone())
                 .and_then(|builder| builder.path(element.path.clone()))
                 .map_err(|error| DesktopError::new(format!("bad element address: {error}")))?
+                .cache_properties(zbus::proxy::CacheProperties::No)
                 .build(),
         )
         .map_err(|error| DesktopError::new(format!("element exposes no actions: {error}")))?;
@@ -678,20 +686,45 @@ impl LinuxDesktop {
         }
         // Read everything the proxy can tell us, then drop it: it borrows
         // `self`, and the registry below needs that borrow released.
-        let Some((name, role, children, state)) = ({
+        // The five requests go out together and their answers are awaited
+        // together: one round trip per element instead of five. The rectangle
+        // is asked for whether or not it is used below; asking costs the app
+        // little, waiting for it separately cost a round trip.
+        let component = (depth > 0)
+            .then(|| self.component(element))
+            .flatten();
+        let Some((name, role, children, state, extents, screen)) = ({
             match self.proxy(element) {
                 Ok(proxy) => {
-                    let name = block_on(proxy.name()).unwrap_or_default();
-                    let role = block_on(proxy.get_role()).unwrap_or(Role::Invalid);
-                    let children = block_on(proxy.get_children()).unwrap_or_default();
-                    let state = block_on(proxy.get_state()).ok();
-                    Some((name, role, children, state))
+                    let component = component.as_ref();
+                    let rect = |coords| async move {
+                        match component {
+                            Some(component) => component.get_extents(coords).await.ok(),
+                            None => None,
+                        }
+                    };
+                    let ((name, role), ((children, state), (extents, screen))) = block_on(zip(
+                        zip(proxy.name(), proxy.get_role()),
+                        zip(
+                            zip(proxy.get_children(), proxy.get_state()),
+                            zip(rect(CoordType::Window), rect(CoordType::Screen)),
+                        ),
+                    ));
+                    Some((
+                        name.unwrap_or_default(),
+                        role.unwrap_or(Role::Invalid),
+                        children.unwrap_or_default(),
+                        state.ok(),
+                        extents,
+                        screen,
+                    ))
                 }
                 Err(_) => None,
             }
         }) else {
             return Visit::Nothing;
         };
+        drop(component);
         walk.visited += 1;
 
         let has = |flag: State| state.is_some_and(|state| state.contains(flag));
@@ -705,11 +738,10 @@ impl LinuxDesktop {
         // nothing either way.
         let not_showing = state.is_some() && !has(State::Showing);
         let row = matches!(role, Role::ListItem | Role::TreeItem | Role::TableRow | Role::TableCell);
-        // The rectangle costs a round trip. A showing leaf that is not a row
-        // goes without: its container was already checked against the view,
-        // and leaves are most of a tree.
+        // A showing leaf that is not a row is not checked against the view:
+        // its container already was, and leaves are most of a tree.
         let bounds = if depth > 0 && (!children.is_empty() || row || floats || not_showing) {
-            self.extents(element, CoordType::Window)
+            extents.map(|(x, y, width, height)| Bounds::new(f64::from(x), f64::from(y), f64::from(width), f64::from(height)))
         } else {
             None
         };
@@ -764,7 +796,8 @@ impl LinuxDesktop {
             }
             // Screen bounds let a model fall back to coordinates when an element
             // has no usable action, and make a wrong-looking click diagnosable.
-            if interactive && let Ok((x, y)) = self.center(element) {
+            if interactive && let Some((x, y, width, height)) = screen.filter(|(_, _, w, h)| *w > 0 && *h > 0) {
+                let (x, y) = (f64::from(x) + f64::from(width) / 2.0, f64::from(y) + f64::from(height) / 2.0);
                 row.push_str(&format!(" @({x:.0},{y:.0})"));
             }
             walk.rows.push(row);
@@ -817,7 +850,7 @@ impl LinuxDesktop {
             .destination("org.a11y.atspi.Registry")
             .and_then(|builder| builder.path("/org/a11y/atspi/accessible/root"))
             .map_err(|error| DesktopError::new(format!("bad registry address: {error}")))?;
-        let root = block_on(root.build())
+        let root = block_on(root.cache_properties(zbus::proxy::CacheProperties::No).build())
             .map_err(|error| DesktopError::new(format!("no a11y registry: {error}")))?;
 
         let children = block_on(root.get_children())
