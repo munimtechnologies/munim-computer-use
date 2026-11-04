@@ -1734,6 +1734,9 @@ func toolActivateApp(_ args: [String: Any]) -> String {
     guard let query = args["app"] as? String else { return "error: missing required argument 'app'" }
     guard let resolved = resolveApp(query) else { return "error: no running app matching \(query)" }
     if let refusal = PolicyStore.checkApp(resolved.app) { return refusal }
+    if let refusal = PolicyStore.checkForeground("bring \(resolved.app.localizedName ?? query) to the front") {
+        return refusal
+    }
     // Requests are handled off the main thread; NSRunningApplication.activate is
     // AppKit and belongs on main.
     DispatchQueue.main.sync { resolved.app.activate(options: []) }
@@ -2425,14 +2428,17 @@ func refuseSecureFieldInput(_ element: AXUIElement, _ id: String) -> String? {
     // the agent picks the task back up afterwards.
     AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
     var handedBackTo = "the app"
+    // A user who keeps the agent in the background (#55) brings it forward
+    // themselves; the field is focused either way.
+    let raise = RemoteControl.isEnabled || PolicyStore.current().foregroundRule == .allow
     if let pid = pidOf(element),
         let app = NSRunningApplication(processIdentifier: pid)
     {
-        DispatchQueue.main.sync { app.activate(options: []) }
+        if raise { DispatchQueue.main.sync { app.activate(options: []) } }
         handedBackTo = app.localizedName ?? handedBackTo
     }
     return "handed control to the user: \(id) is a password field, so it was focused in "
-        + "\(handedBackTo) and brought to the front for them to type into. The credential is "
+        + "\(handedBackTo)\(raise ? " and brought to the front" : " (left where it is: the user's policy keeps the agent in the background)") for them to type into. The credential is "
         + "deliberately not routed through the model. Tell the user it is ready, wait for them to "
         + "say they are done, then continue — do not retry this call. "
         + "(COMPUTER_USE_ALLOW_SECURE_FIELD_INPUT=1 lets the agent type throwaway credentials.)"
@@ -3128,6 +3134,12 @@ func toolBrowserSelectTab(_ args: [String: Any]) -> String {
         }
         var params: [String: Any] = ["tabId": tabId]
         if let force = args["bring_to_front"] as? Bool { params["bringToFront"] = force }
+        // Raising the tab's window takes the screen from the user: the one
+        // browser call the user's "foreground" rule covers (#55).
+        if args["bring_to_front"] as? Bool == true,
+           let refusal = PolicyStore.checkForeground("raise the tab's Chrome window over what the user is doing") {
+            return refusal
+        }
         return bridgeText(browserSessionCall("select_tab", params, args: args)) { payload in
             describeSelectTab(tabId, payload)
         }

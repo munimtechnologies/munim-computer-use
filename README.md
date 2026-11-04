@@ -306,7 +306,8 @@ You decide which apps and websites the agent may touch. Put a `policy.json` in t
 ```json
 {
   "apps": { "Keychain Access": "block", "com.apple.MobileSMS": "ask" },
-  "sites": { "bank.example": "block", "mail.google.com": "ask", "*": "allow" }
+  "sites": { "bank.example": "block", "mail.google.com": "ask", "*": "allow" },
+  "foreground": "allow"
 }
 ```
 
@@ -314,6 +315,13 @@ You decide which apps and websites the agent may touch. Put a `policy.json` in t
 - **Apps** match their name or bundle id, ignoring case. The rule applies when the agent reads, captures or activates the app. Actions then target elements from a snapshot that was allowed.
 - **Sites** match a host and all its subdomains, and the most specific pattern wins. They are checked on every browser action against the page the tab is showing at that moment, so following a link into a blocked site does not get around it.
 - **`*`** sets the default, which is otherwise `allow`, so `{"apps": {"*": "block", "Notes": "allow"}}` is an allow-list.
+- **`"foreground"`** is one rule for the whole screen, not per app. Set it to `"block"` to keep the agent in the background, so it never takes the screen from you. It covers:
+  - `activate_app`;
+  - `browser_select_tab` with `bring_to_front`;
+  - on Windows, typing into a window that is not in front, and any action that would fall back to your real pointer;
+  - on Linux, every pointer action (they all move the real pointer).
+
+  Those calls fail with `foreground_required` before anything moves, and work that runs in the background goes ahead. `"ask"` prompts once per agent task. A tool argument cannot override the rule. Remote control from a viewer is exempt, because there you are the one driving.
 - Changes apply at once, with no restart. A file that is not valid blocks everything rather than being ignored, so a typo cannot quietly turn a block into an allow.
 
 This is a guard rail for an agent that follows its instructions, not a sandbox. A coordinate click lands wherever it points, and a whole-display screenshot shows every window.

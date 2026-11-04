@@ -37,6 +37,8 @@ windows = { version = "0.62.2", features = [
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_LibraryLoader",
   "Win32_Graphics_Gdi",
+  # Cloaked windows are not on top for input (platform/windows.rs, #50).
+  "Win32_Graphics_Dwm",
   # Desktop Duplication for the live view (live.rs).
   "Win32_Graphics_Direct3D",
   "Win32_Graphics_Direct3D11",

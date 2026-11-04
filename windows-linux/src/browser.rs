@@ -627,6 +627,12 @@ impl BrowserBridge {
         {
             map.insert("sites".into(), policy.sites_json());
         }
+        // Raising the tab's window takes the screen from the user: the one
+        // browser call the user's "foreground" rule covers (#55).
+        if command == "select_tab" && args.get("bring_to_front").and_then(Value::as_bool) == Some(true) {
+            crate::policy::check_foreground("raise the tab's Chrome window over what the user is doing")
+                .map_err(|error| error.to_string())?;
+        }
         let timeout = call_timeout(command, args, policy.sites_ask());
         let result = self
             .dispatch_with_timeout(command, params, timeout)

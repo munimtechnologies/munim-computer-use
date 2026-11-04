@@ -492,6 +492,8 @@ impl LinuxDesktop {
     }
 
     fn move_pointer(&self, x: f64, y: f64) -> Result<()> {
+        // Every pointer action here moves the real pointer (#55).
+        crate::policy::check_foreground("act there with the real pointer")?;
         // XTEST MotionNotify takes i16 screen coords — reject out-of-range or
         // non-finite values instead of silently clamping via `as i16`.
         let xi = to_xtest_coord(x, "x")?;
@@ -1280,6 +1282,7 @@ impl Desktop for LinuxDesktop {
     }
 
     fn activate_app(&mut self, app: &str) -> Result<String> {
+        crate::policy::check_foreground(&format!("bring {app} to the front"))?;
         // Prefer AT-SPI grab_focus (portable), then fall back to EWMH raise —
         // dialogs often refuse Component.grab_focus even when X11 can activate.
         if app.trim().is_empty() {

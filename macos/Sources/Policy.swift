@@ -9,6 +9,11 @@ import Foundation
 //   { "apps":  { "Keychain Access": "block", "com.apple.MobileSMS": "ask" },
 //     "sites": { "bank.example": "block", "mail.google.com": "ask", "*": "allow" } }
 //
+// "foreground" (one rule, not a map) says whether the agent may take the
+// screen from the user: bring an app to the front or raise a Chrome tab's
+// window. Under block those calls refuse with foreground_required and work that
+// runs in the background still goes ahead; a tool argument cannot override it.
+//
 // Each rule is allow, ask (the user approves once per server process) or
 // block. Apps match their name or bundle id exactly, ignoring case; sites match
 // a host and its subdomains, and the most specific pattern wins. "*" sets the
@@ -27,6 +32,8 @@ enum PolicyRule: String {
 struct Policy {
     var apps: [(pattern: String, rule: PolicyRule)] = []
     var sites: [(pattern: String, rule: PolicyRule)] = []
+    /// Taking the foreground; nil means allow.
+    var foreground: PolicyRule?
     /// Why the file could not be used, when it exists but is not valid.
     var error: String?
 
@@ -35,9 +42,15 @@ struct Policy {
             return .failure("not valid JSON")
         }
         guard let object = root as? [String: Any] else {
-            return .failure("the top level must be an object with \"apps\" and/or \"sites\"")
+            return .failure("the top level must be an object with \"apps\", \"sites\" and/or \"foreground\"")
         }
         var policy = Policy()
+        if let value = object["foreground"], !(value is NSNull) {
+            guard let text = value as? String,
+                  let rule = PolicyRule(rawValue: text.trimmingCharacters(in: .whitespaces).lowercased())
+            else { return .failure("\"foreground\" must be \"allow\", \"ask\" or \"block\"") }
+            policy.foreground = rule
+        }
         for key in ["apps", "sites"] {
             guard let value = object[key], !(value is NSNull) else { continue }
             guard let map = value as? [String: Any] else {
@@ -66,6 +79,10 @@ struct Policy {
         }
         return apps.first(where: { $0.pattern == "*" })?.rule ?? .allow
     }
+
+    /// Whether the agent may take the foreground. A broken file blocks it,
+    /// like everything else the file could have covered.
+    var foregroundRule: PolicyRule { error != nil ? .block : (foreground ?? .allow) }
 
     var hasAppRules: Bool { !apps.isEmpty || error != nil }
     var hasSiteRules: Bool { !sites.isEmpty }
@@ -133,7 +150,11 @@ enum PolicyStore {
             let known = approved.contains(key)
             lock.unlock()
             if known { return nil }
-            guard confirm(name: name) else { return "error: the user declined to let the agent use \(name)" }
+            guard confirm(
+                title: "Let the agent use \(name)?",
+                detail: "Your Computer Use policy asks before the agent reads or controls this app. "
+                    + "Allowing it lasts until this agent session ends.")
+            else { return "error: the user declined to let the agent use \(name)" }
             lock.lock()
             approved.insert(key)
             lock.unlock()
@@ -141,16 +162,56 @@ enum PolicyStore {
         }
     }
 
+    /// nil when the agent may take the screen to `action` (what is about to come
+    /// to the front, in words); otherwise the error line. Called before anything
+    /// moves, so a refusal leaves the user's screen as it was. Remote control is
+    /// exempt: there the user is the one driving.
+    static func checkForeground(_ action: String) -> String? {
+        if RemoteControl.isEnabled { return nil }
+        let policy = current()
+        switch policy.foregroundRule {
+        case .allow:
+            return nil
+        case .block:
+            return foregroundRequired(action, broken: policy.error)
+        case .ask:
+            let key = "\u{0}foreground"
+            lock.lock()
+            let known = approved.contains(key)
+            lock.unlock()
+            if known { return nil }
+            guard confirm(
+                title: "Let the agent take over the screen?",
+                detail: "To \(action), it needs to bring a window to the front. Your Computer Use policy asks first. "
+                    + "Allowing it lasts until this agent session ends.")
+            else {
+                return "error: foreground_required: the user declined to let the agent take over the screen to \(action); "
+                    + "nothing was done. Keep to actions that work in the background, or ask the user to do this step"
+            }
+            lock.lock()
+            approved.insert(key)
+            lock.unlock()
+            return nil
+        }
+    }
+
+    static func foregroundRequired(_ action: String, broken: String?) -> String {
+        let why = broken.map { "\($0), which keeps the agent in the background until it is fixed" }
+            ?? "the user's Computer Use policy keeps the agent in the background (\"foreground\" is not \"allow\")"
+        return "error: foreground_required: to \(action) the agent would have to take the foreground window or the real pointer, "
+            + "and \(why); nothing was done. Use an action that works in the background (an element_id click, set_value, "
+            + "the browser_* tools), or ask the user to do this step or change the rule"
+    }
+
     /// Seconds an approval prompt waits before counting as a refusal.
     static let promptTimeout: TimeInterval = 120
 
-    private static func confirm(name: String) -> Bool {
+    private static func confirm(title: String, detail: String) -> Bool {
         DispatchQueue.main.sync {
             NSApp.activate(ignoringOtherApps: true)
             let alert = NSAlert()
-            alert.messageText = "Let the agent use \(name)?"
-            alert.informativeText = "Your Computer Use policy asks before the agent reads or controls this app. "
-                + "Allowing it lasts until this agent session ends."
+            alert.messageText = title
+            alert.informativeText = detail
             alert.addButton(withTitle: "Allow")
             alert.addButton(withTitle: "Don't Allow")
             // An unanswered prompt counts as "no" rather than stalling the server.

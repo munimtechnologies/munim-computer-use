@@ -41,8 +41,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, MSG, PM_NOREMOVE, PeekMessageW, PostMessageW, SMTO_ABORTIFHUNG, SW_RESTORE,
     SendMessageTimeoutW, WM_NULL,
     SetForegroundWindow, ShowWindow, WindowFromPoint, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, GWL_STYLE,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, GWL_STYLE, GWL_EXSTYLE, GW_HWNDNEXT,
+    WS_EX_LAYERED, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
 };
+use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 
 use super::agent_cursor::AgentCursor;
 use super::outline::{self, Bounds, Fingerprint, Listed, OcrMode, OcrText, truncate};
@@ -245,17 +247,17 @@ impl WindowsDesktop {
 
     /// A coordinate action reaches whatever window is on top at the point:
     /// the real cursor clicks it, and posted messages go to it. When another
-    /// app's window covers the target there, refuse rather than act on it.
+    /// app's window covers the target there, refuse rather than act on it,
+    /// and say which window that is (#50).
     fn check_uncovered(id: u32, window: HWND, x: f64, y: f64) -> Result<()> {
         let owner = |hwnd: HWND| {
             let mut pid = 0u32;
             unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
             pid
         };
-        let at = unsafe { WindowFromPoint(POINT { x: x.round() as i32, y: y.round() as i32 }) };
-        if at.0.is_null() {
+        let Some(at) = Self::window_at(POINT { x: x.round() as i32, y: y.round() as i32 }) else {
             return Ok(());
-        }
+        };
         let root = unsafe { GetAncestor(at, GA_ROOT) };
         let top = owner(root);
         if top == owner(window) || top == std::process::id() {
@@ -264,14 +266,90 @@ impl WindowsDesktop {
         // A Windows Security prompt (a firewall or credential prompt) lays an
         // invisible layer over the whole screen that takes every click until
         // it is answered, which activating the app cannot get past.
-        let mut buf = [0u16; 64];
-        let len = unsafe { GetClassNameW(root, &mut buf) };
-        if String::from_utf16_lossy(&buf[..len.max(0) as usize]).starts_with("Shell_SystemDim") {
+        let class = Self::class_name(root);
+        if class.starts_with("Shell_SystemDim") {
             return Err(outline::system_prompt_error(id));
         }
-        Err(DesktopError::new(format!(
-            "e{id} is covered by another window — bring it forward with activate_app, or use an action that works through accessibility"
-        )))
+        let ex_style = unsafe { GetWindowLongW(root, GWL_EXSTYLE) } as u32;
+        let foreground = unsafe { GetForegroundWindow() };
+        let cover = outline::Cover {
+            program: crate::bridge_diag::process_exe(owner(root))
+                .and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned())),
+            class,
+            topmost: ex_style & WS_EX_TOPMOST.0 != 0,
+            target_in_front: !foreground.0.is_null() && owner(foreground) == owner(window),
+        };
+        Err(outline::covered_error(id, x, y, &cover))
+    }
+
+    fn class_name(hwnd: HWND) -> String {
+        let mut buf = [0u16; 128];
+        let len = unsafe { GetClassNameW(hwnd, &mut buf) };
+        String::from_utf16_lossy(&buf[..len.max(0) as usize])
+    }
+
+    /// The window a press at `point` reaches: WindowFromPoint's, looking past
+    /// top-level windows that are on top but not there for input. Those are
+    /// click-through overlays (another agent's pointer, a recorder's frame)
+    /// and windows DWM keeps cloaked (apps on another virtual desktop,
+    /// suspended Store apps). Below one, the answer is a top-level window.
+    fn window_at(point: POINT) -> Option<HWND> {
+        let at = unsafe { WindowFromPoint(point) };
+        if at.0.is_null() {
+            return None;
+        }
+        let mut root = unsafe { GetAncestor(at, GA_ROOT) };
+        if !Self::passes_input(root) {
+            return Some(at);
+        }
+        for _ in 0..64 {
+            root = Self::next_window_at(root, point)?;
+            if !Self::passes_input(root) {
+                return Some(root);
+            }
+        }
+        None
+    }
+
+    /// Whether input at any point of `hwnd` goes through it to the window below.
+    fn passes_input(hwnd: HWND) -> bool {
+        let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
+        if ex_style & WS_EX_TRANSPARENT.0 != 0 && ex_style & WS_EX_LAYERED.0 != 0 {
+            return true;
+        }
+        let mut cloaked = 0u32;
+        unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_CLOAKED,
+                (&mut cloaked as *mut u32).cast(),
+                std::mem::size_of::<u32>() as u32,
+            )
+        }
+        .is_ok()
+            && cloaked != 0
+    }
+
+    /// The next visible top-level window below `hwnd` in z-order whose frame
+    /// holds `point`.
+    fn next_window_at(hwnd: HWND, point: POINT) -> Option<HWND> {
+        let mut at = hwnd;
+        for _ in 0..4096 {
+            at = unsafe { GetWindow(at, GW_HWNDNEXT) }.ok()?;
+            if at.0.is_null() {
+                return None;
+            }
+            if !unsafe { IsWindowVisible(at) }.as_bool() || unsafe { IsIconic(at) }.as_bool() {
+                continue;
+            }
+            let mut rect = RECT::default();
+            if unsafe { GetWindowRect(at, &mut rect) }.is_ok()
+                && point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom
+            {
+                return Some(at);
+            }
+        }
+        None
     }
 
     /// Centre of an element in screen coordinates.
@@ -386,10 +464,7 @@ impl WindowsDesktop {
     /// Resolve the deepest visible child HWND under a screen point.
     fn hwnd_at_screen(x: i32, y: i32) -> Option<HWND> {
         let point = POINT { x, y };
-        let mut hwnd = unsafe { WindowFromPoint(point) };
-        if hwnd.0.is_null() {
-            return None;
-        }
+        let mut hwnd = Self::window_at(point)?;
         // Walk into nested children — a single ChildWindowFromPointEx only
         // returns the immediate child, which misses grandchildren (Bot: nested
         // Win32 controls).
@@ -449,10 +524,7 @@ impl WindowsDesktop {
     /// Top-level window under a screen point, unless it is one of ours (the
     /// agent pointer overlay).
     fn root_at(x: f64, y: f64) -> Option<HWND> {
-        let at = unsafe { WindowFromPoint(POINT { x: x.round() as i32, y: y.round() as i32 }) };
-        if at.0.is_null() {
-            return None;
-        }
+        let at = Self::window_at(POINT { x: x.round() as i32, y: y.round() as i32 })?;
         let root = unsafe { GetAncestor(at, GA_ROOT) };
         let mut pid = 0u32;
         unsafe { GetWindowThreadProcessId(root, Some(&mut pid)) };
@@ -472,6 +544,7 @@ impl WindowsDesktop {
         if window == previous {
             return Ok(None);
         }
+        crate::policy::check_foreground("type into a window that is not in front, which has to be brought forward for the keystrokes")?;
         // Keys reaching the target from here on would be the user's, so hold
         // them until their window is back.
         let mut held = super::user_keys::hold();
@@ -566,6 +639,9 @@ impl WindowsDesktop {
     /// the real cursor uses it for the same reason: `move_to`, `click`,
     /// `right_click` and `drag_to` all clamp to the primary display.
     fn jump_cursor(x: f64, y: f64) -> Result<()> {
+        // The last resort after background delivery; the user's policy may
+        // keep the agent off their pointer (#55).
+        crate::policy::check_foreground("act there with the real pointer, since input sent in the background did not reach it")?;
         Mouse::set_cursor_pos(&UIPoint::new(x.round() as i32, y.round() as i32))
             .map_err(|error| DesktopError::new(format!("could not move cursor: {error}")))
     }
@@ -1573,6 +1649,7 @@ impl WindowsDesktop {
     /// Bring `window` forward with keyboard focus, and say which window is in
     /// front afterwards. `requested` is the window_id the caller asked for.
     fn bring_window_forward(&mut self, app: &str, pid: u32, window: HWND, requested: Option<u64>) -> Result<String> {
+        crate::policy::check_foreground(&format!("bring {app} to the front"))?;
         // Only a minimized window needs restoring; SW_RESTORE on a maximized
         // one would shrink it back to its normal size.
         if unsafe { IsIconic(window) }.as_bool() {
@@ -2063,6 +2140,11 @@ impl Desktop for WindowsDesktop {
                     window = self.input_window.map(|raw| HWND(raw as *mut _));
                 }
                 Target::Element { element: target, window: owner, minimized } => {
+                    // Focusing a control in a window behind the user's can
+                    // bring that window forward on its own.
+                    if owner != previous && !minimized {
+                        crate::policy::check_foreground("type into a window that is not in front, which has to be brought forward for the keystrokes")?;
+                    }
                     if Self::refuses_secure_input(&target) {
                         let _ = target.set_focus();
                         return Ok(super::secure_field_handback(id));
