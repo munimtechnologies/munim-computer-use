@@ -598,32 +598,90 @@ async function detachTab(tabId) {
   }
 }
 
+// The native host gives up on a call after its own timeout, but that does not
+// cancel Chrome's request. A DevTools command that never answers (a renderer
+// stuck in a site's handler, a tab Chrome froze under memory pressure) would
+// hold this task's queue for good, and every later call for it would time out
+// too (#52). Bound each command here, so the queue moves on. Nothing is replayed.
+const DEBUGGER_TIMEOUT_MS = 6000;
+// Chrome stops a synchronous page evaluation at this limit, so neither an
+// injected script nor a page handler it set off can run on for ever.
+const EVALUATE_TIMEOUT_MS = 4000;
+
+function withDeadline(promise, what) {
+  let timer;
+  const expired = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} timed out`)), DEBUGGER_TIMEOUT_MS);
+  });
+  return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
+}
+
 async function send(tabId, method, params = {}) {
-  await attach(tabId);
-  return chrome.debugger.sendCommand({ tabId }, method, params);
+  try {
+    await withDeadline(attach(tabId), "attaching to the tab");
+    const bounded = method === "Runtime.evaluate" ? { timeout: EVALUATE_TIMEOUT_MS, ...params } : params;
+    return await withDeadline(chrome.debugger.sendCommand({ tabId }, method, bounded), method);
+  } catch (error) {
+    const message = error?.message || "";
+    const stopped = /Execution was terminated/.test(message);
+    if (!stopped && !/timed out$/.test(message)) throw error;
+    // Chrome's own view of the tab often still answers when its page does not.
+    // Read it only: never activate, reload or discard a tab that may hold a draft.
+    const tab = await withDeadline(chrome.tabs.get(tabId), "tab lookup").catch(() => null);
+    const state = tab
+      ? ` (Chrome reports the tab ${tab.discarded ? "discarded" : tab.frozen ? "frozen" : tab.status || "open"})`
+      : "";
+    const what = stopped
+      ? `${method} was stopped: the page was still busy after ${EVALUATE_TIMEOUT_MS / 1000} s`
+      : `${message}: the page did not answer within ${DEBUGGER_TIMEOUT_MS / 1000} s`;
+    throw new Error(
+      `${what}${state}. ` +
+        "Whether the action took effect is unknown, so it was not retried: look at the page " +
+        "(browser_snapshot or browser_read) before doing it again. Many open tabs can starve " +
+        "Chrome of memory; close finished ones.",
+    );
+  }
 }
 
 /** Shared by snapshots and explicit readiness checks, serialized into the page. */
-function isElementVisibleInPage(el) {
+/// With `why === true` it returns why the element is hidden instead ("" when
+/// it is visible), for snapshots that find nothing to say what they left out.
+function isElementVisibleInPage(el, why) {
+  const hidden = (reason) => (why === true ? reason : false);
   const r = el.getBoundingClientRect();
-  if (r.width < 2 || r.height < 2) return false;
+  if (r.width < 2 || r.height < 2) return hidden("no size");
   // Styled labels often use transparent native controls as real hit targets.
   // Do not extend this exception to containers: a faded-out dialog is not ready.
   const transparentControl = el.matches('input,button,select,textarea');
+  // An element fading in starts at opacity 0. Chrome does not advance
+  // animations in a tab it is not showing, so a menu opened in a background
+  // tab stays at its first frame for as long as the agent works there (#53).
+  // It counts as shown; one fading out (ending at 0) does not. Keyframes that
+  // stop short of the end (`from { opacity: 0 }`) end at the element's own
+  // opacity.
+  const fadingIn = (node) => (node.getAnimations?.() || []).some((animation) => {
+    if (animation.playState !== "running" && !animation.pending) return false;
+    const frames = (animation.effect?.getKeyframes?.() || []).filter((frame) => "opacity" in frame);
+    const last = frames[frames.length - 1];
+    return !!last && ((last.computedOffset ?? last.offset ?? 1) < 1 || Number(last.opacity) > 0);
+  });
   let escapedInert = false;
   // Walk the flat tree (slot, then shadow host), so a hidden host or a hidden
   // slot hides the shadow content and slotted children it renders.
   for (let node = el; node; node = node.assignedSlot || node.parentElement || node.parentNode?.host || null) {
-    if (node.hidden || node.getAttribute("aria-hidden")?.toLowerCase() === "true") return false;
-    if (node.inert && !escapedInert) return false;
+    if (node.hidden) return hidden("hidden");
+    if (node.getAttribute("aria-hidden")?.toLowerCase() === "true") return hidden("aria-hidden");
+    if (node.inert && !escapedInert) return hidden("inert");
     // Native showModal() escapes ancestor inertness, not its own inert subtrees.
     if (node.matches("dialog:modal")) escapedInert = true;
     const style = getComputedStyle(node);
-    if (style.display === "none" || style.contentVisibility === "hidden" ||
-        (Number(style.opacity) === 0 && (node !== el || !transparentControl))) return false;
+    if (style.display === "none") return hidden("display: none");
+    if (style.contentVisibility === "hidden") return hidden("content-visibility: hidden");
+    if (Number(style.opacity) === 0 && (node !== el || !transparentControl) && !fadingIn(node)) return hidden("opacity 0");
   }
   const style = getComputedStyle(el);
-  return style.visibility !== "hidden" && style.visibility !== "collapse";
+  if (style.visibility === "hidden" || style.visibility === "collapse") return hidden("visibility: hidden");
+  return why === true ? "" : true;
 }
 
 /**
@@ -687,7 +745,7 @@ function pageDomInPage() {
   };
   const byIndex = (index) => queryAll(document, '[data-cu-idx="' + index + '"]')[0] || null;
   const byId = (from, id) => from.getRootNode().getElementById?.(id) || document.getElementById(id);
-  return { queryAll, contains, stack, hit, byIndex, byId };
+  return { queryAll, parent, contains, stack, hit, byIndex, byId };
 }
 
 /// A compact outline of the interactive elements on the page, with ids the
@@ -717,9 +775,21 @@ const SNAPSHOT_JS = `((options = {}) => {
     // overlays, but never let a corner widget or bottom banner hide the page.
     const x = innerWidth / 2, y = innerHeight / 2;
     const r = dialog.getBoundingClientRect();
-    if (x < r.left || x >= r.right || y < r.top || y >= r.bottom) return false;
     const painted = dom.stack(x, y);
-    return !painted.length || dom.contains(dialog, painted[0]);
+    if (x >= r.left && x < r.right && y >= r.top && y < r.bottom &&
+        (!painted.length || dom.contains(dialog, painted[0]))) return true;
+    // A dialog placed near the top of a blocking backdrop does not cover the
+    // centre, but the backdrop does: a fixed, full-viewport ancestor that is
+    // painted on top there. A modeless chat widget in a corner has none.
+    if (!painted.length) return false;
+    for (let node = dom.parent(dialog); node && node !== document.body && node !== document.documentElement; node = dom.parent(node)) {
+      const box = node.getBoundingClientRect();
+      const style = getComputedStyle(node);
+      if (style.position !== 'fixed' || style.pointerEvents === 'none' || box.left > 1 || box.top > 1 ||
+          box.right < innerWidth - 1 || box.bottom < innerHeight - 1) continue;
+      if (dom.contains(node, painted[0])) return true;
+    }
+    return false;
   });
   const native = dialogs.filter((dialog) => dialog.matches(':modal'));
   // Keep nested custom dialogs inside the native top layer eligible too.
@@ -807,8 +877,27 @@ const SNAPSHOT_JS = `((options = {}) => {
       inView: r.top >= 0 && r.bottom <= innerHeight && r.left >= 0 && r.right <= innerWidth,
     });
   }
+  // Nothing listed while the page has controls reads as an empty page. Say
+  // what kept them out instead, by count; never their text.
+  let empty = null;
+  if (i === 0) {
+    const reasons = {};
+    let skipped = 0;
+    for (const el of dom.queryAll(document, sel)) {
+      const reason = !inScope(el) ? 'behind the dialog' : visible(el, true);
+      if (!reason) continue;
+      skipped++;
+      reasons[reason] = (reasons[reason] || 0) + 1;
+    }
+    if (skipped) {
+      const parts = Object.entries(reasons).sort((a, b) => b[1] - a[1]).map(([reason, n]) => n + ' ' + reason);
+      empty = 'no control is listed, but the page has ' + skipped + ' that ' + (skipped === 1 ? 'is' : 'are') +
+        ' not shown (' + parts.join(', ') + '). A menu or dialog that is still opening, or one that hides the ' +
+        'rest of the page from assistive tech, can do this: wait_for_selector, snapshot again, or use browser_read for its text';
+    }
+  }
   const end = Math.min(i, offset + out.length);
-  return { title: document.title, url: location.href, elements: out,
+  return { title: document.title, url: location.href, elements: out, ...(empty ? { empty } : {}),
     scope: modal ? 'modal' : 'page', total: i, offset, limit, frames,
     truncated: end < i, nextOffset: end < i ? end : null };
 })()`;
@@ -1312,6 +1401,76 @@ const TAB_FINISH_JS = `(() => {
   return { moved: true, focused: name(next) };
 })()`;
 
+/// Note the focused text field before a Backspace, and watch whether the page
+/// takes the key for itself, so the follow-up can check the field changed.
+/// Values stay in the page: only whether they changed comes back.
+const EDIT_PROBE_JS = `(() => {
+  let el = document.activeElement;
+  while (el?.shadowRoot?.activeElement) el = el.shadowRoot.activeElement;
+  const field = !!el && (el.tagName === 'TEXTAREA' ||
+    (el.tagName === 'INPUT' && !/^(button|checkbox|color|file|hidden|image|radio|range|reset|submit)$/.test(el.type)));
+  if (!field && !el?.isContentEditable) { window.__cuEditProbe = { el: null }; return false; }
+  const state = () => {
+    if (field) {
+      let start = null, end = null;
+      try { start = el.selectionStart; end = el.selectionEnd; } catch {}
+      return { value: el.value, start, end };
+    }
+    const sel = getSelection();
+    return { value: el.textContent, start: sel?.focusOffset ?? null, end: sel?.anchorOffset ?? null };
+  };
+  const probe = { el, field, state, before: state(), events: [] };
+  probe.listener = (e) => {
+    if (e.type === 'keydown' && e.key !== 'Backspace') return;
+    if (e.composedPath().includes(el)) probe.events.push(e);
+  };
+  probe.done = () => { for (const type of ['keydown', 'beforeinput']) removeEventListener(type, probe.listener, true); };
+  for (const type of ['keydown', 'beforeinput']) addEventListener(type, probe.listener, true);
+  window.__cuEditProbe = probe;
+  return true;
+})()`;
+
+/// Finish a Backspace. Chrome runs a key's editing action only in a page that
+/// has focus, and an agent tab in the background never does: the page sees the
+/// keydown and the field keeps its text (#54). When the field did not change
+/// and the page did not take the key for itself, delete the way the browser
+/// would have, the character before the caret or the selection, with the
+/// input event a page listens for. A field that still does not change is an
+/// error, never a success.
+const EDIT_FINISH_JS = `(() => {
+  const probe = window.__cuEditProbe;
+  delete window.__cuEditProbe;
+  if (!probe?.el) return { checked: false };
+  probe.done();
+  const { el, field, state, before } = probe;
+  const same = (a, b) => a.value === b.value && a.start === b.start && a.end === b.end;
+  let active = document.activeElement;
+  while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
+  if (active !== el) return { checked: true, edited: true, note: 'focus moved off the field' };
+  if (!same(before, state())) return { checked: true, edited: true };
+  // A page that cancels the key (a chip input removing a tag, an editor with
+  // its own undo) decided what Backspace does; do not delete on top of that.
+  if (probe.events.some((e) => e.defaultPrevented)) return { checked: true, edited: false, handled: true };
+  const empty = before.value === '' || (before.start === 0 && before.end === 0);
+  if (empty) return { checked: true, edited: false, note: 'there was nothing before the caret to delete' };
+  try { document.execCommand('delete'); } catch {}
+  if (!same(before, state())) return { checked: true, edited: true, fallback: true };
+  if (field && before.start !== null) {
+    let start = Math.min(before.start, before.end), end = Math.max(before.start, before.end);
+    if (start === end) {
+      start -= 1;
+      // Never split a character made of two UTF-16 units (most emoji).
+      if (start > 0 && /[\\uDC00-\\uDFFF]/.test(el.value[start]) && /[\\uD800-\\uDBFF]/.test(el.value[start - 1])) start -= 1;
+    }
+    try {
+      el.setRangeText('', start, end, 'end');
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'deleteContentBackward' }));
+    } catch {}
+    if (!same(before, state())) return { checked: true, edited: true, fallback: true };
+  }
+  return { checked: true, edited: false };
+})()`;
+
 async function pressKey(tabId, key) {
   const map = {
     Enter: { windowsVirtualKeyCode: 13, code: "Enter", key: "Enter", text: "\r" },
@@ -1322,8 +1481,10 @@ async function pressKey(tabId, key) {
   const spec = map[key];
   if (!spec) throw new Error(`unsupported key: ${key}`);
   if (key === "Tab") await send(tabId, "Runtime.evaluate", { expression: TAB_PROBE_JS, returnByValue: true });
+  if (key === "Backspace") await send(tabId, "Runtime.evaluate", { expression: EDIT_PROBE_JS, returnByValue: true });
   await send(tabId, "Input.dispatchKeyEvent", { type: "keyDown", ...spec });
   await send(tabId, "Input.dispatchKeyEvent", { type: "keyUp", ...spec });
+  if (key === "Backspace") return finishBackspace(tabId);
   if (key !== "Tab") return { pressed: key };
   const res = await send(tabId, "Runtime.evaluate", { expression: TAB_FINISH_JS, returnByValue: true });
   const focus = res?.result?.value || {};
@@ -1336,6 +1497,27 @@ async function pressKey(tabId, key) {
     );
   }
   return { pressed: key, focused: focus.focused ?? null, handledByPage: focus.handled === true };
+}
+
+async function finishBackspace(tabId) {
+  const res = await send(tabId, "Runtime.evaluate", { expression: EDIT_FINISH_JS, returnByValue: true, userGesture: true });
+  const edit = res?.result?.value || {};
+  if (!edit.checked) return { pressed: "Backspace", note: "no text field has focus, so nothing was checked" };
+  if (edit.handled) return { pressed: "Backspace", handledByPage: true };
+  if (edit.edited) {
+    return {
+      pressed: "Backspace",
+      ...(edit.fallback ? { note: "Chrome did not edit the field in this background tab, so the extension deleted the character itself" } : {}),
+      ...(edit.note ? { note: edit.note } : {}),
+    };
+  }
+  if (edit.note) return { pressed: "Backspace", note: edit.note };
+  // Reporting success here let the next type append to text the agent meant
+  // to remove.
+  throw new Error(
+    "Backspace reached the page but the focused field did not change — click the field with " +
+      "browser_click and look at it with browser_snapshot before trying again",
+  );
 }
 
 async function screenshot(tabId) {

@@ -3216,6 +3216,7 @@ func describeSnapshot(_ payload: [String: Any]) -> String {
             lines.append("truncated — continue with browser_snapshot offset=\(next), limit=\(limit) (same tab_id/session_id; unchanged UI keeps indices)")
         }
         if let frames = payload["frames"] as? Int, frames > 0 { lines.append(framesNote(frames)) }
+        if let empty = payload["empty"] as? String { lines.append("note: \(empty)") }
     }
     for element in elements {
         let index = element["i"] as? Int ?? -1
@@ -3368,6 +3369,8 @@ func toolBrowserPressKey(_ args: [String: Any]) -> String {
         } else if let focused = payload["focused"] as? String {
             line += " — focus is now on \(focused)"
         }
+        // Backspace says when it could not check, or had to edit itself.
+        if let note = payload["note"] as? String { line += " — \(note)" }
         return withPageAfter(line, payload)
     }
 }
@@ -4536,7 +4539,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "browser_press_key",
-        "description": "Press Enter, Tab, Escape or Backspace in one of the agent's tabs, for example Enter to submit a form after browser_type. Only these four keys are supported; use browser_type for characters. Tab moves focus to the next field and says which element has it; it fails rather than leave focus where it was. Enter can submit forms and Backspace deletes, so check the page state with browser_snapshot first.",
+        "description": "Press Enter, Tab, Escape or Backspace in one of the agent's tabs, for example Enter to submit a form after browser_type. Only these four keys are supported; use browser_type for characters. Tab moves focus to the next field and says which element has it; it fails rather than leave focus where it was. Backspace checks the focused field changed and fails if it did not. Enter can submit forms and Backspace deletes, so check the page state with browser_snapshot first.",
         "inputSchema": [
             "type": "object",
             "properties": [

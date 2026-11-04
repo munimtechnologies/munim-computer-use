@@ -17,7 +17,7 @@ const option = (name) => {
   return at >= 0 ? process.argv[at + 1] : undefined;
 };
 const suite = option("--suite") || "all";
-assert.ok(["all", "snapshot", "readiness", "shadow", "audit-r1", "audit-r2", "audit-r3"].includes(suite), "invalid --suite");
+assert.ok(["all", "snapshot", "readiness", "shadow", "background", "audit-r1", "audit-r2", "audit-r3"].includes(suite), "invalid --suite");
 const chromePath = option("--chrome");
 if (!chromePath) throw new Error("provide --chrome <Chrome for Testing binary>");
 if (suite === "all" || suite === "audit-r3") {
@@ -323,6 +323,92 @@ try {
     assert.equal(missing.met, false);
     assert.equal(missing.frames, 1);
     console.log("PASS snapshot and readiness report the visible frames they could not search");
+  }
+
+  if (suite === "all" || suite === "background") {
+    // A dialog near the top of a blocking backdrop does not cover the centre;
+    // the backdrop does (LinkedIn offsets some of its dialogs like this).
+    await set(`<main>${buttons(5)}</main><div style="position:fixed;inset:0;background:#0008"><div role="dialog" style="position:absolute;left:30%;right:30%;top:20px;height:120px;background:white"><button>Add a note</button><button>Send without a note</button></div></div>`);
+    const offset = await snapshot();
+    assert.equal(offset.scope, "modal");
+    assert.deepEqual(offset.elements.map((el) => el.label), ["Add a note", "Send without a note"]);
+    console.log("PASS a dialog offset inside a blocking backdrop scopes the snapshot");
+
+    // #53: Chrome does not advance animations in a tab it is not showing, so a
+    // menu opened there stays at the first frame of its fade-in. Hold that
+    // frame here with a long opacity-0 stretch (explicit and implicit ends).
+    const style = "<style>@keyframes hold-in{0%,99%{opacity:0}to{opacity:1}}@keyframes hold-implicit{0%,99%{opacity:0}}@keyframes out{0%{opacity:1}1%,to{opacity:0}}" +
+      ".in{animation:hold-in 1000s}.implicit{animation:hold-implicit 1000s}.out{animation:out 1000s linear -500s}</style>";
+    await set(`${style}<main aria-hidden="true">${buttons(3)}</main><div role="menu" class="in"><div role="menuitem">Airport</div><div role="menuitem">Downtown</div></div><div role="listbox" class="implicit"><div role="option">Pick up</div></div>`);
+    assert.equal(await evaluate("Number(getComputedStyle(document.querySelector('.in')).opacity)"), 0, "the fixture holds opacity 0");
+    const opening = await snapshot();
+    assert.deepEqual(opening.elements.map((el) => el.label), ["Airport Downtown", "Airport", "Downtown", "Pick up", "Pick up"]);
+    assert.equal(opening.empty, undefined);
+    console.log("PASS controls in a menu stuck at the start of its fade-in are listed");
+
+    // One fading out is gone, and a snapshot with nothing left says why.
+    await set(`${style}<main aria-hidden="true">${buttons(3)}</main><div role="menu" class="out"><div role="menuitem">Airport</div></div>`);
+    const closing = await snapshot();
+    assert.equal(closing.total, 0);
+    assert.match(closing.empty, /the page has 5 that are not shown \(3 aria-hidden, 2 opacity 0\)/);
+    assert.ok(!/Airport|Background/.test(closing.empty), "the note counts controls, it never quotes them");
+    console.log("PASS a fading-out menu is hidden, and an empty snapshot says what it left out");
+
+    // #54: Backspace checks the field changed, and deletes itself when Chrome
+    // did not (a background tab runs the page's handlers but not the edit).
+    const editStart = source.indexOf("const EDIT_PROBE_JS =");
+    const [probeJs, finishJs] = vm.runInNewContext(source.slice(editStart, source.indexOf("\nasync function pressKey(")) + "; [EDIT_PROBE_JS, EDIT_FINISH_JS]");
+    const key = async () => {
+      const spec = { windowsVirtualKeyCode: 8, code: "Backspace", key: "Backspace" };
+      await command("Input.dispatchKeyEvent", { type: "keyDown", ...spec });
+      await command("Input.dispatchKeyEvent", { type: "keyUp", ...spec });
+    };
+    const backspace = async (deliver) => {
+      await evaluate(probeJs);
+      if (deliver) await key();
+      return evaluate(finishJs);
+    };
+    const front = await command("Target.getTargetInfo", {});
+    await command("Target.activateTarget", { targetId: front.targetInfo.targetId });
+    await set('<input id="f" value="hello"><div id="ce" contenteditable="true">abc</div><input id="guard" value="tag">');
+    await evaluate("window.inputs = 0; f.addEventListener('input', () => inputs++); f.focus(); f.setSelectionRange(5, 5); true");
+    assert.deepEqual(await backspace(true), { checked: true, edited: true });
+    assert.equal(await evaluate("f.value"), "hell");
+    // Not delivered at all is what a background tab amounts to for the edit.
+    assert.deepEqual(await backspace(false), { checked: true, edited: true, fallback: true });
+    assert.deepEqual(await evaluate("[f.value, f.selectionStart, inputs]"), ["hel", 3, 2]);
+    await evaluate("f.value = 'a😀'; f.setSelectionRange(3, 3); true");
+    await backspace(false);
+    assert.equal(await evaluate("f.value"), "a", "an emoji is deleted whole");
+    await evaluate("f.setSelectionRange(0, 0); true");
+    assert.match((await backspace(false)).note, /nothing before the caret/);
+    // A page that takes the key for itself decides what it does.
+    await evaluate("guard.addEventListener('keydown', (e) => e.preventDefault()); guard.focus(); guard.setSelectionRange(3, 3); true");
+    assert.deepEqual(await backspace(true), { checked: true, edited: false, handled: true });
+    assert.equal(await evaluate("guard.value"), "tag");
+    await evaluate("ce.focus(); getSelection().collapse(ce.firstChild, 3); true");
+    assert.equal((await backspace(false)).edited, true);
+    assert.equal(await evaluate("ce.textContent"), "ab");
+    await evaluate("document.activeElement.blur(); true");
+    assert.deepEqual(await backspace(true), { checked: false });
+    console.log("PASS Backspace is checked, deletes itself when Chrome did not, and leaves a page's own handling alone");
+
+    // #52: a page evaluation that never returns is stopped by Chrome itself.
+    const begun = Date.now();
+    const stuck = await new Promise((resolve) => {
+      const current = 1e6;
+      const listener = (event) => {
+        const reply = JSON.parse(event.data);
+        if (reply.id === current) { socket.removeEventListener("message", listener); resolve(reply); }
+      };
+      socket.addEventListener("message", listener);
+      socket.send(JSON.stringify({ id: current, method: "Runtime.evaluate", params: { expression: "for (;;) {}", timeout: 500 } }));
+    });
+    // The extension recognises this error and reports it as a stopped page.
+    assert.match(stuck.error?.message || "", /Execution was terminated/);
+    assert.ok(Date.now() - begun < 5000);
+    assert.equal(await evaluate("1 + 1"), 2, "the page answers again afterwards");
+    console.log("PASS Chrome stops an endless page evaluation at the extension's limit");
   }
 
   if (suite === "all" || suite === "audit-r1") {

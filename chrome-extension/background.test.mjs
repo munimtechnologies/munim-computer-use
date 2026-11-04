@@ -1125,6 +1125,85 @@ test("a Tab the page handled itself is a success", async () => {
   pageEval = () => ({ result: { value: {} } });
 });
 
+test("Backspace that edited the field is a plain success", async () => {
+  pageEval = (method, params) =>
+    (params.expression ?? "").includes("__cuEditProbe;")
+      ? { result: { value: { checked: true, edited: true } } }
+      : { result: { value: {} } };
+  const result = await callAndWait("press", { tabId: formTab, key: "Backspace" });
+  assert.equal(result.pressed, "Backspace");
+  assert.equal(result.note, undefined);
+  pageEval = () => ({ result: { value: {} } });
+});
+
+test("a Backspace the background tab ignored is deleted by the extension, and says so", async () => {
+  pageEval = (method, params) =>
+    (params.expression ?? "").includes("__cuEditProbe;")
+      ? { result: { value: { checked: true, edited: true, fallback: true } } }
+      : { result: { value: {} } };
+  const result = await callAndWait("press", { tabId: formTab, key: "Backspace" });
+  assert.match(result.note, /deleted the character itself/);
+  pageEval = () => ({ result: { value: {} } });
+});
+
+test("a Backspace that changed nothing is an error, not a success (#54)", async () => {
+  pageEval = (method, params) =>
+    (params.expression ?? "").includes("__cuEditProbe;")
+      ? { result: { value: { checked: true, edited: false } } }
+      : { result: { value: {} } };
+  await assert.rejects(callAndWait("press", { tabId: formTab, key: "Backspace" }), /did not change/);
+  pageEval = (method, params) =>
+    (params.expression ?? "").includes("__cuEditProbe;")
+      ? { result: { value: { checked: true, edited: false, handled: true } } }
+      : { result: { value: {} } };
+  assert.equal((await callAndWait("press", { tabId: formTab, key: "Backspace" })).handledByPage, true);
+  pageEval = () => ({ result: { value: {} } });
+});
+
+// #52: a DevTools command that never answers must not hold the task's queue.
+test("a stalled page call times out, frees the task and never presses late", async () => {
+  const owned = await call("open_tab", { url: "https://shop.example/note", sessionId: "stall" });
+  const realSet = extensionContext.setTimeout;
+  const realClear = extensionContext.clearTimeout;
+  const deadlines = new Set();
+  let late;
+  let inputs = 0;
+  extensionContext.setTimeout = (fn, ms, ...rest) => {
+    if (ms !== 6000) return realSet(fn, ms, ...rest);
+    const timer = { fn };
+    deadlines.add(timer);
+    return timer;
+  };
+  extensionContext.clearTimeout = (timer) => { if (!deadlines.delete(timer)) realClear(timer); };
+  pageEval = (method, params) => {
+    if (method.startsWith("Input.")) inputs++;
+    const expression = params.expression || "";
+    if (expression.includes("scrollIntoView")) {
+      assert.equal(params.timeout, 4000, "page evaluations carry Chrome's own execution limit");
+      return new Promise((resolve) => { late = resolve; });
+    }
+    if (expression.includes("queryAll(document, sel")) return { result: { value: { title: "Recovered", elements: [] } } };
+    return { result: { value: {} } };
+  };
+  try {
+    const failure = refuses("click", { tabId: owned.tabId, index: 1, sessionId: "stall" });
+    for (let n = 0; n < 50 && !late; n++) await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(late, "the click's target lookup is in flight");
+    for (const timer of [...deadlines]) timer.fn();
+    assert.match(await failure, /Runtime\.evaluate timed out.*not retried/s);
+    // The same task answers again straight away.
+    assert.equal((await call("snapshot", { tabId: owned.tabId, sessionId: "stall" })).title, "Recovered");
+    late({ result: { value: { ok: true, x: 1, y: 1, reachable: true } } });
+    for (let n = 0; n < 5; n++) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(inputs, 0, "a lookup that answers late must not go on to press");
+  } finally {
+    extensionContext.setTimeout = realSet;
+    extensionContext.clearTimeout = realClear;
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "stall" });
+  }
+});
+
 // ── runner ──────────────────────────────────────────────────────────────────
 
 let failed = 0;
