@@ -3039,7 +3039,10 @@ func toolBrowserOpenTab(_ args: [String: Any]) -> String {
     // separate window driven through the accessibility API.
     if BrowserBridge.shared.isConnected {
         return bridgeText(browserSessionCall("open_tab", ["url": url], args: args)) { payload in
-            "opened \(url) in the agent tab group (tab_id=\(payload["tabId"] as? Int ?? -1))"
+            let tab = payload["tabId"] as? Int ?? -1
+            // The tab opened but is not in the group (#59): say both.
+            if let note = payload["note"] as? String { return "opened \(url) as tab_id=\(tab) — \(note)" }
+            return "opened \(url) in the agent tab group (tab_id=\(tab))"
         }
     }
     // Site rules are enforced by the extension; the accessibility fallback

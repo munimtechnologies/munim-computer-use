@@ -43,6 +43,10 @@ let windowRemovedListener = null;
  * by default every expression returns an empty object.
  */
 let pageEval = () => ({ result: { value: {} } });
+/** Window types by id (normal unless listed), the window new tabs land in, and a grouping failure to play. */
+const windowTypes = new Map();
+let createInWindow = 1;
+let groupFailure = null;
 let connects = 0;
 let sent = [];
 /** Tabs the extension attached the debugger to, in order. */
@@ -101,7 +105,8 @@ const chrome = {
     },
   },
   tabs: {
-    create: async ({ url }) => makeTab({ url }),
+    create: async ({ url }) => Object.assign(makeTab({ url }), { windowId: createInWindow }),
+    move: async (id, { windowId }) => Object.assign(tabs.get(id), { windowId }),
     get: async (id) => {
       if (!tabs.has(id)) throw new Error(`no tab ${id}`);
       return tabs.get(id);
@@ -121,8 +126,14 @@ const chrome = {
     },
     update: async (id, props) => Object.assign(tabs.get(id), props),
     group: async ({ tabIds, groupId }) => {
+      if (groupFailure) throw new Error(groupFailure);
+      for (const tabId of tabIds) {
+        if ((windowTypes.get(tabs.get(tabId).windowId) ?? "normal") !== "normal") {
+          throw new Error("Grouping is not supported by tabs in this window.");
+        }
+      }
       const id = groupId ?? nextGroupId++;
-      if (!groups.has(id)) groups.set(id, {});
+      if (!groups.has(id)) groups.set(id, { windowId: tabs.get(tabIds[0]).windowId });
       for (const tabId of tabIds) tabs.get(tabId).groupId = id;
       return id;
     },
@@ -155,6 +166,8 @@ const chrome = {
     remove: async (id) => {
       closedWindows.push(id);
     },
+    get: async (id) => ({ id, type: windowTypes.get(id) ?? "normal" }),
+    getLastFocused: async () => ({ id: 1, type: "normal" }),
     onRemoved: { addListener: (fn) => { windowRemovedListener = fn; } },
   },
   scripting: {
@@ -1228,6 +1241,40 @@ test("a call behind a stuck command fails fast and says which command holds the 
     extensionContext.setTimeout = realSet;
     pageEval = () => ({ result: { value: {} } });
     await call("close_all_tabs", { sessionId: "stuck" });
+  }
+});
+
+// #59: an installed web app can capture the URL into its own window, where
+// Chrome refuses tab groups.
+test("a tab captured into an app window is moved back and grouped", async () => {
+  windowTypes.set(7, "app");
+  createInWindow = 7;
+  try {
+    const opened = await call("open_tab", { url: "https://www.linkedin.com/in/someone", sessionId: "pwa" });
+    assert.equal(opened.note, undefined);
+    assert.equal(tabs.get(opened.tabId).windowId, 1, "moved to the normal window");
+    assert.notEqual(tabs.get(opened.tabId).groupId, -1, "and grouped");
+  } finally {
+    windowTypes.delete(7);
+    createInWindow = 1;
+    await call("close_all_tabs", { sessionId: "pwa" });
+  }
+});
+
+test("a tab Chrome will not group still opens, is reported, and is the task's (#59)", async () => {
+  groupFailure = "Grouping is not supported by tabs in this window.";
+  try {
+    const opened = await call("open_tab", { url: "https://www.linkedin.com/in/someone", sessionId: "nogroup" });
+    assert.ok(tabs.has(opened.tabId));
+    assert.equal(opened.grouped, false);
+    assert.match(opened.note, /the tab is open, but Chrome would not add it to the agent's tab group \(Grouping is not supported/);
+    const listed = await call("list_tabs", { sessionId: "nogroup" });
+    assert.ok(listed.tabs.some((tab) => tab.tabId === opened.tabId || tab.id === opened.tabId), "it is the task's tab");
+    groupFailure = null;
+    await call("close_all_tabs", { sessionId: "nogroup" });
+    assert.ok(!tabs.has(opened.tabId), "cleanup closes it");
+  } finally {
+    groupFailure = null;
   }
 });
 
