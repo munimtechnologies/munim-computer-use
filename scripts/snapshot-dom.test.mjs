@@ -148,6 +148,24 @@ try {
     assert.equal((await evaluate(targetScript(0))).ok, true);
     assert.equal((await evaluate(click(0))).ok, true);
     assert.equal(await evaluate('window.noteClicks'), 1);
+    await evaluate(`document.getElementById('interop-outlet').shadowRoot.querySelector('[role=dialog]').insertAdjacentHTML('beforeend', '<textarea aria-label="Note"></textarea>')`);
+    const withNote = await snapshot();
+    const noteIndex = withNote.elements.find(el => el.tag === 'textarea').i;
+    console.log('textarea target lookup starting');
+    assert.equal((await evaluate(targetScript(noteIndex))).ok, true);
+    console.log('textarea target lookup complete');
+    assert.equal((await evaluate(click(noteIndex))).ok, true);
+    console.log('textarea click complete');
+    await evaluate(`(() => {
+      const field = document.getElementById('interop-outlet').shadowRoot.querySelector('textarea');
+      field.blur();
+      field.onmousedown = () => { for (;;) {} };
+    })()`);
+    await assert.rejects(command('Runtime.evaluate', {expression:click(noteIndex),returnByValue:true,timeout:100}), /terminated/i);
+    assert.equal(await evaluate('window.__cuClickStage'), 'mousedown-and-focus');
+    await evaluate(`document.getElementById('interop-outlet').shadowRoot.querySelector('textarea').onmousedown = null`);
+    assert.equal((await snapshot()).scope, 'modal');
+    console.log('PASS Chromium interrupts a stuck textarea event handler and permits read-only recovery');
     await evaluate(`document.getElementById('interop-outlet').style.display = 'none'`);
     await snapshot();
     assert.equal(await evaluate(`document.getElementById('interop-outlet').shadowRoot.getElementById('note').hasAttribute('data-cu-idx')`), false);

@@ -598,9 +598,37 @@ async function detachTab(tabId) {
   }
 }
 
+// A native-host timeout does not cancel Chrome's request. Bound the request
+// here too, so its rejected await releases the task queue without replaying it.
+const DEBUGGER_TIMEOUT_MS = 6000;
+function debuggerDeadline(promise, operation) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(
+        () =>
+          reject(
+            new Error(
+              `${operation} timed out; action outcome may be uncertain. Re-observe before retrying; the action was not replayed.`,
+            ),
+          ),
+        DEBUGGER_TIMEOUT_MS,
+      );
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 async function send(tabId, method, params = {}) {
-  await attach(tabId);
-  return chrome.debugger.sendCommand({ tabId }, method, params);
+  await debuggerDeadline(attach(tabId), "debugger attach");
+  // Chrome interrupts a synchronous page evaluation at this limit rather than
+  // leaving an injected script (or a site's event handler) running forever.
+  const bounded =
+    method === "Runtime.evaluate" ? { timeout: 4000, ...params } : params;
+  return debuggerDeadline(
+    chrome.debugger.sendCommand({ tabId }, method, bounded),
+    method,
+  );
 }
 
 /** Shared by snapshots and explicit readiness checks, serialized into the page. */
@@ -1078,12 +1106,14 @@ const CLICK_TARGET_JS = (index) => `(() => {
   const el = query('[data-cu-idx="${index}"]')[0];
   if (!el) return { ok: false, reason: 'element ${index} is no longer on the page' };
   // Instant, so a page with smooth scrolling is not measured mid-flight.
+  window.__cuClickStage = 'scroll';
   el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
   const r = el.getBoundingClientRect();
   const x = r.left + r.width / 2;
   const y = r.top + r.height / 2;
   const label = (el.getAttribute('aria-label') || el.innerText || el.getAttribute('title') || '')
     .replace(/\\s+/g, ' ').trim().slice(0, 60);
+  window.__cuClickStage = 'hit-test';
   const hit = (${deepElementFromPoint.toString()})(x, y);
   const shown = document.visibilityState === 'visible';
   const reachable = shown && !!hit && (hit === el || el.contains(hit));
@@ -1124,6 +1154,7 @@ const CLICK_EVENTS_JS = (index) => `(() => {
                  screenX: screenX + x, screenY: screenY + outerHeight - innerHeight + y, button: 0, buttons: 0 };
   const pointer = { pointerId: 1, pointerType: 'mouse', isPrimary: true, width: 1, height: 1 };
   const fire = (Type, type, init) => el.dispatchEvent(new Type(type, { ...base, ...init }));
+  window.__cuClickStage = 'pointer-events';
   fire(PointerEvent, 'pointerover', pointer);
   fire(PointerEvent, 'pointerenter', { ...pointer, bubbles: false, cancelable: false });
   fire(MouseEvent, 'mouseover', {});
@@ -1131,19 +1162,30 @@ const CLICK_EVENTS_JS = (index) => `(() => {
   fire(PointerEvent, 'pointermove', pointer);
   fire(MouseEvent, 'mousemove', {});
   const mouse = fire(PointerEvent, 'pointerdown', { ...pointer, buttons: 1, pressure: 0.5 });
+  window.__cuClickStage = 'mousedown-and-focus';
   if (mouse && fire(MouseEvent, 'mousedown', { buttons: 1, detail: 1 })) el.focus?.();
   fire(PointerEvent, 'pointerup', pointer);
   if (mouse) fire(MouseEvent, 'mouseup', { detail: 1 });
   // A dispatched click still runs the element's activation (links follow,
   // checkboxes toggle); el.click() would say detail 0 and no pointer type.
+  window.__cuClickStage = 'click-event';
   fire(PointerEvent, 'click', { ...pointer, detail: 1 });
+  window.__cuClickStage = 'events-complete';
   return { ok: true };
 })()`;
 
 async function evaluateValue(tabId, expression, failure) {
-  const res = await send(tabId, "Runtime.evaluate", { expression, returnByValue: true, userGesture: true });
-  if (res?.exceptionDetails) throw new Error(res.exceptionDetails.text || failure);
-  return res?.result?.value || {};
+  try {
+    const res = await send(tabId, "Runtime.evaluate", { expression, returnByValue: true, userGesture: true });
+    if (res?.exceptionDetails) throw new Error(res.exceptionDetails.exception?.description || res.exceptionDetails.text || failure);
+    return res?.result?.value || {};
+  } catch (error) {
+    const diagnostic = await send(tabId, 'Runtime.evaluate', {
+      expression: `['scroll','hit-test','pointer-events','mousedown-and-focus','click-event','events-complete'].includes(window.__cuClickStage) ? window.__cuClickStage : 'unavailable'`,
+      returnByValue: true, timeout: 500,
+    }).catch(() => null);
+    throw new Error(`${error.message}; click stage: ${diagnostic?.result?.value || 'unavailable'}. Outcome may be uncertain; re-observe before retrying.`);
+  }
 }
 
 /// Click a snapshotted element.

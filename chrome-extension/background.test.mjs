@@ -1128,6 +1128,75 @@ test("a Tab the page handled itself is a success", async () => {
 
 // ── runner ──────────────────────────────────────────────────────────────────
 
+test("a stalled click rejects, releases its task queue and never resumes late action steps", async () => {
+  const owned = await call("open_tab", {
+    url: "https://shop.example/note",
+    sessionId: "timeout-note",
+  });
+  const originalSet = extensionContext.setTimeout;
+  const originalClear = extensionContext.clearTimeout;
+  const timers = new Set();
+  let late;
+  let inputCalls = 0;
+  extensionContext.setTimeout = (fn, ms, ...args) => {
+    if (ms !== 6000) return originalSet(fn, ms, ...args);
+    const timer = { fn };
+    timers.add(timer);
+    return timer;
+  };
+  extensionContext.clearTimeout = (timer) => {
+    if (!timers.delete(timer)) originalClear(timer);
+  };
+  pageEval = (method, params) => {
+    if (method.startsWith("Input.")) inputCalls++;
+    if ((params.expression || "").includes("scrollIntoView")) {
+      assert.equal(params.timeout, 4000);
+      return new Promise((resolve) => {
+        late = resolve;
+      });
+    }
+    if ((params.expression || "").includes("query(sel)"))
+      return { result: { value: { title: "Recovered", elements: [] } } };
+    return { result: { value: {} } };
+  };
+  try {
+    const failure = refuses("click", {
+      tabId: owned.tabId,
+      index: 1,
+      sessionId: "timeout-note",
+    });
+    for (let n = 0; n < 20 && !late; n++)
+      await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(late, "the target lookup must be in flight");
+    for (const timer of [...timers]) timer.fn();
+    assert.match(
+      await failure,
+      /Runtime.evaluate timed out.*Outcome may be uncertain/s,
+    );
+    const snapshot = await call("snapshot", {
+      tabId: owned.tabId,
+      sessionId: "timeout-note",
+    });
+    assert.equal(snapshot.title, "Recovered");
+    assert.equal(
+      (await call("list_tabs", { sessionId: "timeout-note" })).tabs.length,
+      1,
+    );
+    late({ result: { value: { ok: true, x: 1, y: 1, reachable: true } } });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(
+      inputCalls,
+      0,
+      "a late target lookup must not continue into a press",
+    );
+  } finally {
+    extensionContext.setTimeout = originalSet;
+    extensionContext.clearTimeout = originalClear;
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "timeout-note" });
+  }
+});
+
 let failed = 0;
 for (const [name, body] of checks) {
   try {
