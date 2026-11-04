@@ -80,11 +80,14 @@ struct Walk {
     dialogs: Vec<(ElementRef, usize)>,
     /// The app's top-level windows (depth 1), dialogs included.
     frames: usize,
+    /// The last printed table cell: its line, its row's top and height, and
+    /// the names already on that line, so the rest of its row joins it.
+    cell_row: Option<(usize, i32, i32, Vec<String>)>,
 }
 
 impl Walk {
     fn new(options: StateOptions, find_dialogs: bool) -> Self {
-        Self { options, next_id: 0, visited: 0, rows: Vec::new(), skipped: 0, find_dialogs, dialogs: Vec::new(), frames: 0 }
+        Self { options, next_id: 0, visited: 0, rows: Vec::new(), skipped: 0, find_dialogs, dialogs: Vec::new(), frames: 0, cell_row: None }
     }
 
     /// A modal dialog blocks something only when there is something behind
@@ -800,7 +803,33 @@ impl LinuxDesktop {
                 let (x, y) = (f64::from(x) + f64::from(width) / 2.0, f64::from(y) + f64::from(height) / 2.0);
                 row.push_str(&format!(" @({x:.0},{y:.0})"));
             }
-            walk.rows.push(row);
+            // GTK tree views have no row objects: a row is a run of cells at
+            // the same height. Its cells print on the first one's line, the
+            // way a person reads the row; their ids stay valid.
+            let cell_rect = (role == Role::TableCell && !name.is_empty())
+                .then_some(extents)
+                .flatten()
+                .filter(|(_, _, _, height)| *height > 0);
+            let same_row = match (&walk.cell_row, cell_rect) {
+                (Some((line, top, height, _)), Some((_, y, _, h))) => *line + 1 == walk.rows.len() && *top == y && *height == h,
+                _ => false,
+            };
+            if same_row {
+                let (line, _, _, names) = walk.cell_row.as_mut().expect("checked above");
+                if names.contains(&name) {
+                    // The same text again (a sidebar's icon and label cells): keep the
+                    // line that says where to click.
+                    if !walk.rows[*line].contains(" @(") && row.contains(" @(") {
+                        walk.rows[*line] = row;
+                    }
+                } else {
+                    walk.rows[*line].push_str(&format!(", \"{}\"", truncate(&name, 120)));
+                    names.push(name.clone());
+                }
+            } else {
+                walk.rows.push(row);
+                walk.cell_row = cell_rect.map(|(_, y, _, h)| (walk.rows.len() - 1, y, h, vec![name.clone()]));
+            }
         }
 
         // The window itself is the first clip; floating popups start their own.
