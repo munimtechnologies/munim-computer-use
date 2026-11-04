@@ -255,29 +255,43 @@ final class OutlineWalk {
         // Emit a node only if it carries information: something actionable, or text.
         // Pure layout containers are traversed but not printed, which keeps the
         // outline small enough to be worth putting in a prompt.
+        var rowLine: Int?
         if isInteractive || label != nil {
+            let id = isInteractive ? Registry.add(el, facts) : nil
             var parts = ["\(String(repeating: "  ", count: depth))"]
-            if isInteractive {
-                parts.append("[\(Registry.add(el, facts))] ")
-            } else {
-                parts.append("     ")
-            }
-            parts.append(role.replacingOccurrences(of: "AX", with: ""))
-            if let l = label { parts.append(" \"\(truncate(l, 120))\"") }
+            parts.append(id.map { "[\($0)] " } ?? "     ")
+            let shortRole = role.replacingOccurrences(of: "AX", with: "")
+            var body = shortRole
+            if let l = label { body += " \"\(truncate(l, 120))\"" }
             // Show the current contents whenever they are not already the label.
             // Fields commonly label themselves with AXDescription ("Address and
             // search bar") and keep the typed text in AXValue, so gating this on
             // AXTitle hid what the field actually contains.
             if let v = facts.value, v != label {
-                parts.append(" value=\"\(truncate(v, 80))\"")
+                body += " value=\"\(truncate(v, 80))\""
             }
-            if facts.enabled == false { parts.append(" (disabled)") }
+            if facts.enabled == false { body += " (disabled)" }
+            parts.append(body)
             if facts.focused == true { parts.append(" (focused)") }
             lines.append(parts.joined())
             budget -= 1
             if let frame = facts.frame {
                 for text in [label, facts.value].compactMap({ $0 }) { labelled.append((frame, text)) }
             }
+            if !rowFolds.isEmpty {
+                let line = lines.count - 1
+                if !foldableRoles.contains(role) {
+                    rowFolds[rowFolds.count - 1].foldable = false
+                } else if id == nil, role == "AXStaticText", let l = label, facts.value == nil || facts.value == l {
+                    // Plain text reads as itself.
+                    rowFolds[rowFolds.count - 1].segments[line] = "\"\(truncate(l, 120))\""
+                } else if !(role == "AXCell" && label == nil && facts.value == nil) {
+                    // An empty cell is only a box around the rest; the row is what to click.
+                    // `(focused)` is left out: Finder marks every cell of a focused list focused.
+                    rowFolds[rowFolds.count - 1].segments[line] = id.map { "[\($0)] \(body)" } ?? body
+                }
+            }
+            if role == "AXRow" { rowLine = lines.count - 1 }
         }
         if controlRoles.contains(role), facts.enabled != false,
            !(facts.subrole.map { windowControlSubroles.contains($0) } ?? false),
@@ -294,10 +308,45 @@ final class OutlineWalk {
         }
         if unclippedRoles.contains(role) { childClip = nil }
 
+        if rowLine != nil { rowFolds.append(RowFold()) }
         for child in children(el, facts) {
             walk(child, depth: depth + 1, clip: childClip)
         }
+        if let rowLine, let fold = rowFolds.popLast() {
+            foldRow(at: rowLine, fold)
+        }
         if let modalStart { modalRanges.append(modalStart..<lines.count) }
+    }
+
+    /// What a row's descendants printed, gathered so the row prints on one line.
+    struct RowFold {
+        var foldable = true
+        /// Each descendant line's short form, by line index; lines without one are left out.
+        var segments: [Int: String] = [:]
+    }
+    private var rowFolds: [RowFold] = []
+    /// Roles a row folds over. Anything else (a nested list, a group of
+    /// controls) keeps the row printed as a tree.
+    private let foldableRoles: Set<String> = [
+        "AXCell", "AXStaticText", "AXTextField", "AXImage", "AXButton", "AXCheckBox",
+        "AXLink", "AXDisclosureTriangle", "AXPopUpButton", "AXLevelIndicator",
+        "AXProgressIndicator", "AXGroup", "AXMenuButton",
+    ]
+
+    /// Print a table or outline row and its cells as one line, the way a
+    /// person reads it: `[e36] Row: [e38] TextField "a.txt", "Today", "Zero bytes"`.
+    /// Every id stays registered and the ones worth clicking stay listed; only
+    /// the nesting goes, which was most of a list's tokens.
+    private func foldRow(at rowLine: Int, _ fold: RowFold) {
+        let inner = (rowLine + 1)..<lines.count
+        guard fold.foldable, !inner.isEmpty, inner.count <= 24,
+              !modalLabels.keys.contains(where: { inner.contains($0) })
+        else { return }
+        let segments = inner.compactMap { fold.segments[$0] }
+        if !segments.isEmpty {
+            lines[rowLine] += ": " + segments.joined(separator: ", ")
+        }
+        lines.removeSubrange(inner)
     }
 
     /// The children to follow: a list's header and on-screen rows instead of

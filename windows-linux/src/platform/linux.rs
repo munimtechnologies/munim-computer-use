@@ -745,7 +745,10 @@ impl LinuxDesktop {
                 | Role::Text
                 | Role::ToggleButton
                 | Role::TreeItem
-        );
+        ) || (role == Role::TableCell && !name.is_empty());
+        // GTK tree views (file managers, settings lists) expose each row as
+        // table cells with no row object, so a named cell is how a model
+        // picks a row; see `click`, which selects it rather than activating.
 
         if !name.is_empty() || interactive {
             let mut row = "  ".repeat(depth);
@@ -1299,7 +1302,11 @@ impl Desktop for LinuxDesktop {
         // Windows backend does with the Invoke pattern.
         if let Point::Element(id) = target {
             let reference = self.element(id)?;
-            if click_count <= 1 {
+            // A table cell's action is "activate", which in a GTK tree view
+            // is a double-click (Thunar opens the file). A single click
+            // selects, so it goes through the pointer like a person's would.
+            let cell = self.registry.get(&id).is_some_and(|(_, recorded)| recorded.role == "TableCell");
+            if click_count <= 1 && !cell {
                 // Wait for the agent pointer to land before invoking, matching Win/Mac.
                 // Skip native Wayland — AT-SPI bounds are window-relative and would mis-fly.
                 if !crate::capture::on_wayland() || self.element_is_x11_backed(&reference) {
