@@ -52,4 +52,27 @@ The implicit ARIA-dialog heuristic requires the dialog to cover the viewport
 centre. Added coverage and handling for a dialog near the top of a full-viewport,
 fixed, hit-tested blocking backdrop. Focus alone does not imply modality, and
 explicit `aria-modal=false` remains nonmodal. This follow-up passes the Chromium
-suite; final live modal-only scoping and sending remain pending extension reload.
+suite. The pending live verification above is superseded by the result below.
+
+## Completed live verification
+
+After reloading the extension card with the backdrop correction installed:
+
+- One background-tab click opened Izzy Nill's invitation dialog. Its initial
+  10-second readiness wait timed out during LinkedIn loading; no click was replayed.
+- Read-only re-observation reported readiness `met` in 23 ms, `scope: modal`,
+  total `3`: `Dismiss`, `Add a note`, `Send without a note`. No background
+  profile controls were indexed.
+- Indexed click `2` (`Send without a note`) ran as page events in the background
+  tab. A subsequent page read reported `Invitation sent to Izzy.`
+- Independent navigation to https://www.linkedin.com/in/isabelle-nill/
+  reported `Pending, click to withdraw invitation sent to Izzy Nill`.
+
+The user explicitly authorized sending a connection request to any recipient
+for this final test. The manifest remains version `0.10.0`; the local source
+commits distinguish this build. No push or pull request was made.
+
+Validation: the new real-Chromium shadow-modal regression fails on the unchanged
+source (`page` versus expected `modal`) and passes with the fix. The complete
+Chromium suite, 61 extension tests, native action-contract test, tool parity,
+release build and 155 native unit tests passed during this investigation.
