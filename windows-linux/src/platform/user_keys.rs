@@ -10,7 +10,7 @@
 //! alive it keeps the user's keys back, replaying them once their window has
 //! the foreground again.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -40,6 +40,12 @@ const VK_PACKET: u32 = 0xE7;
 static HOOKED: OnceLock<bool> = OnceLock::new();
 /// Tick of the user's last key event, 0 until the hook has seen one.
 static LAST_USER_KEY: AtomicU32 = AtomicU32::new(0);
+/// Agent keystrokes the hook has seen. The system passes each key through the
+/// hook just before it routes the key to the foreground window, so once this
+/// has counted a whole burst, every key of it has gone to the window that was
+/// in front. Until then the burst is still being routed, and the hook itself
+/// slows that down, so a fixed pause can end with keys left over (#47).
+static AGENT_KEYS: AtomicU64 = AtomicU64::new(0);
 /// Whether a `Hold` is alive, and the user's keys it has kept back.
 static HELD: Mutex<(bool, Vec<KBDLLHOOKSTRUCT>)> = Mutex::new((false, Vec::new()));
 
@@ -66,6 +72,9 @@ unsafe extern "system" fn on_key(code: i32, wparam: WPARAM, lparam: LPARAM) -> L
         let key = unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) };
         // UI Automation's SetFocus sends UNLOCK_VK too, and waits for it.
         let unlock = key.vkCode == u32::from(super::windows::UNLOCK_VK);
+        if key.dwExtraInfo == AGENT_INPUT {
+            AGENT_KEYS.fetch_add(1, Ordering::SeqCst);
+        }
         if key.dwExtraInfo != AGENT_INPUT && !unlock {
             LAST_USER_KEY.store(unsafe { GetTickCount() }.max(1), Ordering::Relaxed);
             let mut held = HELD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -100,6 +109,28 @@ pub fn wait_for_pause() {
             return;
         }
         std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Where the count of routed agent keys stands, to wait from. None without
+/// the hook.
+pub fn agent_keys_mark() -> Option<u64> {
+    hooked().then(|| AGENT_KEYS.load(Ordering::SeqCst))
+}
+
+/// Wait until the hook has seen `count` agent keys since `mark`: the whole
+/// burst has been routed. False if that takes longer than `limit` (another
+/// hook swallowed some, or Windows dropped ours for being slow).
+pub fn wait_routed(mark: u64, count: u64, limit: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        if AGENT_KEYS.load(Ordering::SeqCst).wrapping_sub(mark) >= count {
+            return true;
+        }
+        if start.elapsed() >= limit {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
