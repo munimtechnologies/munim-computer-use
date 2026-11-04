@@ -53,55 +53,93 @@ ${body}
 `;
 }
 
-// --- 1. Five servers reading a growing folder --------------------------------
+// --- 1. Every server reading a growing folder, on each OS -------------------
 
-// Each server's own "read this window" tool on File Explorer showing a folder of
-// N files, text only where the server allows it. Median of 10 warm calls (two
-// rounds of 5). Tokens are characters / 4, plus the screenshot open-computer-use
-// always attaches (Anthropic's w*h/750). Measured 27 October 2026.
+// Each server's own "read this window" tool on the file manager showing a
+// folder of N files, text only where the server has a switch for it. Median of
+// 10 warm calls (two rounds of 5). Tokens are characters / 4. Measured
+// 4 November 2026; the README's tables carry the same numbers.
 const SIZES = [100, 1000, 5000, 20000];
-const SCALE = [
-  { name: "munim-computer-use 0.8.0", short: "munim", ms: [139, 132, 155, 138], tokens: [2008, 2012, 2012, 2015] },
-  { name: "Cua Driver 0.38.0", short: "Cua Driver", ms: [199, 176, 177, 191], tokens: [3898, 3901, 3901, 3904] },
-  { name: "Windows-MCP 0.8.5", short: "Windows-MCP", ms: [770, 770, 784, 755], tokens: [3806, 3809, 3809, 3811] },
-  { name: "computer-use-mcp 7.8.0 (zavora)", short: "zavora", ms: [430, 495, 433, 520], tokens: [9346, 9348, 9348, 9349] },
-  { name: "open-computer-use 1.1.2", short: "open-computer-use", ms: [3946, 3823, 3700, 4227], tokens: [5858, 5861, 5861, 5852] },
-];
-// Fixed slots, in series order (validated: scripts' palette check, both modes).
+const SCALE_RUNS = {
+  windows: {
+    file: "chart-scale",
+    title: "Windows 11 · File Explorer",
+    note: "Windows 11 laptop, one 1920×1080 display.",
+    series: [
+      { name: "munim-computer-use 0.10.0", short: "munim", ms: [117, 119, 127, 124], tokens: [2008, 2012, 2012, 2014] },
+      { name: "Cua Driver 0.38.0", short: "Cua Driver", ms: [148, 162, 153, 158], tokens: [3898, 3901, 3901, 3904] },
+      { name: "Windows-MCP 0.8.8", short: "Windows-MCP", ms: [15369, 15705, 15237, 15593], tokens: [3869, 1211, 3871, 3873] },
+      { name: "computer-use-mcp 7.8.0 (zavora)", short: "zavora", ms: [438, 395, 428, 404], tokens: [9343, 9346, 9348, 9351] },
+      { name: "open-computer-use 1.1.3", short: "open-computer-use", ms: [3086, 2964, 3226, 3216], tokens: [4885, 4888, 4900, 4903] },
+    ],
+  },
+  macos: {
+    file: "chart-scale-macos",
+    title: "macOS 27 · Finder (list view)",
+    note: "MacBook Air (M1), macOS 27.2, one 1920×1080 display.",
+    series: [
+      { name: "munim-computer-use 0.10.0", short: "munim", ms: [45, 47, 59, 103], tokens: [1013, 985, 986, 986] },
+      { name: "Cua Driver 0.38.0", short: "Cua Driver", ms: [287, 287, 304, 351], tokens: [2394, 2395, 2395, 2396] },
+      { name: "computer-use-mcp 7.8.0 (zavora)", short: "zavora", ms: [1164, 1178, 1162, 1172], tokens: [22427, 22430, 22435, 22445] },
+      { name: "open-computer-use 1.1.3", short: "open-computer-use", ms: [132, 297, 980, 3588], tokens: [1080, 1073, 1073, 1074] },
+      { name: "MacOS-MCP 0.4.7", short: "MacOS-MCP", ms: [365, 2257, 8629, 73911], tokens: [17325, 3808, 3081, 2580] },
+    ],
+  },
+  linux: {
+    file: "chart-scale-linux",
+    title: "Linux · Thunar (details view)",
+    note: "Ubuntu in WSL 2 on the same laptop, X11 (Xvfb 1920×1080).",
+    series: [
+      { name: "munim-computer-use 0.10.0", short: "munim", ms: [193, 205, 242, 231], tokens: [1243, 1244, 1244, 1245] },
+      { name: "Cua Driver 0.38.0", short: "Cua Driver", ms: [660, 301, 292, 289], tokens: [5733, 2300, 2300, 2301] },
+      { name: "computer-use-mcp 7.8.0 (zavora)", short: "zavora", ms: [855, 906, 880, 856], tokens: [28577, 28578, 28578, 28578] },
+      { name: "open-computer-use 1.1.3", short: "open-computer-use", ms: [1578, 2892, 4931, 12904], tokens: [26038, 42717, 42717, 42718] },
+    ],
+  },
+};
+// One colour per project in every chart (validated: palette check, both modes).
 const SERIES = {
   light: ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"],
   dark: ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181"],
 };
+const SLOT = { munim: 0, "Cua Driver": 1, "Windows-MCP": 2, "MacOS-MCP": 2, zavora: 3, "open-computer-use": 4 };
 
-function scaleChart(t, mode) {
-  const W = 820, left = 64, right = 215, plotH = 220, gapH = 84, top = 150;
+// A log axis over whichever of `steps` the data needs.
+function logAxis(values, steps) {
+  const lo = Math.min(...values), hi = Math.max(...values);
+  const below = steps.filter((s) => s <= lo);
+  const above = steps.filter((s) => s >= hi);
+  const min = below.length ? below[below.length - 1] : steps[0];
+  const max = above.length ? above[0] : steps[steps.length - 1];
+  return { min, max, ticks: steps.filter((s) => s >= min && s <= max) };
+}
+
+function scaleChart(t, mode, run) {
+  const W = 820, left = 64, right = 215, plotH = 200, gapH = 84, top = 150;
   const plotW = W - left - right;
-  const colors = SERIES[mode];
+  const runs = run.series;
+  const colour = (s) => SERIES[mode][SLOT[s.short]];
   const lx = Math.log10(SIZES[0]), rx = Math.log10(SIZES[SIZES.length - 1]);
   const x = (n) => left + ((Math.log10(n) - lx) / (rx - lx)) * plotW;
+  const panel = (title, key, steps, tick, fmt) => {
+    const axis = logAxis(runs.flatMap((s) => s[key]), steps);
+    const span = Math.log10(axis.max) - Math.log10(axis.min);
+    return { title, key, ticks: axis.ticks, tick, fmt, y: (v, y0) => y0 + plotH - ((Math.log10(v) - Math.log10(axis.min)) / span) * plotH };
+  };
   const panels = [
-    {
-      title: "Time per read (log scale, lower is better)", key: "ms",
-      // Latencies span 0.17 s to 3.7 s, so a log axis keeps the fast ones apart.
-      y: (v, y0) => y0 + plotH - ((Math.log10(v) - Math.log10(100)) / (Math.log10(5000) - Math.log10(100))) * plotH,
-      ticks: [100, 200, 500, 1000, 2000, 5000], tick: (v) => (v < 1000 ? `${v / 1000} s` : `${v / 1000} s`),
-      fmt: (v) => `${(v / 1000).toFixed(2)} s`,
-    },
-    {
-      title: "Tokens per read (≈, lower is better)", key: "tokens",
-      y: (v, y0) => y0 + plotH - (v / 10000) * plotH,
-      ticks: [0, 2500, 5000, 7500, 10000], tick: (v) => (v ? `${v / 1000}K` : "0"),
-      fmt: (v) => `${(v / 1000).toFixed(1)}K`,
-    },
+    panel("Time per read (log scale, lower is better)", "ms", [20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000],
+      (v) => `${v / 1000} s`, (v) => (v < 1000 ? `${v} ms` : `${(v / 1000).toFixed(1)} s`)),
+    panel("Tokens per read (≈, log scale, lower is better)", "tokens", [250, 500, 1000, 2500, 5000, 10000, 25000, 50000],
+      (v) => (v >= 1000 ? `${v / 1000}K` : `${v}`), (v) => `${(v / 1000).toFixed(1)}K`),
   ];
   const H = top + panels.length * plotH + gapH + 40;
-  let body = text(20, 30, "Reading a window as the folder grows, five servers on Windows 11", { fill: t.ink, size: 16, weight: 600 });
-  body += text(20, 50, "Each server's read tool on File Explorer showing 100 to 20,000 files, same PC, median of 10 warm calls.", { fill: t.ink2, size: 12 });
-  body += text(20, 66, "Every server reads only the rows on screen, so folder size barely matters; what differs is the level.", { fill: t.ink2, size: 12 });
-  SCALE.forEach((s, i) => {
+  let body = text(20, 30, `Reading a window as the folder grows: ${run.title}`, { fill: t.ink, size: 16, weight: 600 });
+  body += text(20, 50, `Each server's read tool on a folder of 100 to 20,000 files, median of 10 warm calls. ${run.note}`, { fill: t.ink2, size: 12 });
+  body += text(20, 66, "Lower is better on both panels. A flat line means the server reads only what is on screen, however big the folder.", { fill: t.ink2, size: 12 });
+  runs.forEach((s, i) => {
     const lx0 = 20 + (i % 3) * 250, ly = 92 + Math.floor(i / 3) * 20;
-    body += `<line x1="${lx0}" x2="${lx0 + 14}" y1="${ly - 4}" y2="${ly - 4}" stroke="${colors[i]}" stroke-width="2"/>`;
-    body += `<circle cx="${lx0 + 7}" cy="${ly - 4}" r="3" fill="${colors[i]}"/>`;
+    body += `<line x1="${lx0}" x2="${lx0 + 14}" y1="${ly - 4}" y2="${ly - 4}" stroke="${colour(s)}" stroke-width="2"/>`;
+    body += `<circle cx="${lx0 + 7}" cy="${ly - 4}" r="3" fill="${colour(s)}"/>`;
     body += text(lx0 + 20, ly, s.name, { fill: t.ink2, size: 12, weight: i === 0 ? 600 : 400 });
   });
   panels.forEach((p, n) => {
@@ -116,17 +154,16 @@ function scaleChart(t, mode) {
       body += text(x(size), y0 + plotH + 18, `${size.toLocaleString("en-US")} files`, { fill: t.muted, size: 11, anchor: "middle" });
     }
     // munim is drawn last so it sits on top where lines cross.
-    const order = SCALE.map((_, i) => i).reverse();
-    for (const i of order) {
-      const s = SCALE[i];
+    for (const i of runs.map((_, i) => i).reverse()) {
+      const s = runs[i];
       const points = SIZES.map((size, j) => `${x(size).toFixed(1)},${p.y(s[p.key][j], y0).toFixed(1)}`).join(" ");
-      body += `<polyline points="${points}" fill="none" stroke="${colors[i]}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+      body += `<polyline points="${points}" fill="none" stroke="${colour(s)}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
       SIZES.forEach((size, j) => {
-        body += `<circle cx="${x(size)}" cy="${p.y(s[p.key][j], y0)}" r="4" fill="${colors[i]}" stroke="${t.surface}" stroke-width="2"/>`;
+        body += `<circle cx="${x(size)}" cy="${p.y(s[p.key][j], y0)}" r="4" fill="${colour(s)}" stroke="${t.surface}" stroke-width="2"/>`;
       });
     }
     // End labels; lines that end within a label's height share one label.
-    const ends = SCALE.map((s, i) => ({ i, y: p.y(s[p.key][SIZES.length - 1], y0), value: s[p.key][SIZES.length - 1] }))
+    const ends = runs.map((s, i) => ({ i, y: p.y(s[p.key][SIZES.length - 1], y0), value: s[p.key][SIZES.length - 1] }))
       .sort((a, b) => a.y - b.y);
     const groups = [];
     for (const end of ends) {
@@ -134,20 +171,19 @@ function scaleChart(t, mode) {
       if (last && end.y - last[last.length - 1].y < 15) last.push(end);
       else groups.push([end]);
     }
+    // Lines that end close together get one label each, stacked around their mean.
     for (const group of groups) {
       const y = group.reduce((sum, e) => sum + e.y, 0) / group.length;
-      const values = group.map((e) => p.fmt(e.value));
-      const label = values.every((v) => v === values[0])
-        ? group.map((e) => SCALE[e.i].short).join(", ") + ` ${values[0]}`
-        : group.length === 2 && p.key === "tokens"
-          ? group.map((e) => SCALE[e.i].short).join(", ") + ` ${[...values].sort().join("–").replace(/K–/, "–")}`
-          : group.map((e, k) => `${SCALE[e.i].short} ${values[k]}`).join(", ");
-      body += text(left + plotW + 10, y + 4, label, { fill: group.some((e) => e.i === 0) ? t.ink : t.ink2, size: 12, weight: group.some((e) => e.i === 0) ? 600 : 400 });
+      group.forEach((e, k) => {
+        const mine = e.i === 0;
+        const ly = y + (k - (group.length - 1) / 2) * 14;
+        body += text(left + plotW + 10, ly + 4, `${runs[e.i].short} ${p.fmt(e.value)}`, { fill: mine ? t.ink : t.ink2, size: 12, weight: mine ? 600 : 400 });
+      });
     }
   });
-  const desc = SCALE.map((s) => `${s.name}: ${s.ms.map((v) => `${v} ms`).join(", ")}; ${s.tokens.map((v) => `${v} tokens`).join(", ")}`).join(". ")
+  const desc = runs.map((s) => `${s.name}: ${s.ms.map((v) => `${v} ms`).join(", ")}; ${s.tokens.map((v) => `${v} tokens`).join(", ")}`).join(". ")
     + ` (for ${SIZES.join(", ")} files)`;
-  return svg(W, H, "Five computer-use servers reading File Explorer as the folder grows", desc, t, body);
+  return svg(W, H, `Computer-use servers reading a growing folder: ${run.title}`, desc, t, body);
 }
 
 // --- 2. Capability coverage, counted from the README matrix -----------------
@@ -265,7 +301,7 @@ function historyChart(t) {
 }
 
 for (const [mode, t] of Object.entries(THEMES)) {
-  writeFileSync(join(out, `chart-scale-${mode}.svg`), scaleChart(t, mode));
+  for (const run of Object.values(SCALE_RUNS)) writeFileSync(join(out, `${run.file}-${mode}.svg`), scaleChart(t, mode, run));
   writeFileSync(join(out, `chart-coverage-${mode}.svg`), coverageChart(t));
   writeFileSync(join(out, `chart-history-${mode}.svg`), historyChart(t));
 }
