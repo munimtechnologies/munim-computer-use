@@ -277,6 +277,12 @@ function replyError(portRef, id, message) {
 // Commands for one task run in order. Different tasks never share this queue.
 // Register queues before starting work, so process cleanup also sees queued opens.
 const commandQueues = new Map();
+/** clientId → the command running now for that task, and since when. */
+const running = new Map();
+// Past this, a task's command is stuck rather than slow: every Chrome call it
+// makes has its own deadline, and only a prompt waiting on the user runs
+// longer. The native host gives up on a call at about this point anyway.
+const STUCK_COMMAND_MS = 20000;
 function enqueue(clientId, task) {
   const run = (commandQueues.get(clientId) ?? Promise.resolve()).then(task);
   const tail = run.catch(() => {});
@@ -608,10 +614,10 @@ const DEBUGGER_TIMEOUT_MS = 6000;
 // injected script nor a page handler it set off can run on for ever.
 const EVALUATE_TIMEOUT_MS = 4000;
 
-function withDeadline(promise, what) {
+function withDeadline(promise, what, ms = DEBUGGER_TIMEOUT_MS) {
   let timer;
   const expired = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${what} timed out`)), DEBUGGER_TIMEOUT_MS);
+    timer = setTimeout(() => reject(new Error(`${what} timed out`)), ms);
   });
   return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
 }
@@ -1562,7 +1568,8 @@ let cursorInlined = null;
 async function toDataUrl(href) {
   if (href.startsWith("data:")) return href;
   try {
-    const res = await fetch(href);
+    // A site that never finishes serving its icon must not hold the task (#56).
+    const res = await fetch(href, { signal: AbortSignal.timeout(3000) });
     if (!res.ok) return null;
     const bytes = new Uint8Array(await res.arrayBuffer());
     let binary = "";
@@ -1666,13 +1673,15 @@ function restoreFavicon() {
 
 async function markTab(tabId) {
   try {
-    const [cursor, site] = await Promise.all([inlineCursor(), siteFavicon(tabId)]);
+    // Decorative, and it runs after every action: a page too busy to take the
+    // badge script must not hold the task's queue behind it (#56).
+    const [cursor, site] = await withDeadline(Promise.all([inlineCursor(), siteFavicon(tabId)]), "favicon", 4000);
     if (!cursor) return;
-    await chrome.scripting.executeScript({
+    await withDeadline(chrome.scripting.executeScript({
       target: { tabId },
       func: applyFavicon,
       args: [badgeHref(cursor, site)],
-    });
+    }), "favicon badge", 2000);
   } catch {
     // Chrome's own pages (chrome://, the Web Store) refuse injection; the tab
     // still works, it just cannot show the badge.
@@ -1684,7 +1693,7 @@ async function markTab(tabId) {
 async function unmarkTab(tabId) {
   siteFavicons.delete(tabId);
   try {
-    await chrome.scripting.executeScript({ target: { tabId }, func: restoreFavicon });
+    await withDeadline(chrome.scripting.executeScript({ target: { tabId }, func: restoreFavicon }), "favicon", 2000);
   } catch {
     // Same injection limits as markTab; the tab is being let go either way.
   }
@@ -2321,13 +2330,30 @@ async function handleCommand(msg, replyPort) {
     }
     // JSON tuple encoding prevents session ids from colliding across processes.
     const clientId = sessionId === undefined ? processId : JSON.stringify([processId, sessionId]);
+    // Queued behind a command that is stuck, this call would only time out in
+    // turn, minutes of identical timeouts with no cause given (#56). Say which
+    // command holds the task instead, at once.
+    const busy = running.get(clientId);
+    if (busy && Date.now() - busy.since > STUCK_COMMAND_MS && prompts.size === 0) {
+      throw new Error(
+        `not started: this task's earlier ${busy.command} has been waiting on Chrome for ` +
+          `${Math.round((Date.now() - busy.since) / 1000)} s and still holds the task. The extension is ` +
+          "connected; that tab's page is not answering. Try again shortly, or use another session_id for other work",
+      );
+    }
     const state = clientState(clientId);
     state.processId = processId;
     state.sessionId = sessionId ?? null;
-    const result = await enqueue(clientId, () => {
+    const result = await enqueue(clientId, async () => {
       // A preceding cleanup may have removed the state while this waited.
       Object.assign(clientState(clientId), { processId, sessionId: sessionId ?? null });
-      return handler({ ...params, clientId });
+      const entry = { command, since: Date.now() };
+      running.set(clientId, entry);
+      try {
+        return await handler({ ...params, clientId });
+      } finally {
+        if (running.get(clientId) === entry) running.delete(clientId);
+      }
     });
     reply(replyPort, id, result);
   } catch (e) {

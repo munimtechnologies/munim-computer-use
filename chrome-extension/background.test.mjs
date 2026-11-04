@@ -175,7 +175,7 @@ async function fetch(url) {
 }
 
 // URL is not an enumerable global, so the spread below would leave it out.
-const extensionContext = vm.createContext({ ...globalThis, URL, chrome, console, fetch });
+const extensionContext = vm.createContext({ ...globalThis, URL, AbortSignal, chrome, console, fetch });
 vm.runInContext(source, extensionContext, {
   filename: "background.js",
 });
@@ -1201,6 +1201,33 @@ test("a stalled page call times out, frees the task and never presses late", asy
     extensionContext.clearTimeout = realClear;
     pageEval = () => ({ result: { value: {} } });
     await call("close_all_tabs", { sessionId: "stall" });
+  }
+});
+
+// #56: calls queued behind a stuck command fail at once and name it.
+test("a call behind a stuck command fails fast and says which command holds the task", async () => {
+  const owned = await call("open_tab", { url: "https://shop.example/stuck", sessionId: "stuck" });
+  const realSet = extensionContext.setTimeout;
+  extensionContext.setTimeout = (fn, ms, ...rest) => (ms === 6000 ? {} : realSet(fn, ms, ...rest));
+  let release;
+  pageEval = () => new Promise((resolve) => { release = resolve; });
+  try {
+    const first = call("snapshot", { tabId: owned.tabId, sessionId: "stuck" }).catch((error) => error);
+    for (let n = 0; n < 50 && !release; n++) await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(release, "the snapshot is in flight");
+    vm.runInContext("globalThis.__realNow = Date.now; Date.now = () => __realNow() + 21000", extensionContext);
+    assert.match(await refuses("list_tabs", { sessionId: "stuck" }), /not started: this task's earlier snapshot has been waiting on Chrome for 2\d s/);
+    // Another task is not held up.
+    assert.ok(Array.isArray((await call("list_tabs", { sessionId: "elsewhere" })).tabs));
+    vm.runInContext("Date.now = __realNow", extensionContext);
+    release({ result: { value: { title: "Late", elements: [] } } });
+    assert.equal((await first).title, "Late");
+    assert.ok(Array.isArray((await call("list_tabs", { sessionId: "stuck" })).tabs), "the task answers again once it is free");
+  } finally {
+    vm.runInContext("if (globalThis.__realNow) Date.now = __realNow", extensionContext);
+    extensionContext.setTimeout = realSet;
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "stuck" });
   }
 });
 
