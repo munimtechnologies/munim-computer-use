@@ -112,5 +112,14 @@ rejection and Rohit's uncertain outcome remain unchanged; no sends were retried.
 Verification for this follow-up: 64 extension tests (including sixth-open
 rejection, no draft removal, independent task budgets, and non-mutating lifecycle
 diagnostics), complete Chromium suite, extension-build tests, tool parity, and
-155 release-profile native tests passed. Live guard verification is pending the
-extension reload and will use only blank tabs.
+155 release-profile native tests passed. After reconciling upstream PRs #48/#49,
+the expanded Chromium suite and all 161 Windows release-profile native tests pass.
+
+After the extension-card reload, live verification used only `about:blank` tabs
+in a distinct `guard-verification-final` session. Five opens succeeded; a sixth
+returned `task tab limit reached (5/5); no tab was opened`. Tab listing still
+showed exactly five. Closing one deliberately chosen blank tab allowed one
+replacement, again leaving exactly five. Cleanup closed only those five blank
+test tabs and removed that test group. No prospect tabs were opened or existing
+drafts, invitations, or outreach results altered by this verification. This
+verifies enforcement, not a reproduction or cure of Chrome memory exhaustion.
