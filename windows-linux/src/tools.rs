@@ -1098,7 +1098,7 @@ fn all_tool_defs() -> Value {
         },
         {
             "name": "browser_press_key",
-            "description": "Press Enter, Tab, Escape or Backspace in one of the agent's tabs, for example Enter to submit a form after browser_type. Only these four keys are supported; use browser_type for characters. Tab moves focus to the next field and says which element has it; it fails rather than leave focus where it was. Enter can submit forms and Backspace deletes, so check the page state with browser_snapshot first.",
+            "description": "Press Enter, Tab, Escape or Backspace in one of the agent's tabs, for example Enter to submit a form after browser_type. Only these four keys are supported; use browser_type for characters. Tab moves focus to the next field and says which element has it; it fails rather than leave focus where it was. Backspace checks the focused field changed and fails if it did not. Enter can submit forms and Backspace deletes, so check the page state with browser_snapshot first.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

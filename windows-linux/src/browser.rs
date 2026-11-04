@@ -1186,6 +1186,10 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
                     } else if let Some(focused) = result.get("focused").and_then(Value::as_str) {
                         line.push_str(&format!(" — focus is now on {focused}"));
                     }
+                    // Backspace says when it could not check, or had to edit itself.
+                    if let Some(note) = result.get("note").and_then(Value::as_str) {
+                        line.push_str(&format!(" — {note}"));
+                    }
                     line
                 }
                 "navigate" => format!(
@@ -1407,6 +1411,9 @@ fn describe_snapshot(result: &Value) -> String {
         }
         if let Some(frames) = result.get("frames").and_then(Value::as_u64).filter(|&n| n > 0) {
             lines.push(frames_note(frames));
+        }
+        if let Some(empty) = result.get("empty").and_then(Value::as_str) {
+            lines.push(format!("note: {empty}"));
         }
     }
     for element in result
