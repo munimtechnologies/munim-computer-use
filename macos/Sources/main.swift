@@ -1864,6 +1864,20 @@ private func finishCapture(_ box: CaptureBox, timedOut: Bool, after seconds: Int
     return shot
 }
 
+/// A capture through screencapture instead of ScreenCaptureKit (see
+/// CaptureFallback.swift), recording the outcome for the tool error the way
+/// finishCapture does. `timedOutAfter` is set when ScreenCaptureKit just timed
+/// out on this very capture.
+private func fallbackCapture(timedOutAfter seconds: Int?, _ capture: () -> CaptureShot?) -> CaptureShot? {
+    let shot = capture()
+    let lead = seconds.map { "ScreenCaptureKit did not answer within \($0) s" }
+        ?? "ScreenCaptureKit stopped answering"
+    lastCaptureFailureLock.lock()
+    lastCaptureFailureReason = shot == nil ? ("\(lead), and the screencapture fallback failed too", true) : nil
+    lastCaptureFailureLock.unlock()
+    return shot
+}
+
 /// A ScreenCaptureKit error as one line: its description plus domain and code,
 /// which tell a refusal (permission, TCC) apart from a failed stream.
 private func describeCaptureError(_ error: Error) -> String {
@@ -1974,11 +1988,14 @@ func backingScale(for display: SCDisplay) -> CGFloat {
 /// executor and blocks the JSON-RPC loop until it lands, with a timeout so a
 /// wedged capture can never hang the server.
 func captureWindow(pid: pid_t, maxWidth: Int, encoding: ImageEncoding) -> CaptureShot? {
+    let fallback = { ScreencaptureFallback.window(pid: pid, maxWidth: maxWidth, encoding: encoding) }
+    if !ScreenCaptureHealth.usable { return fallbackCapture(timedOutAfter: nil, fallback) }
     let semaphore = DispatchSemaphore(value: 0)
     let box = CaptureBox()
 
     let task = Task.detached {
         defer { semaphore.signal() }
+        if await ScreenCaptureHealth.hangIfSimulated() { return }
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(
                 false, onScreenWindowsOnly: true)
@@ -2023,18 +2040,23 @@ func captureWindow(pid: pid_t, maxWidth: Int, encoding: ImageEncoding) -> Captur
     if waited == .timedOut {
         task.cancel()
         // Do not read `box` after cancel — the task may still be writing.
-        return finishCapture(box, timedOut: true, after: 15)
+        ScreenCaptureHealth.noteTimeout()
+        return fallbackCapture(timedOutAfter: 15, fallback)
     }
+    ScreenCaptureHealth.noteAnswered()
     return finishCapture(box, timedOut: false, after: 15)
 }
 
 /// Capture a whole display. Window capture covers one app; this is for seeing
 /// the desktop as a whole, including every monitor the user has attached.
 func captureDisplay(index: Int, maxWidth: Int, encoding: ImageEncoding) -> CaptureShot? {
+    let fallback = { ScreencaptureFallback.display(index: index, maxWidth: maxWidth, encoding: encoding) }
+    if !ScreenCaptureHealth.usable { return fallbackCapture(timedOutAfter: nil, fallback) }
     let semaphore = DispatchSemaphore(value: 0)
     let box = CaptureBox()
     let task = Task.detached {
         defer { semaphore.signal() }
+        if await ScreenCaptureHealth.hangIfSimulated() { return }
         // The cached display list first; if that display is gone or the
         // capture fails, once more with a fresh list.
         for fresh in [false, true] {
@@ -2075,8 +2097,10 @@ func captureDisplay(index: Int, maxWidth: Int, encoding: ImageEncoding) -> Captu
     if semaphore.wait(timeout: .now() + 20) == .timedOut {
         task.cancel()
         // Do not read `box` after cancel — the task may still be writing.
-        return finishCapture(box, timedOut: true, after: 20)
+        ScreenCaptureHealth.noteTimeout()
+        return fallbackCapture(timedOutAfter: 20, fallback)
     }
+    ScreenCaptureHealth.noteAnswered()
     return finishCapture(box, timedOut: false, after: 20)
 }
 
@@ -2084,10 +2108,13 @@ func captureDisplay(index: Int, maxWidth: Int, encoding: ImageEncoding) -> Captu
 /// global screen points, the same space click/hover take, so a model can zoom
 /// straight from the coordinates it already knows.
 func captureRegion(rect: CGRect, maxWidth: Int, encoding: ImageEncoding) -> CaptureShot? {
+    let fallback = { ScreencaptureFallback.region(rect: rect, maxWidth: maxWidth, encoding: encoding) }
+    if !ScreenCaptureHealth.usable { return fallbackCapture(timedOutAfter: nil, fallback) }
     let semaphore = DispatchSemaphore(value: 0)
     let box = CaptureBox()
     let task = Task.detached {
         defer { semaphore.signal() }
+        if await ScreenCaptureHealth.hangIfSimulated() { return }
         for fresh in [false, true] {
             do {
                 let displays = try await DisplayCache.shared.current(fresh: fresh)
@@ -2139,8 +2166,10 @@ func captureRegion(rect: CGRect, maxWidth: Int, encoding: ImageEncoding) -> Capt
     }
     if semaphore.wait(timeout: .now() + 15) == .timedOut {
         task.cancel()
-        return finishCapture(box, timedOut: true, after: 15)
+        ScreenCaptureHealth.noteTimeout()
+        return fallbackCapture(timedOutAfter: 15, fallback)
     }
+    ScreenCaptureHealth.noteAnswered()
     return finishCapture(box, timedOut: false, after: 15)
 }
 
@@ -5111,6 +5140,11 @@ if cliArguments.contains("cursor-overlay") {
     exit(2)
 }
 
+// Server mode from here on. Give this process its own executable path before
+// anything starts, so ScreenCaptureKit's daemon does not confuse it with other
+// servers run from the same binary (see PrivateExecutable.swift).
+PrivateExecutable.adopt()
+
 BrowserBridge.shared.start()
 
 /// Best-effort: drop the agent Chrome tab group when this MCP process is going
@@ -5133,6 +5167,7 @@ func installExitCleanupSignals() {
         source.setEventHandler {
             cleanupAgentBrowserTabsOnExit()
             AgentCursor.shared.hide()
+            PrivateExecutable.removeLink()
             exit(0)
         }
         source.resume()
@@ -5228,6 +5263,7 @@ while let line = readLine(strippingNewline: true) {
     // stdin closed: the client is gone, so the process should follow.
     cleanupAgentBrowserTabsOnExit()
     AgentCursor.shared.hide()
+    PrivateExecutable.removeLink()
     exit(0)
 }
 

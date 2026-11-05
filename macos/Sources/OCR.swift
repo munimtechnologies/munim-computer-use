@@ -199,11 +199,14 @@ func ocrWindowTarget(_ text: OCRText) -> WindowTarget? {
 /// Capture one window at full resolution for OCR, wherever it is: behind other
 /// windows, or parked on the invisible display.
 func captureWindowImage(windowID: UInt32) -> (CGImage, CGRect)? {
+    // While ScreenCaptureKit is not answering, see CaptureFallback.swift.
+    if !ScreenCaptureHealth.usable { return ScreencaptureFallback.windowImage(windowID: windowID) }
     let semaphore = DispatchSemaphore(value: 0)
     final class Box: @unchecked Sendable { var value: (CGImage, CGRect)? }
     let box = Box()
     let task = Task.detached {
         defer { semaphore.signal() }
+        if await ScreenCaptureHealth.hangIfSimulated() { return }
         guard let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true),
               let window = content.windows.first(where: { $0.windowID == windowID })
         else { return }
@@ -225,7 +228,9 @@ func captureWindowImage(windowID: UInt32) -> (CGImage, CGRect)? {
     }
     if semaphore.wait(timeout: .now() + 10) == .timedOut {
         task.cancel()
-        return nil
+        ScreenCaptureHealth.noteTimeout()
+        return ScreencaptureFallback.windowImage(windowID: windowID)
     }
+    ScreenCaptureHealth.noteAnswered()
     return box.value
 }
