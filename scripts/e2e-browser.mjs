@@ -197,8 +197,36 @@ pages["/upload"] = `<title>Upload</title>
     document.getElementById('pick').onclick = () => document.getElementById('doc').click();
     document.getElementById('form').addEventListener('submit', () => { window.submitted = true; });
   </script>`;
+// #66: JavaScript dialogs. Each button's result lands in the title, which a
+// snapshot shows once the dialog is answered.
+pages["/dialogs"] = `<title>Dialogs</title>
+  <button onclick="alert('Saved'); document.title = 'after alert'">Alert</button>
+  <button onclick="document.title = 'confirm ' + confirm('Delete the draft?')">Confirm</button>
+  <button onclick="document.title = 'prompt ' + prompt('Name the list', 'Groceries')">Prompt</button>
+  <button onclick="const first = confirm('Discard changes?'); alert('Then this one'); document.title = 'chain ' + first">Chain</button>`;
+// #65: an exception, a console error and two failed requests whose URLs carry
+// values that must not reach the model.
+pages["/broken"] = `<title>Broken</title><img src="/missing.png?token=SECRET-IN-QUERY">
+  <script>
+    fetch('/api/fail?session=SECRET-IN-QUERY#frag').catch(() => {});
+    console.error('render failed');
+    setTimeout(() => { null.boom; }, 50);
+  </script>`;
+pages["/clean"] = "<title>Clean</title><h1>Nothing wrong here</h1><script>console.log('just chatter')</script>";
+pages["/probe"] = `<title>Probe</title><button>Go</button><script>
+    window.probed = 0;
+    setInterval(() => {
+      const error = new Error('probe');
+      Object.defineProperty(error, 'stack', { get() { window.probed++; return ''; } });
+      console.debug(error);
+    }, 200);
+  </script>`;
 const site = http.createServer((req, res) => {
-  const body = pages[req.url.split("?")[0]];
+  const route = req.url.split("?")[0];
+  // No icon, and no error for it: a clean page must have no failed requests.
+  if (route === "/favicon.ico") return res.writeHead(204).end();
+  if (route === "/api/fail") return res.writeHead(500, { "content-type": "text/plain" }).end("failed");
+  const body = pages[route];
   res.writeHead(body ? 200 : 404, { "content-type": "text/html; charset=utf-8" });
   res.end(body ? `<!doctype html><meta charset="utf-8">${body}` : "not found");
 });
@@ -459,8 +487,9 @@ let tab;
 check("tools/list advertises browser_read and browser_request_credentials", async () => {
   const reply = await rpc("tools/list");
   const names = reply.result.tools.map((entry) => entry.name);
-  assert.equal(names.length, 35);
+  assert.equal(names.length, 37);
   assert.ok(names.includes("browser_read") && names.includes("browser_request_credentials"));
+  assert.ok(names.includes("browser_handle_dialog") && names.includes("browser_page_errors"));
 });
 
 check("browser_read returns the page text with headings", async () => {
@@ -1145,6 +1174,160 @@ check("a page hidden until its first frame is listed and read with its window mi
     await browserCommand("Browser.setWindowBounds", { windowId, bounds: { windowState: "normal" } });
     await ok("browser_close_tab", { tab_id: id });
   }
+});
+
+// ── JavaScript dialogs (#66) ────────────────────────────────────────────────
+// Every dialog here opens in a background tab. Nothing below brings Chrome
+// forward or sends OS input: the dialogs are answered through the debugger.
+
+let dialogTab;
+const DIALOG = /dialog open: JavaScript (\w+) dialog (d\d+): "([^"]*)"/;
+/** Click a button on the dialogs page by its label; the dialog it opens is in the reply. */
+async function clickButton(label) {
+  const snapshot = await ok("browser_snapshot", { tab_id: dialogTab });
+  return ok("browser_click", { tab_id: dialogTab, index: indexOf(snapshot, `button "${label}"`) });
+}
+/** The dialog the snapshot shows: [type, id, message]. */
+async function pendingDialog() {
+  const snapshot = await ok("browser_snapshot", { tab_id: dialogTab });
+  const match = DIALOG.exec(snapshot);
+  if (!match) throw new Error(`no dialog in:\n${snapshot}`);
+  return match.slice(1);
+}
+const pageTitle = async () => (await ok("browser_snapshot", { tab_id: dialogTab })).split("  [")[0];
+
+check("an alert shows in the snapshot, pauses other commands, and is accepted by id", async () => {
+  dialogTab = Number(/tab_id=(\d+)/.exec(await ok("browser_open_tab", { url: `${base}/dialogs` }))[1]);
+  await sleep(500);
+  const clicked = await clickButton("Alert");
+  assert.match(clicked, /the page opened a JavaScript alert dialog d\d+: "Saved" and is paused until it is answered/, clicked);
+  const [type, id, message] = await pendingDialog();
+  assert.deepEqual([type, message], ["alert", "Saved"]);
+  // A command that would hang behind the dialog says so at once.
+  const started = Date.now();
+  const read = await tool("browser_read", { tab_id: dialogTab });
+  assert.equal(read.isError, true);
+  assert.match(read.text, new RegExp(`not started: tab ${dialogTab} is showing a JavaScript alert dialog ${id}: "Saved"`));
+  assert.ok(Date.now() - started < 3000, "it waited on the paused page");
+  const answered = await ok("browser_handle_dialog", { tab_id: dialogTab, action: "accept", dialog_id: id });
+  assert.match(answered, new RegExp(`^accepted the dialog in tab ${dialogTab} — JavaScript alert dialog ${id}: "Saved"`), answered);
+  assert.equal(await pageTitle(), "after alert", "the page carried on after the alert");
+});
+
+check("a confirm can be accepted or dismissed, and the page sees which", async () => {
+  await clickButton("Confirm");
+  let [type, id] = await pendingDialog();
+  assert.equal(type, "confirm");
+  await ok("browser_handle_dialog", { tab_id: dialogTab, action: "accept", dialog_id: id });
+  assert.equal(await pageTitle(), "confirm true");
+  await clickButton("Confirm");
+  [, id] = await pendingDialog();
+  await ok("browser_handle_dialog", { tab_id: dialogTab, action: "dismiss", dialog_id: id });
+  assert.equal(await pageTitle(), "confirm false");
+});
+
+check("a prompt takes the agent's text, or keeps its default text", async () => {
+  await clickButton("Prompt");
+  let [type, id] = await pendingDialog();
+  assert.equal(type, "prompt");
+  assert.match(await ok("browser_snapshot", { tab_id: dialogTab }), /\(default text "Groceries"\)/);
+  const typed = await ok("browser_handle_dialog", { tab_id: dialogTab, action: "accept", dialog_id: id, prompt_text: "Hardware" });
+  assert.match(typed, /entering 8 characters/);
+  assert.equal(await pageTitle(), "prompt Hardware");
+  await clickButton("Prompt");
+  [, id] = await pendingDialog();
+  assert.match(await ok("browser_handle_dialog", { tab_id: dialogTab, action: "accept", dialog_id: id }), /keeping its default text/);
+  assert.equal(await pageTitle(), "prompt Groceries");
+});
+
+check("with no dialog open, handle_dialog answers nothing and says so", async () => {
+  const result = await tool("browser_handle_dialog", { tab_id: dialogTab, action: "accept" });
+  assert.equal(result.isError, true);
+  assert.match(result.text, /has no JavaScript dialog open, so nothing was answered/);
+});
+
+check("a dialog that replaced the one the agent read is refused, not answered", async () => {
+  await clickButton("Chain");
+  const [, first] = await pendingDialog();
+  const answered = await ok("browser_handle_dialog", { tab_id: dialogTab, action: "accept", dialog_id: first });
+  // The page opened its alert as soon as the confirm closed.
+  const next = /The page opened another at once: JavaScript alert dialog (d\d+): "Then this one"/.exec(answered);
+  assert.ok(next, answered);
+  const stale = await tool("browser_handle_dialog", { tab_id: dialogTab, action: "dismiss", dialog_id: first });
+  assert.equal(stale.isError, true);
+  assert.match(stale.text, new RegExp(`dialog ${first} is no longer open; tab ${dialogTab} now shows JavaScript alert dialog ${next[1]}: "Then this one". Nothing was answered`));
+  assert.deepEqual((await pendingDialog()).slice(1), [next[1], "Then this one"], "the replacement is still open");
+  await ok("browser_handle_dialog", { tab_id: dialogTab, action: "accept", dialog_id: next[1] });
+  assert.equal(await pageTitle(), "chain true");
+});
+
+check("another session cannot answer the dialog or read the tab's problems", async () => {
+  await clickButton("Confirm");
+  const [, id] = await pendingDialog();
+  for (const name of ["browser_handle_dialog", "browser_page_errors"]) {
+    const result = await tool(name, { session_id: "e2e-intruder", tab_id: dialogTab, action: "accept", dialog_id: id });
+    assert.equal(result.isError, true, name);
+    assert.match(result.text, /not one of this agent's tabs/, name);
+  }
+  assert.equal((await pendingDialog())[1], id, "the dialog is still open");
+  await ok("browser_handle_dialog", { tab_id: dialogTab, action: "dismiss", dialog_id: id });
+  assert.equal(await pageTitle(), "confirm false");
+  assert.equal(new RegExp(`^\\* tab_id=${dialogTab}\\b`, "m").test(await ok("browser_list_tabs", { all: true })), false, "the tab was brought to front");
+  await ok("browser_close_tab", { tab_id: dialogTab });
+});
+
+// ── page problems (#65) ─────────────────────────────────────────────────────
+
+check("browser_page_errors reports an exception, a console error and failed requests, redacted", async () => {
+  const id = Number(/tab_id=(\d+)/.exec(await ok("browser_open_tab", { url: `${base}/clean` }))[1]);
+  await sleep(500);
+  // Attach first, so the broken page loads while the agent watches for failed
+  // requests. Its exception and console error come from what Chrome kept.
+  await ok("browser_snapshot", { tab_id: id });
+  await ok("browser_navigate", { tab_id: id, url: `${base}/broken`, return_state: true });
+  await sleep(500);
+  const text = await ok("browser_page_errors", { tab_id: id });
+  assert.match(text, new RegExp(`^\\d+ problems in tab ${id}: exceptions and console errors the page has logged since it loaded \\(Chrome keeps a limited number\\), and failed requests since the agent attached \\d+s ago`), text);
+  assert.match(text, /exception \d+s ago: Uncaught TypeError: Cannot read properties of null \(reading 'boom'\)/, text);
+  assert.match(text, /console\.error \d+s ago: render failed/, text);
+  assert.match(text, new RegExp(`request \\d+s ago: HTTP 404 Not Found  \\[${base}/missing\\.png\\]`), text);
+  assert.match(text, new RegExp(`request \\d+s ago: HTTP 500 Internal Server Error  \\[${base}/api/fail\\]`), text);
+  assert.doesNotMatch(text, /SECRET-IN-QUERY|#frag/, "a query value or fragment reached the model");
+  // Reading them did not reload, navigate or show the tab.
+  assert.match(await ok("browser_snapshot", { tab_id: id }), new RegExp(`^Broken {2}\\[${base}/broken\\]`));
+  assert.equal(new RegExp(`^\\* tab_id=${id}\\b`, "m").test(await ok("browser_list_tabs", { all: true })), false, "the tab was brought to front");
+  const ages = (reply) => reply.replace(/\d+s ago/g, "_ ago");
+  assert.equal(ages(await ok("browser_page_errors", { tab_id: id })), ages(text), "reading them changed what is there");
+  await ok("browser_close_tab", { tab_id: id });
+});
+
+check("a clean page gives a clear empty result", async () => {
+  const id = Number(/tab_id=(\d+)/.exec(await ok("browser_open_tab", { url: `${base}/clean` }))[1]);
+  await sleep(500);
+  await ok("browser_snapshot", { tab_id: id });
+  await ok("browser_navigate", { tab_id: id, url: `${base}/clean`, return_state: true });
+  const text = await ok("browser_page_errors", { tab_id: id });
+  assert.match(text, new RegExp(`^no problems in tab ${id}: no uncaught exceptions or console errors logged since the page loaded, and no failed requests since the agent attached \\d+s ago$`), text);
+  await ok("browser_close_tab", { tab_id: id });
+});
+
+// The best-known CDP check: log an Error whose stack getter runs only when a
+// debugger with Runtime enabled serializes console arguments. Runtime is on
+// only while browser_page_errors reads Chrome's record, never in between.
+check("the page cannot see Runtime enabled while the agent works in it", async () => {
+  const id = Number(/tab_id=(\d+)/.exec(await ok("browser_open_tab", { url: `${base}/probe` }))[1]);
+  await sleep(500);
+  const atProbe = (url) => url === `${base}/probe`;
+  await ok("browser_snapshot", { tab_id: id });
+  await ok("browser_click", { tab_id: id, index: indexOf(await ok("browser_snapshot", { tab_id: id }), 'button "Go"') });
+  await sleep(600);
+  assert.equal(await evaluateIn(atProbe, "window.probed"), 0, "the probe saw Runtime enabled while the agent acted");
+  await ok("browser_page_errors", { tab_id: id });
+  const during = await evaluateIn(atProbe, "window.probed");
+  await sleep(600);
+  assert.equal(await evaluateIn(atProbe, "window.probed"), during, "Runtime stayed on after browser_page_errors");
+  console.log(`     (the probe fired ${during} times during browser_page_errors' replay)`);
+  await ok("browser_close_tab", { tab_id: id });
 });
 
 let failed = 0;

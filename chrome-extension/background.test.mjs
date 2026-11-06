@@ -52,7 +52,10 @@ let sent = [];
 /** Tabs the extension attached the debugger to, in order. */
 const attaches = [];
 let debuggerDetachListener = null;
+/** chrome.debugger.onEvent: tests play DevTools events (dialogs, problems) through it. */
+let debuggerEventListener = null;
 let tabCreatedListener = null;
+let tabRemovedListener = null;
 
 /** A tab the page opened (target=_blank, window.open), as Chrome reports it. */
 function openChild(openerTabId, url = "https://shop.example/terms") {
@@ -139,7 +142,7 @@ const chrome = {
     },
     ungroup: async (ids) => ids.forEach((id) => { tabs.get(id).groupId = -1; }),
     onUpdated: { addListener() {}, removeListener() {} },
-    onRemoved: { addListener() {} },
+    onRemoved: { addListener: (fn) => { tabRemovedListener = fn; } },
     onCreated: { addListener: (fn) => { tabCreatedListener = fn; } },
   },
   tabGroups: {
@@ -155,6 +158,7 @@ const chrome = {
     },
     detach: async () => {},
     onDetach: { addListener: (fn) => { debuggerDetachListener = fn; } },
+    onEvent: { addListener: (fn) => { debuggerEventListener = fn; } },
     sendCommand: async (target, method, params) => pageEval(method, params ?? {}, target.tabId),
   },
   windows: {
@@ -1689,6 +1693,319 @@ test("upload_file passes on why an index names no file input, and checks its arg
   } finally {
     pageEval = () => ({ result: { value: {} } });
     await call("close_all_tabs", { sessionId: "up4" });
+  }
+});
+
+// ── JavaScript dialogs (#66) ────────────────────────────────────────────────
+
+/** A value from the extension's realm as plain data, for deep comparisons. */
+const plain = (value) => JSON.parse(JSON.stringify(value));
+/** Chrome reporting a dialog in a tab, the way Page.javascriptDialogOpening does. */
+function openDialog(tabId, type, message, defaultPrompt = "") {
+  debuggerEventListener({ tabId }, "Page.javascriptDialogOpening", { url: "https://shop.example/", frameId: "F", message, type, hasBrowserHandler: true, defaultPrompt });
+}
+const closeDialog = (tabId, result) => debuggerEventListener({ tabId }, "Page.javascriptDialogClosed", { frameId: "F", result, userInput: "" });
+/**
+ * A page that logs every DevTools command and answers Page.handleJavaScriptDialog
+ * by closing the dialog. `stored` is what Chrome holds of the page's console
+ * messages and exceptions: Runtime.enable replays it as events before replying.
+ */
+function playDialogPage(stored = []) {
+  const seen = [];
+  pageEval = (method, params, tabId) => {
+    seen.push([method, params]);
+    if (method === "Page.handleJavaScriptDialog") closeDialog(tabId, params.accept);
+    if (method === "Runtime.enable") for (const [event, details] of stored) debuggerEventListener({ tabId }, event, details);
+    if (params.expression?.includes("queryAll(document, sel")) return { result: { value: { title: "Shop", url: "https://shop.example/", elements: [], total: 0 } } };
+    return { result: { value: {} } };
+  };
+  return seen;
+}
+
+test("attaching turns on dialogs and failed requests after focus emulation, and never Runtime", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/", sessionId: "watch" })).tabId;
+  const seen = playDialogPage();
+  await call("snapshot", { tabId: tab, sessionId: "watch" });
+  await call("snapshot", { tabId: tab, sessionId: "watch" });
+  const methods = seen.map(([method]) => method);
+  assert.equal(methods[0], "Emulation.setFocusEmulationEnabled");
+  for (const domain of ["Page.enable", "Log.enable"]) assert.ok(methods.includes(domain), `${domain} was not sent`);
+  // Runtime left on is what bot checks on the user's signed-in sites look for.
+  assert.ok(!methods.includes("Runtime.enable"), "Runtime was turned on outside browser_page_errors");
+  assert.ok(!methods.includes("Network.enable"), "every request would stream to the extension");
+  pageEval = () => ({ result: { value: {} } });
+  await call("close_all_tabs", { sessionId: "watch" });
+});
+
+test("an open dialog shows in the snapshot and every page command says so at once", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/", sessionId: "dlg" })).tabId;
+  const seen = playDialogPage();
+  try {
+    await call("snapshot", { tabId: tab, sessionId: "dlg" });
+    openDialog(tab, "confirm", "Delete this order?");
+    seen.length = 0;
+    const snap = await call("snapshot", { tabId: tab, sessionId: "dlg" });
+    assert.equal(snap.jsDialog.type, "confirm");
+    assert.equal(snap.jsDialog.message, "Delete this order?");
+    assert.match(snap.jsDialog.id, /^d\d+$/);
+    assert.equal(snap.total, 0);
+    assert.match(snap.empty, /waits on its JavaScript confirm dialog/);
+    assert.deepEqual(seen, [], "nothing was sent to a paused page");
+    for (const [command, params] of [["read", {}], ["click", { index: 1 }], ["type", { text: "x" }], ["screenshot", {}], ["navigate", { url: "https://shop.example/next" }]]) {
+      const message = await refuses(command, { tabId: tab, sessionId: "dlg", ...params });
+      assert.match(message, new RegExp(`not started: tab ${tab} is showing a JavaScript confirm dialog ${snap.jsDialog.id}: "Delete this order\\?"`), command);
+      assert.match(message, /browser_handle_dialog/);
+    }
+    assert.deepEqual(seen, [], "nothing was sent to a paused page");
+    assert.ok(!tabs.get(tab).url.endsWith("/next"), "navigate would have dismissed the dialog");
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "dlg" });
+  }
+});
+
+test("handle_dialog answers the dialog named by id and refuses a replaced one", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/", sessionId: "dlg2" })).tabId;
+  const seen = playDialogPage();
+  try {
+    await call("snapshot", { tabId: tab, sessionId: "dlg2" });
+    openDialog(tab, "confirm", "Delete this order?");
+    const first = (await call("snapshot", { tabId: tab, sessionId: "dlg2" })).jsDialog;
+    // The page closed that one (the user answered it) and opened another.
+    closeDialog(tab, true);
+    openDialog(tab, "confirm", "Also delete the invoice?");
+    const stale = await refuses("handle_dialog", { tabId: tab, sessionId: "dlg2", action: "accept", dialogId: first.id });
+    assert.match(stale, new RegExp(`dialog ${first.id} is no longer open; tab ${tab} now shows JavaScript confirm dialog d\\d+: "Also delete the invoice\\?". Nothing was answered`));
+    assert.ok(!seen.some(([method]) => method === "Page.handleJavaScriptDialog"), "a replaced dialog was answered");
+    const current = (await call("snapshot", { tabId: tab, sessionId: "dlg2" })).jsDialog;
+    const done = await callAndWait("handle_dialog", { tabId: tab, sessionId: "dlg2", action: "dismiss", dialogId: current.id });
+    assert.equal(done.action, "dismiss");
+    assert.equal(done.dialog.message, "Also delete the invoice?");
+    assert.equal(done.next, undefined);
+    assert.deepEqual(plain(seen.filter(([method]) => method === "Page.handleJavaScriptDialog").map(([, params]) => params)), [{ accept: false }]);
+    // The page runs again.
+    const snap = await call("snapshot", { tabId: tab, sessionId: "dlg2" });
+    assert.equal(snap.jsDialog, undefined);
+    assert.equal(snap.title, "Shop");
+    // Answering it twice says it is gone, and how.
+    assert.match(await refuses("handle_dialog", { tabId: tab, sessionId: "dlg2", action: "accept", dialogId: current.id }), /already dismissed by the agent\. Nothing was answered/);
+    assert.match(await refuses("handle_dialog", { tabId: tab, sessionId: "dlg2", action: "accept" }), /has no JavaScript dialog open, so nothing was answered/);
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "dlg2" });
+  }
+});
+
+test("a prompt takes the agent's text, or its default text, and prompt_text fits only a prompt", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/", sessionId: "dlg3" })).tabId;
+  const seen = playDialogPage();
+  const answers = () => seen.filter(([method]) => method === "Page.handleJavaScriptDialog").map(([, params]) => params);
+  try {
+    await call("snapshot", { tabId: tab, sessionId: "dlg3" });
+    openDialog(tab, "prompt", "Name the list", "Groceries");
+    assert.equal((await call("snapshot", { tabId: tab, sessionId: "dlg3" })).jsDialog.defaultPrompt, "Groceries");
+    assert.match(await refuses("handle_dialog", { tabId: tab, sessionId: "dlg3", action: "dismiss", promptText: "x" }), /prompt_text only applies when accepting a prompt dialog/);
+    assert.match(await refuses("handle_dialog", { tabId: tab, sessionId: "dlg3", action: "ok" }), /action must be accept or dismiss/);
+    const typed = await callAndWait("handle_dialog", { tabId: tab, sessionId: "dlg3", action: "accept", promptText: "Hardware" });
+    assert.equal(typed.promptChars, 8);
+    openDialog(tab, "prompt", "Name the list", "Groceries");
+    const kept = await callAndWait("handle_dialog", { tabId: tab, sessionId: "dlg3", action: "accept" });
+    assert.equal(kept.promptDefault, true);
+    openDialog(tab, "alert", "Saved");
+    assert.match(await refuses("handle_dialog", { tabId: tab, sessionId: "dlg3", action: "accept", promptText: "x" }), /d\d+ is an alert dialog/);
+    await callAndWait("handle_dialog", { tabId: tab, sessionId: "dlg3", action: "accept" });
+    assert.deepEqual(plain(answers()), [{ accept: true, promptText: "Hardware" }, { accept: true, promptText: "Groceries" }, { accept: true }]);
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "dlg3" });
+  }
+});
+
+test("a dialog the page opens right after an answer is reported with it", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/", sessionId: "dlg4" })).tabId;
+  playDialogPage();
+  const base = pageEval;
+  pageEval = (method, params, tabId) => {
+    const answer = base(method, params, tabId);
+    if (method === "Page.handleJavaScriptDialog") setTimeout(() => openDialog(tabId, "alert", "Order deleted"), 20);
+    return answer;
+  };
+  try {
+    await call("snapshot", { tabId: tab, sessionId: "dlg4" });
+    openDialog(tab, "confirm", "Delete this order?");
+    const done = await callAndWait("handle_dialog", { tabId: tab, sessionId: "dlg4", action: "accept" });
+    assert.equal(done.next.type, "alert");
+    assert.equal(done.next.message, "Order deleted");
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "dlg4" });
+  }
+});
+
+test("a click whose press opens a dialog is reported as done, with the dialog", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/", sessionId: "dlg5" })).tabId;
+  const log = playClick({ found: { reachable: true } });
+  const click = pageEval;
+  // The press's release never answers: the page is in its click handler, in confirm().
+  pageEval = (method, params, tabId) => {
+    if (method === "Input.dispatchMouseEvent" && params.type === "mouseReleased") {
+      log.input.push(params.type);
+      setTimeout(() => openDialog(tabId, "confirm", "Leave the group?"), 5);
+      return new Promise(() => {});
+    }
+    return click(method, params, tabId);
+  };
+  try {
+    const result = await callAndWait("click", { tabId: tab, index: 4, sessionId: "dlg5" });
+    assert.deepEqual(log.input, ["mouseMoved", "mousePressed", "mouseReleased"]);
+    assert.equal(log.pageEvents, 0, "the press was played a second time");
+    assert.equal(result.route, "input");
+    assert.equal(result.target, '[4] div "More"');
+    assert.equal(result.jsDialog.message, "Leave the group?");
+    assert.match(result.note, /the page opened a JavaScript confirm dialog d\d+: "Leave the group\?" and is paused until it is answered/);
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "dlg5" });
+  }
+});
+
+test("another task cannot answer a dialog or read problems in a tab it does not own", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/", sessionId: "owner" })).tabId;
+  playDialogPage();
+  try {
+    await call("snapshot", { tabId: tab, sessionId: "owner" });
+    openDialog(tab, "confirm", "Delete this order?");
+    assert.match(await refuses("handle_dialog", { tabId: tab, sessionId: "intruder", action: "accept" }), /not one of this agent's tabs/);
+    assert.match(await refuses("page_errors", { tabId: tab, sessionId: "intruder" }), /not one of this agent's tabs/);
+    assert.equal((await call("snapshot", { tabId: tab, sessionId: "owner" })).jsDialog.message, "Delete this order?", "still open");
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "owner" });
+  }
+});
+
+// ── page problems (#65) ─────────────────────────────────────────────────────
+
+const exception = (text, description, at) => ["Runtime.exceptionThrown", { timestamp: at, exceptionDetails: { text, url: "https://shop.example/app.js?v=9", lineNumber: 11, columnNumber: 4, exception: { description } } }];
+const consoleCall = (type, args, at) => ["Runtime.consoleAPICalled", { type, timestamp: at, args }];
+const logEntry = (entry) => ["Log.entryAdded", { entry }];
+
+test("page_errors reads exceptions and console errors from Chrome's replay, with failed requests since attach, redacted", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/", sessionId: "probs" })).tabId;
+  const now = Date.now();
+  // What Chrome holds for the document, handed over on Runtime.enable.
+  const seen = playDialogPage([
+    consoleCall("error", [{ type: "string", value: "boot failed" }], now - 60000),
+    exception("Uncaught", "TypeError: Cannot read properties of null (reading 'x')\n    at app.js:12:5", now + 1),
+    consoleCall("log", [{ type: "string", value: "just chatter" }], now + 2),
+    consoleCall("error", [{ type: "string", value: "fetch https://api.example/v1/me?token=SECRET#frag failed" }, { type: "object", description: "Object" }], now + 3),
+  ]);
+  try {
+    await call("snapshot", { tabId: tab, sessionId: "probs" });
+    for (const [method, params] of [
+      // Log.enable replays what Chrome logged before the agent attached.
+      logEntry({ source: "network", level: "error", text: "Failed to load resource: the server responded with a status of 404 (Not Found)", url: "https://shop.example/old.png", timestamp: now - 50000 }),
+      logEntry({ source: "network", level: "error", text: "Failed to load resource: the server responded with a status of 500 (Internal Server Error)", url: "https://user:pw@api.example/orders?session=SECRET#x", timestamp: now + 4 }),
+      logEntry({ source: "network", level: "error", text: "Failed to load resource: net::ERR_NAME_NOT_RESOLVED", url: "https://cdn.example/lib.js", timestamp: now + 5 }),
+      logEntry({ source: "violation", level: "verbose", text: "Forced reflow while executing JavaScript", timestamp: now + 6 }),
+      // Runtime is off between calls; a stray event is not kept.
+      consoleCall("error", [{ type: "string", value: "outside a call" }], now + 7),
+    ]) debuggerEventListener({ tabId: tab }, method, params);
+    seen.length = 0;
+    const result = await callAndWait("page_errors", { tabId: tab, sessionId: "probs" });
+    assert.equal(result.fresh, undefined, "the tab was attached already");
+    assert.match(result.since, /^\d+s$/);
+    assert.equal(result.note, undefined);
+    const listed = () => plain(result.entries.map((entry) => [entry.kind, entry.text, entry.url ?? null, entry.earlier ?? false]));
+    assert.deepEqual(listed(), [
+      ["console.error", "boot failed", null, false],
+      ["request", "HTTP 404 Not Found", "https://shop.example/old.png", true],
+      ["exception", "Uncaught TypeError: Cannot read properties of null (reading 'x')", "https://shop.example/app.js:12:5", false],
+      ["console.error", "fetch https://api.example/v1/me failed Object", null, false],
+      ["request", "HTTP 500 Internal Server Error", "https://api.example/orders", false],
+      ["request", "net::ERR_NAME_NOT_RESOLVED", "https://cdn.example/lib.js", false],
+    ]);
+    assert.ok(!JSON.stringify(result).includes("SECRET"), "a query value leaked");
+    assert.ok(!JSON.stringify(result).includes("pw@"), "URL credentials leaked");
+    // Runtime was on only for the call, and nothing ran in the page.
+    assert.deepEqual(seen.map(([method]) => method), ["Runtime.enable", "Runtime.disable"]);
+    // A second call takes the same replay again, not twice as much.
+    const again = await callAndWait("page_errors", { tabId: tab, sessionId: "probs" });
+    assert.equal(again.entries.length, result.entries.length);
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "probs" });
+  }
+});
+
+test("page_errors keeps a bounded list, counts repeats, and forgets a released or closed tab", async () => {
+  const opened = await call("open_tab", { url: "https://shop.example/", sessionId: "probs2" });
+  const tab = opened.tabId;
+  const now = Date.now();
+  const stored = [
+    ...Array.from({ length: 3 }, () => consoleCall("error", [{ type: "string", value: "poll failed" }], now)),
+    ...Array.from({ length: 60 }, (_, i) => consoleCall("error", [{ type: "string", value: `error ${i} ${"x".repeat(500)}` }], now + 1 + i)),
+  ];
+  playDialogPage(stored);
+  try {
+    await call("snapshot", { tabId: tab, sessionId: "probs2" });
+    const result = await callAndWait("page_errors", { tabId: tab, sessionId: "probs2" });
+    assert.equal(result.entries.length, 50);
+    assert.equal(result.limit, 50);
+    assert.equal(result.dropped, 11, "61 different problems, the first repeated three times");
+    assert.ok(result.entries.every((entry) => entry.text.length <= 300));
+    assert.match(result.entries.at(-1).text, /^error 59 x+…$/);
+    // A repeat is counted on the entry before it.
+    stored.length = 3;
+    const counted = await callAndWait("page_errors", { tabId: tab, sessionId: "probs2" });
+    assert.deepEqual(plain(counted.entries.map((entry) => [entry.text, entry.repeats])), [["poll failed", 3]]);
+    // Failed requests are kept between calls; closed by the user, nothing is kept for the id.
+    debuggerEventListener({ tabId: tab }, ...logEntry({ source: "network", level: "error", text: "Failed to load resource: net::ERR_FAILED", url: "https://x.example/", timestamp: Date.now() }));
+    assert.equal(vm.runInContext(`captures.get(${tab}).entries.length`, extensionContext), 1);
+    tabRemovedListener(tab);
+    debuggerEventListener({ tabId: tab }, ...logEntry({ source: "network", level: "error", text: "Failed to load resource: net::ERR_FAILED", url: "https://x.example/", timestamp: Date.now() }));
+    assert.equal(vm.runInContext(`captures.has(${tab})`, extensionContext), false);
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "probs2" });
+  }
+});
+
+test("page_errors on a page paused by a dialog lists failed requests and says why exceptions are missing", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/", sessionId: "probs4" })).tabId;
+  const seen = playDialogPage([consoleCall("error", [{ type: "string", value: "never read" }], Date.now())]);
+  try {
+    await call("snapshot", { tabId: tab, sessionId: "probs4" });
+    debuggerEventListener({ tabId: tab }, ...logEntry({ source: "network", level: "error", text: "Failed to load resource: the server responded with a status of 403 (Forbidden)", url: "https://shop.example/api", timestamp: Date.now() }));
+    openDialog(tab, "alert", "Session expired");
+    seen.length = 0;
+    const result = await callAndWait("page_errors", { tabId: tab, sessionId: "probs4" });
+    assert.match(result.note, /cannot be read while the page waits on JavaScript dialog d\d+/);
+    assert.deepEqual(plain(result.entries.map((entry) => entry.text)), ["HTTP 403 Forbidden"]);
+    assert.deepEqual(seen, [], "a paused page was sent a command");
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "probs4" });
+  }
+});
+
+test("page_errors on a tab not attached yet starts watching there and says so", async () => {
+  const user = makeTab({ url: "https://shop.example/account", title: "Account" });
+  const seen = playDialogPage();
+  try {
+    await call("use_tab", { tabId: user.id, sessionId: "probs3" });
+    const result = await callAndWait("page_errors", { tabId: user.id, sessionId: "probs3" });
+    assert.equal(result.fresh, true);
+    assert.equal(result.entries.length, 0);
+    const methods = seen.map(([method]) => method);
+    assert.ok(methods.indexOf("Runtime.disable") > methods.indexOf("Runtime.enable"), "Runtime was left on");
+    assert.ok(!methods.some((method) => method === "Page.navigate" || method === "Page.reload" || method === "Page.bringToFront"));
+    assert.equal(tabs.get(user.id).active, false, "the tab was not activated");
+    await call("release_tab", { tabId: user.id, sessionId: "probs3" });
+    assert.equal(vm.runInContext(`captures.has(${user.id})`, extensionContext), false, "the capture outlived the release");
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "probs3" });
   }
 });
 

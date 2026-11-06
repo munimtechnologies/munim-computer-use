@@ -500,6 +500,7 @@ function forgetTab(clientId, tabId) {
   if (tabOwner.get(tabId) === clientId) {
     tabOwner.delete(tabId);
     attached.delete(tabId);
+    forgetPage(tabId);
   }
 }
 
@@ -580,6 +581,7 @@ async function closeOwnedTabs(clientId, ids, expectedGroupId) {
     if (state) state.tabs.delete(id);
     tabOwner.delete(id);
     attached.delete(id);
+    forgetPage(id);
     try {
       await chrome.tabs.remove(id);
     } catch {
@@ -646,6 +648,7 @@ async function attach(tabId) {
   } catch {
     // Older Chrome, or a session Chrome ended at once.
   }
+  await watchPage(tabId);
   // A page that loaded while Chrome was not drawing it has done no frame work
   // yet. Web-component apps (Stencil, which Fathom uses) keep every component
   // `visibility: hidden` until its first frame hydrates it, so read at once it
@@ -701,12 +704,400 @@ async function redraw(tabId) {
 // this browser" bar, DevTools takes the tab, or the renderer goes away.
 // Forget it, so the next command attaches again instead of failing forever.
 chrome.debugger.onDetach.addListener((source) => {
-  if (source.tabId !== undefined) attached.delete(source.tabId);
+  if (source.tabId === undefined) return;
+  attached.delete(source.tabId);
+  forgetPage(source.tabId);
 });
+
+// ── JavaScript dialogs and page problems ────────────────────────────────────
+//
+// alert(), confirm(), prompt() and beforeunload are browser dialogs, not DOM:
+// no snapshot can see them, and while one is open the page runs nothing else.
+// The Page domain reports them (Page.javascriptDialogOpening/Closed) and
+// Page.handleJavaScriptDialog answers them without activating the tab or
+// sending OS input.
+//
+// What Chrome does, checked on Chrome 151 (Chrome for Testing, headed and
+// headless) with the tab in the background and a debugger attached:
+//   - A dialog in a background tab is not dismissed by Chrome, with or without
+//     the Page domain. It stays open, Chrome shows it to the user when they
+//     switch to the tab (the event says hasBrowserHandler: true), and the page
+//     is paused: Runtime.evaluate and Page.captureScreenshot do not answer, nor
+//     does the Input.dispatchMouseEvent whose click opened it, until it closes.
+//   - The user can still answer it in Chrome; Page.javascriptDialogClosed then
+//     arrives without the agent having acted.
+//   - A dialog that opened before the agent attached is not reported: Page.enable
+//     itself does not answer while it is open, and Page.handleJavaScriptDialog
+//     says no dialog is showing. Only the user can answer that one.
+//
+// Failed requests come from Log, on from the moment the agent attaches: Chrome
+// logs every net error and HTTP error status there, documents included, with
+// the URL. Log reports only failures, so nothing is sent per successful
+// request, which is why the Network domain is not used: it would stream every
+// request with its headers to the extension. Log.enable also replays what
+// Chrome still holds for the current document; those entries are kept and
+// marked as earlier than the capture.
+//
+// Exceptions and console errors come from Runtime, and Runtime is NOT left on.
+// A page can tell that a debugger has Runtime enabled (the best-known probe
+// logs an Error whose stack getter fires when DevTools serializes console
+// arguments), and the user's signed-in sites are the ones that flag accounts
+// for it. Chrome keeps each document's console messages and exceptions anyway,
+// whether or not anyone listens, and replays them on Runtime.enable. So
+// browser_page_errors turns Runtime on, takes the replay, and turns it off
+// again: what it lists is what the page has logged since it loaded, as far as
+// Chrome kept it. The replay itself serializes the stored messages, so a page
+// with such a probe can still notice that moment; it cannot notice the hours
+// in between.
+
+/** tabId → the dialog open in that tab now. */
+const dialogs = new Map();
+/** tabId → the last dialog that closed, so a stale dialog_id can say why. */
+const closedDialogs = new Map();
+/** tabId → listeners waiting for a dialog to open (see whileNoDialog). */
+const dialogListeners = new Map();
+let dialogCount = 0;
+/** tabId → { since, entries, dropped }: failed requests and other logged errors since the agent attached. */
+const captures = new Map();
+/** tabId → { since, entries, dropped }: what one browser_page_errors call is taking from Chrome's replay. */
+const replays = new Map();
+// How long the replay keeps arriving after Runtime.enable answers. Chrome sends
+// it before the reply; the slack covers the hop to the service worker.
+const REPLAY_SETTLE_MS = 100;
+const PAGE_PROBLEM_LIMIT = 50;
+const PAGE_PROBLEM_TEXT = 300;
+const DIALOG_MESSAGE_MAX = 2000;
+// Short: a page already paused behind a dialog never answers these, and the
+// attach that sends them must finish within its own deadline.
+const WATCH_TIMEOUT_MS = 3000;
+
+/// Start a fresh capture for a newly attached tab and turn on the domains that
+/// report dialogs and failed requests. Runtime stays off (see above). A Chrome
+/// that refuses one still works; it just reports less.
+async function watchPage(tabId) {
+  captures.set(tabId, { since: Date.now(), entries: [], dropped: 0 });
+  await Promise.all(["Page.enable", "Log.enable"].map((method) =>
+    withDeadline(chrome.debugger.sendCommand({ tabId }, method), method, WATCH_TIMEOUT_MS).catch(() => {})));
+}
+
+/// Drop a tab's dialog state and capture: it was released, closed or detached.
+function forgetPage(tabId) {
+  dialogs.delete(tabId);
+  closedDialogs.delete(tabId);
+  dialogListeners.delete(tabId);
+  captures.delete(tabId);
+  replays.delete(tabId);
+}
+
+/// What the agent is shown of a dialog. A prompt's default text is part of
+/// what the page asked, so it is shown too; what the user typed never is.
+function publicDialog(dialog) {
+  return {
+    id: dialog.id, type: dialog.type, message: dialog.message,
+    ...(dialog.type === "prompt" ? { defaultPrompt: dialog.defaultPrompt } : {}),
+  };
+}
+
+function dialogLabel(dialog) {
+  return `JavaScript ${dialog.type} dialog ${dialog.id}: "${dialog.message}"`;
+}
+
+/// For a command that would have run in a page already paused by a dialog.
+function dialogPendingError(tabId, dialog) {
+  const error = new Error(
+    `not started: tab ${tabId} is showing a ${dialogLabel(dialog)}. The page is paused until it is answered, ` +
+      `so nothing else can run in it: call browser_handle_dialog with dialog_id=${dialog.id} to accept or dismiss it`,
+  );
+  error.dialog = dialog;
+  return error;
+}
+
+/// For a command that was running when the page opened a dialog.
+function dialogOpenedError(tabId, dialog) {
+  const error = new Error(
+    `the page in tab ${tabId} opened a ${dialogLabel(dialog)} while the agent was acting on it. The action ` +
+      "reached the page, but whether all of it ran is unknown, and the page is paused until the dialog is " +
+      `answered: call browser_handle_dialog with dialog_id=${dialog.id} to accept or dismiss it, then look at the ` +
+      "page before doing anything again",
+  );
+  error.dialog = dialog;
+  error.opened = true;
+  return error;
+}
+
+/// The result of a click or key press that made the page open a dialog. The
+/// press reached the page (that is what opened it), so it is reported as done,
+/// with the dialog, rather than as a failure.
+function openedDialog(dialog, result = {}) {
+  const note = `the page opened a ${dialogLabel(dialog)} and is paused until it is answered: ` +
+    `call browser_handle_dialog with dialog_id=${dialog.id} to accept or dismiss it`;
+  return { ...result, jsDialog: publicDialog(dialog), note: result.note ? `${result.note}; ${note}` : note };
+}
+
+/// Settle a DevTools command, or reject as soon as the page opens a dialog: the
+/// command would not answer until the dialog closed.
+function whileNoDialog(tabId, promise) {
+  let listener;
+  const opened = new Promise((_, reject) => {
+    listener = (dialog) => reject(dialogOpenedError(tabId, dialog));
+    if (!dialogListeners.has(tabId)) dialogListeners.set(tabId, new Set());
+    dialogListeners.get(tabId).add(listener);
+  });
+  return Promise.race([promise, opened]).finally(() => dialogListeners.get(tabId)?.delete(listener));
+}
+
+/// The dialog that opens in a tab within `ms`, or null.
+function nextDialog(tabId, ms) {
+  if (dialogs.has(tabId)) return Promise.resolve(dialogs.get(tabId));
+  return whileNoDialog(tabId, sleep(ms).then(() => null)).catch((error) => error.dialog ?? null);
+}
+
+/// "12s", "4m", "3h", as the servers word ages elsewhere.
+function agoText(ms) {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  if (seconds < 90) return `${seconds}s`;
+  if (seconds < 5400) return `${Math.floor(seconds / 60)}m`;
+  return `${Math.floor(seconds / 3600)}h`;
+}
+
+/// A URL with no query string, fragment or user name and password: those can
+/// carry tokens and session ids. A data: URL keeps only its type.
+function redactUrl(url) {
+  const text = String(url ?? "");
+  if (!text) return "";
+  if (/^data:/i.test(text)) return `${text.slice(0, Math.min(60, text.search(/[,;]|$/)))},…`;
+  try {
+    const parsed = new URL(text);
+    parsed.username = "";
+    parsed.password = "";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.href.slice(0, PAGE_PROBLEM_TEXT);
+  } catch {
+    return text.split(/[?#]/)[0].slice(0, PAGE_PROBLEM_TEXT);
+  }
+}
+
+/// Message text with the same parts taken out of any URL in it, cut to length.
+function redactText(text) {
+  const plain = String(text ?? "")
+    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/?#@"'<>]+@/gi, "$1")
+    .replace(/\b((?:https?|wss?|ftp|file|blob):\/\/?[^\s?#"'<>()]*)[?#][^\s"'<>()]*/gi, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+  return plain.length > PAGE_PROBLEM_TEXT ? `${plain.slice(0, PAGE_PROBLEM_TEXT - 1)}…` : plain;
+}
+
+/// Where in a script something happened, as url:line:column.
+function scriptPlace(url, line, column) {
+  if (!url) return undefined;
+  return `${redactUrl(url)}${Number.isInteger(line) ? `:${line + 1}` : ""}${Number.isInteger(column) ? `:${column + 1}` : ""}`;
+}
+
+/// One DevTools event as a page problem, or null when it is not one. Only
+/// errors are kept: an exception nobody caught, console.error and
+/// console.assert, a request that failed, and other errors Chrome logged
+/// (blocked content, security). Values are cut down and redacted here, so
+/// nothing longer or more revealing is ever stored.
+function pageProblem(method, params) {
+  if (method === "Runtime.exceptionThrown") {
+    const details = params?.exceptionDetails ?? {};
+    const first = String(details.exception?.description ?? "").split("\n")[0];
+    const prefix = details.text && details.text !== first ? details.text : "";
+    const text = [prefix, first].filter(Boolean).join(" ") || "Uncaught exception";
+    const frame = details.stackTrace?.callFrames?.[0];
+    return {
+      kind: "exception", at: params.timestamp, text: redactText(text),
+      url: scriptPlace(details.url || frame?.url, details.lineNumber ?? frame?.lineNumber, details.columnNumber ?? frame?.columnNumber),
+    };
+  }
+  if (method === "Runtime.consoleAPICalled") {
+    if (params?.type !== "error" && params?.type !== "assert") return null;
+    const parts = (params.args ?? []).map((arg) =>
+      arg.value !== undefined ? String(arg.value) : String(arg.description ?? arg.unserializableValue ?? arg.type ?? "").split("\n")[0]);
+    const frame = params.stackTrace?.callFrames?.[0];
+    return {
+      kind: `console.${params.type}`, at: params.timestamp,
+      text: redactText(parts.join(" ") || (params.type === "assert" ? "Assertion failed" : "")),
+      url: scriptPlace(frame?.url, frame?.lineNumber, frame?.columnNumber),
+    };
+  }
+  if (method === "Log.entryAdded") {
+    const entry = params?.entry ?? {};
+    if (entry.level !== "error") return null;
+    if (entry.source === "network") {
+      const status = /status of (\d{3})(?: \(([^)]*)\))?/.exec(entry.text ?? "");
+      const failure = /(net::ERR_[A-Z0-9_]+)/.exec(entry.text ?? "");
+      const text = status ? `HTTP ${status[1]}${status[2] ? ` ${status[2]}` : ""}` : failure ? failure[1] : redactText(entry.text);
+      return { kind: "request", at: entry.timestamp, text, url: redactUrl(entry.url) || undefined };
+    }
+    return { kind: "error", at: entry.timestamp, text: redactText(entry.text), url: redactUrl(entry.url) || undefined };
+  }
+  return null;
+}
+
+/// Keep a problem in a ring buffer: the tab's capture for Log, or the replay a
+/// browser_page_errors call is taking for Runtime. A repeat of the entry just
+/// before it (a failing poll, an error in an animation frame) is counted, not
+/// stored.
+function recordProblem(capture, problem) {
+  if (!capture || !problem) return;
+  const at = Number.isFinite(problem.at) ? problem.at : Date.now();
+  const earlier = at < capture.since;
+  const last = capture.entries.at(-1);
+  if (last && last.kind === problem.kind && last.text === problem.text && last.url === problem.url && Boolean(last.earlier) === earlier) {
+    last.repeats = (last.repeats ?? 1) + 1;
+    last.at = at;
+    return;
+  }
+  capture.entries.push({ ...problem, at, ...(earlier ? { earlier: true } : {}) });
+  if (capture.entries.length > PAGE_PROBLEM_LIMIT) {
+    capture.entries.shift();
+    capture.dropped += 1;
+  }
+}
+
+/// Take the exceptions and console errors Chrome holds for the tab's document:
+/// Runtime on, its replay into a fresh buffer, Runtime off. Null when it could
+/// not be read, with why.
+async function replayRuntime(tabId) {
+  // A page paused behind a dialog answers no Runtime command.
+  if (dialogs.has(tabId)) {
+    return { failed: `exceptions and console errors cannot be read while the page waits on JavaScript dialog ${dialogs.get(tabId).id}` };
+  }
+  const replay = { since: -Infinity, entries: [], dropped: 0 };
+  replays.set(tabId, replay);
+  try {
+    await withDeadline(chrome.debugger.sendCommand({ tabId }, "Runtime.enable"), "Runtime.enable", WATCH_TIMEOUT_MS);
+    await sleep(REPLAY_SETTLE_MS);
+    return { replay };
+  } catch {
+    return { failed: "Chrome did not hand over the page's exceptions and console errors (the page did not answer)" };
+  } finally {
+    if (replays.get(tabId) === replay) replays.delete(tabId);
+    await withDeadline(chrome.debugger.sendCommand({ tabId }, "Runtime.disable"), "Runtime.disable", WATCH_TIMEOUT_MS).catch(() => {});
+  }
+}
+
+/// browser_page_errors: the replayed exceptions and console errors with the
+/// failed requests since the agent attached, oldest first, the latest
+/// PAGE_PROBLEM_LIMIT of them. Nothing is evaluated in the page.
+async function pageProblems(tabId, fresh) {
+  const capture = captures.get(tabId) ?? { since: Date.now(), entries: [], dropped: 0 };
+  const { replay, failed } = await replayRuntime(tabId);
+  const merged = [...capture.entries, ...(replay?.entries ?? [])].sort((a, b) => a.at - b.at);
+  const kept = merged.slice(-PAGE_PROBLEM_LIMIT);
+  const now = Date.now();
+  return {
+    tabId,
+    since: agoText(now - capture.since),
+    ...(fresh ? { fresh: true } : {}),
+    ...(failed ? { note: failed } : {}),
+    limit: PAGE_PROBLEM_LIMIT,
+    dropped: capture.dropped + (replay?.dropped ?? 0) + (merged.length - kept.length),
+    entries: kept.map((entry) => ({
+      kind: entry.kind, ago: agoText(now - entry.at), text: entry.text,
+      ...(entry.url ? { url: entry.url } : {}),
+      ...(entry.repeats ? { repeats: entry.repeats } : {}),
+      ...(entry.earlier ? { earlier: true } : {}),
+    })),
+  };
+}
+
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  const tabId = source.tabId;
+  if (tabId === undefined || !attached.has(tabId)) return;
+  if (method === "Page.javascriptDialogOpening") {
+    const message = String(params?.message ?? "");
+    const dialog = {
+      id: `d${++dialogCount}`,
+      type: String(params?.type ?? "alert"),
+      message: message.length > DIALOG_MESSAGE_MAX ? `${message.slice(0, DIALOG_MESSAGE_MAX - 1)}…` : message,
+      defaultPrompt: String(params?.defaultPrompt ?? ""),
+    };
+    dialogs.set(tabId, dialog);
+    for (const listener of [...(dialogListeners.get(tabId) ?? [])]) listener(dialog);
+    return;
+  }
+  if (method === "Page.javascriptDialogClosed") {
+    // Answered by the agent, by the user in Chrome, or closed by a navigation.
+    // What the user typed into a prompt is never kept.
+    const dialog = dialogs.get(tabId);
+    if (dialog) {
+      dialogs.delete(tabId);
+      closedDialogs.set(tabId, { ...dialog, accepted: params?.result === true, byAgent: false });
+    }
+    return;
+  }
+  // Runtime events only arrive while browser_page_errors has Runtime on.
+  const problem = pageProblem(method, params);
+  if (method.startsWith("Runtime.")) recordProblem(replays.get(tabId), problem);
+  else recordProblem(captures.get(tabId), problem);
+});
+
+/// browser_handle_dialog. `dialogId`, when given, must name the dialog open
+/// now, so a dialog that replaced the one the agent read is never answered in
+/// its place. Page.handleJavaScriptDialog answers whichever dialog is open, so
+/// the check is made right before it; the window between them is one message.
+async function handleDialog(tabId, { action, promptText, dialogId }) {
+  if (action !== "accept" && action !== "dismiss") throw new Error("action must be accept or dismiss");
+  if (promptText !== undefined && typeof promptText !== "string") throw new Error("prompt_text must be a string");
+  if (dialogId !== undefined && typeof dialogId !== "string") throw new Error("dialog_id must be a string such as d3");
+  const dialog = dialogs.get(tabId);
+  if (!dialog) {
+    const closed = closedDialogs.get(tabId);
+    if (dialogId !== undefined && closed?.id === dialogId) {
+      throw new Error(
+        `dialog ${dialogId} is no longer open: it was already ${closed.accepted ? "accepted" : "dismissed"}` +
+          (closed.byAgent ? " by the agent" : " (by the user in Chrome, or the page moved on)") + ". Nothing was answered",
+      );
+    }
+    throw new Error(
+      `tab ${tabId} has no JavaScript dialog open, so nothing was answered. browser_snapshot shows one when it is ` +
+        "open; a dialog that opened before the agent attached to the tab cannot be seen or answered by it",
+    );
+  }
+  if (dialogId !== undefined && dialogId !== dialog.id) {
+    throw new Error(
+      `dialog ${dialogId} is no longer open; tab ${tabId} now shows ${dialogLabel(dialog)}. Nothing was answered: ` +
+        `read it, then call again with dialog_id=${dialog.id}`,
+    );
+  }
+  if (promptText !== undefined && (dialog.type !== "prompt" || action !== "accept")) {
+    throw new Error(
+      `prompt_text only applies when accepting a prompt dialog; ${dialog.id} is ${/^[aeiou]/.test(dialog.type) ? "an" : "a"} ${dialog.type} dialog`,
+    );
+  }
+  // Accepting a prompt without text submits what it already holds, as OK does.
+  const text = dialog.type === "prompt" && action === "accept" ? (promptText ?? dialog.defaultPrompt) : undefined;
+  try {
+    await withDeadline(
+      chrome.debugger.sendCommand({ tabId }, "Page.handleJavaScriptDialog", {
+        accept: action === "accept", ...(text !== undefined ? { promptText: text } : {}),
+      }),
+      "Page.handleJavaScriptDialog",
+    );
+  } catch (error) {
+    if (!/no dialog is showing/i.test(error?.message ?? "")) throw error;
+    if (dialogs.get(tabId) === dialog) dialogs.delete(tabId);
+    throw new Error(`dialog ${dialog.id} closed before it could be answered (the user answered it, or the page moved on). Nothing was answered`);
+  }
+  if (dialogs.get(tabId) === dialog) dialogs.delete(tabId);
+  closedDialogs.set(tabId, { ...dialog, accepted: action === "accept", byAgent: true });
+  // Pages often open the next dialog at once (an alert after a confirm). Say so,
+  // so the agent does not act on a page that is still paused.
+  const next = await nextDialog(tabId, 250);
+  return {
+    tabId, action, dialog: publicDialog(dialog),
+    ...(text !== undefined ? (promptText !== undefined ? { promptChars: promptText.length } : { promptDefault: true }) : {}),
+    ...(next ? { next: publicDialog(next) } : {}),
+  };
+}
 
 /// Let go of a tab's debugger session, clearing Chrome's "is debugging this
 /// browser" banner. Safe to call for a tab that was never attached.
 async function detachTab(tabId) {
+  forgetPage(tabId);
   if (!attached.has(tabId)) return;
   attached.delete(tabId);
   try {
@@ -737,9 +1128,14 @@ function withDeadline(promise, what, ms = DEBUGGER_TIMEOUT_MS) {
 async function send(tabId, method, params = {}) {
   try {
     await withDeadline(attach(tabId), "attaching to the tab");
+    // A page paused behind a dialog answers nothing; say so at once instead of
+    // after the deadline, and stop waiting the moment one opens.
+    const pending = dialogs.get(tabId);
+    if (pending) throw dialogPendingError(tabId, pending);
     const bounded = method === "Runtime.evaluate" ? { timeout: EVALUATE_TIMEOUT_MS, ...params } : params;
-    return await withDeadline(chrome.debugger.sendCommand({ tabId }, method, bounded), method);
+    return await withDeadline(whileNoDialog(tabId, chrome.debugger.sendCommand({ tabId }, method, bounded)), method);
   } catch (error) {
+    if (error?.dialog) throw error;
     const message = error?.message || "";
     const stopped = /Execution was terminated/.test(message);
     if (!stopped && !/timed out$/.test(message)) throw error;
@@ -756,7 +1152,8 @@ async function send(tabId, method, params = {}) {
       `${what}${state}. ` +
         "Whether the action took effect is unknown, so it was not retried: look at the page " +
         "(browser_snapshot or browser_read) before doing it again. Many open tabs can starve " +
-        "Chrome of memory; close finished ones.",
+        "Chrome of memory; close finished ones. A JavaScript dialog that opened before the agent attached " +
+        "to the tab also pauses the page without being reported; only the user can answer it in Chrome.",
     );
   }
 }
@@ -1187,14 +1584,32 @@ async function snapshot(tabId, { offset = 0, limit = 250 } = {}) {
     if (res?.exceptionDetails) throw new Error(res.exceptionDetails.text || "evaluate failed");
     return res.result.value;
   };
-  let value = await take();
-  // Nothing listed on a page Chrome is not drawing: ask once more for it to
-  // be shown and look again, and if it still is not, say so (#63).
-  if (value?.shown === false && value.total === 0) {
-    if (await redraw(tabId)) value = await take();
-    if (value?.shown === false && value.total === 0) value.empty = NOT_DRAWN_NOTE;
+  try {
+    let value = await take();
+    // Nothing listed on a page Chrome is not drawing: ask once more for it to
+    // be shown and look again, and if it still is not, say so (#63).
+    if (value?.shown === false && value.total === 0) {
+      if (await redraw(tabId)) value = await take();
+      if (value?.shown === false && value.total === 0) value.empty = NOT_DRAWN_NOTE;
+    }
+    return value;
+  } catch (error) {
+    if (!error?.dialog) throw error;
+    return dialogSnapshot(tabId, error.dialog, offset, limit);
   }
-  return value;
+}
+
+/// A snapshot of a page paused behind a JavaScript dialog: the dialog is the
+/// one thing on it that can be acted on, and nothing in the page can be read.
+/// Title and URL come from Chrome's view of the tab, which still answers.
+async function dialogSnapshot(tabId, dialog, offset, limit) {
+  const tab = await withDeadline(chrome.tabs.get(tabId), "tab lookup").catch(() => ({}));
+  return {
+    title: tab.title ?? "", url: tab.url ?? "", elements: [], total: 0, offset, limit,
+    scope: "page", frames: 0, truncated: false, nextOffset: null,
+    jsDialog: publicDialog(dialog),
+    empty: `nothing is listed while the page waits on its JavaScript ${dialog.type} dialog (${dialog.id}); answer it with browser_handle_dialog`,
+  };
 }
 
 async function clickAt(tabId, x, y) {
@@ -1211,24 +1626,29 @@ async function clickAt(tabId, x, y) {
     buttons: 0,
     pointerType: "mouse",
   });
-  await send(tabId, "Input.dispatchMouseEvent", {
-    type: "mousePressed",
-    x,
-    y,
-    button: "left",
-    buttons: 1,
-    clickCount: 1,
-    pointerType: "mouse",
-  });
-  await send(tabId, "Input.dispatchMouseEvent", {
-    type: "mouseReleased",
-    x,
-    y,
-    button: "left",
-    buttons: 0,
-    clickCount: 1,
-    pointerType: "mouse",
-  });
+  try {
+    await send(tabId, "Input.dispatchMouseEvent", {
+      type: "mousePressed",
+      x,
+      y,
+      button: "left",
+      buttons: 1,
+      clickCount: 1,
+      pointerType: "mouse",
+    });
+    await send(tabId, "Input.dispatchMouseEvent", {
+      type: "mouseReleased",
+      x,
+      y,
+      button: "left",
+      buttons: 0,
+      clickCount: 1,
+      pointerType: "mouse",
+    });
+  } catch (error) {
+    if (!error?.opened) throw error;
+    return openedDialog(error.dialog, { clicked: { x, y }, cursor });
+  }
   await markTab(tabId);
   return { clicked: { x, y }, cursor };
 }
@@ -1642,8 +2062,13 @@ async function clickElement(tabId, index) {
       await send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none", buttons: 0, pointerType: "mouse" });
       if ((await evaluateValue(tabId, CLICK_PROBE_JS(false), "click failed")).hover) {
         const press = { x, y, button: "left", clickCount: 1, pointerType: "mouse" };
-        await send(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...press, buttons: 1 });
-        await send(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...press, buttons: 0 });
+        try {
+          await send(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...press, buttons: 1 });
+          await send(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...press, buttons: 0 });
+        } catch (error) {
+          if (!error?.opened) throw error;
+          return openedDialog(error.dialog, { ok: true, tag: found.tag, x, y, route: "input", target });
+        }
         // A press that navigated took the probe (or the whole context) with
         // it. Otherwise not pressed means not delivered, so the page events
         // below are not a second click.
@@ -1663,7 +2088,13 @@ async function clickElement(tabId, index) {
     }
   }
   if (route !== "input") {
-    const fired = await evaluateValue(tabId, CLICK_EVENTS_JS(index), "click failed");
+    let fired;
+    try {
+      fired = await evaluateValue(tabId, CLICK_EVENTS_JS(index), "click failed");
+    } catch (error) {
+      if (!error?.opened) throw error;
+      return openedDialog(error.dialog, { ok: true, tag: found.tag, x, y, route, why, target });
+    }
     if (!fired.ok) throw new Error(fired.reason || "click failed");
   }
   // A checkbox, radio or switch says what it is now.
@@ -2089,8 +2520,14 @@ async function pressKey(tabId, rawKey, rawModifiers) {
   const backspace = press.key === "Backspace" && press.modifiers === 0;
   if (tab) await send(tabId, "Runtime.evaluate", { expression: TAB_PROBE_JS, returnByValue: true });
   if (backspace) await send(tabId, "Runtime.evaluate", { expression: EDIT_PROBE_JS, returnByValue: true });
-  await dispatchKey(tabId, press);
   const pressed = { pressed: press.label, ...(press.note ? { note: press.note } : {}) };
+  try {
+    await dispatchKey(tabId, press);
+  } catch (error) {
+    // The key reached the page: that is what opened the dialog.
+    if (!error?.opened) throw error;
+    return openedDialog(error.dialog, pressed);
+  }
   if (backspace) return { ...(await finishBackspace(tabId)), pressed: press.label };
   if (!tab) {
     const after = await evaluateValue(tabId, KEY_RESULT_JS, "key press failed").catch(() => ({}));
@@ -2574,6 +3011,8 @@ function restoreFavicon() {
 }
 
 async function markTab(tabId) {
+  // A page paused behind a dialog cannot run the badge script either.
+  if (dialogs.has(tabId)) return;
   try {
     // Decorative, and it runs after every action: a page too busy to take the
     // badge script must not hold the task's queue behind it (#56).
@@ -2684,6 +3123,10 @@ async function waitForReadiness(p) {
         returnByValue: true,
       });
     } catch (error) {
+      // Nothing renders while a dialog is open; waiting longer cannot help.
+      if (error?.dialog) {
+        return outcome("error", { error: `the page is paused behind JavaScript ${error.dialog.type} dialog ${error.dialog.id}` });
+      }
       // A navigation committing mid-wait destroys the execution context; the
       // new document is the one to observe, so poll again until the deadline.
       if (Date.now() >= deadline) return outcome("error", { error: error.message || "evaluate failed" });
@@ -2726,6 +3169,9 @@ async function settle(tabId, pauseMs = 350, loadBudgetMs = 8000) {
 
 /** Attach current state and separate action success from readiness/timeout. */
 async function withState(p, result) {
+  // A dialog the page opened just after the action returned still pauses it.
+  const pending = dialogs.get(p.tabId);
+  if (pending && !result?.jsDialog) result = openedDialog(pending, result);
   if (p.returnState !== true) return result;
   const readiness = p.waitForSelector !== undefined ? await waitForReadiness(p) : await settle(p.tabId);
   await checkTab(requireClientId(p), p.tabId, p.sites, "read");
@@ -3190,6 +3636,10 @@ const handlers = {
     validateReadiness(p, true);
     const clientId = requireClientId(p);
     assertOwned(clientId, p.tabId);
+    // Navigating closes an open dialog as dismissed (checked on Chrome 151), so
+    // a confirm or an "unsaved changes" prompt would be answered without anyone
+    // deciding to. The agent answers it first, explicitly.
+    if (dialogs.has(p.tabId)) throw dialogPendingError(p.tabId, dialogs.get(p.tabId));
     await checkSite(clientId, p.url, p.sites, "open");
     return withState(p, await navigate(p.tabId, p.url));
   },
@@ -3254,6 +3704,24 @@ const handlers = {
     assertOwned(clientId, p.tabId);
     await checkTab(clientId, p.tabId, p.sites, "look at");
     return screenshot(p.tabId);
+  },
+  handle_dialog: async (p) => {
+    const clientId = requireClientId(p);
+    assertOwned(clientId, p.tabId);
+    await checkTab(clientId, p.tabId, p.sites, "answer a dialog on");
+    return handleDialog(p.tabId, { action: p.action, promptText: p.promptText, dialogId: p.dialogId });
+  },
+  page_errors: async (p) => {
+    const clientId = requireClientId(p);
+    assertOwned(clientId, p.tabId);
+    await checkTab(clientId, p.tabId, p.sites, "read");
+    // Watching for failed requests starts when the agent attaches. A tab it has
+    // not attached to yet (just taken over, or never acted on) is attached now;
+    // that reads nothing from the page and does not navigate, reload or show
+    // the tab. What Log.enable replays arrives during the Runtime replay wait.
+    const fresh = !attached.has(p.tabId);
+    if (fresh) await withDeadline(attach(p.tabId), "attaching to the tab");
+    return pageProblems(p.tabId, fresh);
   },
   request_credentials: async (p) => {
     const clientId = requireClientId(p);
@@ -3325,6 +3793,7 @@ chrome.tabs.onCreated.addListener(claimChildTab);
 chrome.tabs.onRemoved.addListener((tabId) => {
   siteFavicons.delete(tabId);
   agentInputAt.delete(tabId);
+  forgetPage(tabId);
   if (!tabOwner.has(tabId) && !attached.has(tabId)) return;
   const clientId = tabOwner.get(tabId);
   if (clientId) {

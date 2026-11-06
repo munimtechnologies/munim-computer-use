@@ -24,7 +24,7 @@ pub fn browser_control_enabled() -> bool {
 }
 
 /// Returned in the `initialize` result; identical in the Swift server.
-pub const SERVER_INSTRUCTIONS: &str = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. In a Chrome tab the agent works in, use browser_click, browser_type, browser_fill (to replace a field's value) and browser_press_key (keys and shortcuts such as cmd+a); they act on that tab in the background without bringing Chrome forward. Never use the desktop click, press_key or type_text on a Chrome tab: they go to whichever Chrome window is in front, which can be the user's. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Pass return_state on an action to get current state back in the same call. Use run_steps for several actions you already know, like click, type, press return: one call, stopping at the first that fails. For delayed browser UI, use wait_for_selector with return_state and inspect readiness; a loaded tab is not SPA readiness. A timeout does not undo the action: re-observe with browser_snapshot and the same wait before repeating a non-idempotent action. Use browser_read to read a page's text. Never ask for, or type, a password or code yourself: browser_request_credentials lets the user enter it without you seeing it. The user's Computer Use policy can block apps and sites or require their approval; when a call says so, do not work around it. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf.";
+pub const SERVER_INSTRUCTIONS: &str = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. In a Chrome tab the agent works in, use browser_click, browser_type, browser_fill (to replace a field's value) and browser_press_key (keys and shortcuts such as cmd+a); they act on that tab in the background without bringing Chrome forward. Never use the desktop click, press_key or type_text on a Chrome tab: they go to whichever Chrome window is in front, which can be the user's. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Pass return_state on an action to get current state back in the same call. Use run_steps for several actions you already know, like click, type, press return: one call, stopping at the first that fails. For delayed browser UI, use wait_for_selector with return_state and inspect readiness; a loaded tab is not SPA readiness. A timeout does not undo the action: re-observe with browser_snapshot and the same wait before repeating a non-idempotent action. Use browser_read to read a page's text. When a page opens a JavaScript alert, confirm or prompt, browser_snapshot shows it and browser_handle_dialog answers it; browser_page_errors lists a page's exceptions, console errors and failed requests. Never ask for, or type, a password or code yourself: browser_request_credentials lets the user enter it without you seeing it. The user's Computer Use policy can block apps and sites or require their approval; when a call says so, do not work around it. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf.";
 
 pub fn tool_defs() -> Value {
     let Value::Array(defs) = all_tool_defs() else {
@@ -848,7 +848,7 @@ fn all_tool_defs() -> Value {
         },
         {
             "name": "browser_snapshot",
-            "description": "List the interactive elements (links, buttons, inputs, tabs, checkboxes, table and grid rows listed as row with their cell text, and other clickable elements) on the page in one of the agent's tabs, with the index each one has for browser_click, plus the page title and URL. Inputs show their type, such as input[password], and text the page lets you edit in place shows as [editable], such as span[editable] (click it, or browser_fill it); checkboxes, radios and switches are named by their label and show their state, such as (checked) or (unchecked, disabled). Works on a background tab, so the user can be looking at something else. Use it before every browser_click, because indices change when the page changes; use browser_read for the page's text. Read-only. Automatically scopes to the topmost visible dialog when one is open, naming it on a dialog: line, excluding hidden/inert controls but retaining reachable offscreen controls. Results report scope, total and truncation. Continue with offset and limit on the same tab/session; indices stay global across pages of an unchanged UI. Snapshot again after UI changes.",
+            "description": "List the interactive elements (links, buttons, inputs, tabs, checkboxes, table and grid rows listed as row with their cell text, and other clickable elements) on the page in one of the agent's tabs, with the index each one has for browser_click, plus the page title and URL. Inputs show their type, such as input[password], and text the page lets you edit in place shows as [editable], such as span[editable] (click it, or browser_fill it); checkboxes, radios and switches are named by their label and show their state, such as (checked) or (unchecked, disabled). Works on a background tab, so the user can be looking at something else. Use it before every browser_click, because indices change when the page changes; use browser_read for the page's text. Read-only. Automatically scopes to the topmost visible dialog when one is open, naming it on a dialog: line, excluding hidden/inert controls but retaining reachable offscreen controls. Results report scope, total and truncation. Continue with offset and limit on the same tab/session; indices stay global across pages of an unchanged UI. Snapshot again after UI changes. While the page has a JavaScript dialog open (alert, confirm, prompt), the snapshot shows the dialog's type, message and dialog_id instead, for browser_handle_dialog.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -934,6 +934,33 @@ fn all_tool_defs() -> Value {
             },
             "annotations": {
                 "title": "Read page text",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true
+            }
+        },
+        {
+            "name": "browser_page_errors",
+            "description": "List the problems the page in one of the agent's tabs has reported: uncaught JavaScript exceptions and console errors the page has logged since it loaded (Chrome keeps a limited number), and requests that failed since the agent attached to the tab (network errors and HTTP status 400 or above), oldest first, with how long ago each happened. Use it when a page is empty, broken or ignores an action, before navigating again or assuming a sign-in problem. The reply says when watching for failed requests began; ones Chrome still held from before are marked as earlier. Exceptions and console errors are read from what Chrome keeps for the page during this call only, so the page is not watched for them in between. The latest 50 are listed. URLs are shown without query strings, fragments or credentials, and request headers, cookies and bodies are never read. Read-only: it does not reload, navigate or show the tab.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session."
+                    },
+                    "tab_id": {
+                        "type": "integer",
+                        "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs"
+                    }
+                },
+                "required": ["tab_id"]
+            },
+            "annotations": {
+                "title": "List page errors",
                 "readOnlyHint": true,
                 "destructiveHint": false,
                 "idempotentHint": true,
@@ -1262,6 +1289,46 @@ fn all_tool_defs() -> Value {
             }
         },
         {
+            "name": "browser_handle_dialog",
+            "description": "Answer the JavaScript dialog (alert, confirm, prompt or leave-page) open in one of the agent's tabs. While one is open the page is paused: browser_snapshot shows the dialog's type, message and dialog_id instead of the page, and other browser commands on the tab say a dialog is open. accept presses OK and dismiss presses Cancel. prompt_text is entered into a prompt before accepting it; without it, a prompt is accepted with its default text. Pass the dialog_id from the snapshot, so a dialog that replaced the one you read is refused instead of answered. Works on a background tab without showing it or using the keyboard. A dialog that opened before the agent attached to the tab cannot be seen or answered; the user answers that one in Chrome. Accepting a confirm can submit, delete or leave a page with unsaved changes, so read the message, and ask the user before confirming anything irreversible.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session."
+                    },
+                    "tab_id": {
+                        "type": "integer",
+                        "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs"
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["accept", "dismiss"],
+                        "description": "accept (OK) or dismiss (Cancel)"
+                    },
+                    "prompt_text": {
+                        "type": "string",
+                        "description": "Text to enter into a prompt dialog before accepting it. Only with action=accept on a prompt"
+                    },
+                    "dialog_id": {
+                        "type": "string",
+                        "description": "dialog_id of the dialog being answered, from browser_snapshot (such as d3). A different dialog open now is refused instead of answered"
+                    }
+                },
+                "required": ["tab_id", "action"]
+            },
+            "annotations": {
+                "title": "Answer JavaScript dialog",
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": true
+            }
+        },
+        {
             "name": "browser_close_all_tabs",
             "description": "Close every tab the agent opened, including tabs its clicks opened, and remove its tab group. Tabs taken over with browser_use_tab are released back to the user, not closed. Call this when finished with the browser so no empty group is left in the user's tab strip. The MCP process also runs this automatically when the Computer Use session ends. Unsaved state in the agent's tabs is lost.",
             "inputSchema": {
@@ -1337,7 +1404,7 @@ fn all_tool_defs() -> Value {
 mod tests {
     use super::{all_tool_defs, tool_defs};
 
-    /// The macOS server advertises exactly these 35 tools. Drifting apart would
+    /// The macOS server advertises exactly these 37 tools. Drifting apart would
     /// silently give a model different capabilities per platform.
     #[test]
     fn advertises_the_macos_tool_surface() {
@@ -1349,7 +1416,7 @@ mod tests {
             .map(|tool| tool["name"].as_str().expect("tool has a name"))
             .collect();
 
-        assert_eq!(names.len(), 35, "tool count drifted from the macOS server");
+        assert_eq!(names.len(), 37, "tool count drifted from the macOS server");
         for expected in [
             "list_apps",
             "get_app_state",
@@ -1378,12 +1445,14 @@ mod tests {
             "browser_close_tab",
             "browser_snapshot",
             "browser_read",
+            "browser_page_errors",
             "browser_click",
             "browser_type",
             "browser_fill",
             "browser_upload_file",
             "browser_request_credentials",
             "browser_press_key",
+            "browser_handle_dialog",
             "browser_close_all_tabs",
             "browser_navigate",
         ] {
