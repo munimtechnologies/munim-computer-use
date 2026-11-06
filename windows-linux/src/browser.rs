@@ -610,6 +610,11 @@ impl BrowserBridge {
                 return Err("session_id must be a nonblank string of at most 128 characters".into());
             }
         }
+        // Local paths are checked here, on the machine running Chrome, before
+        // anything reaches the extension.
+        if command == "upload_file" {
+            check_upload_paths(args)?;
+        }
         if !self.connected() {
             return Err(self.hub.explain(command, args, CallError::Link(Link::NoHost)));
         }
@@ -1039,7 +1044,7 @@ fn normalise(_command: &str, args: &Value) -> Value {
     if let Some(session) = args.get("session_id").filter(|v| !v.is_null()) {
         map.insert("sessionId".into(), session.clone());
     }
-    for key in ["url", "text", "key", "modifiers", "index", "x", "y", "all", "query", "offset", "limit", "fields", "reason"] {
+    for key in ["url", "text", "key", "modifiers", "index", "x", "y", "all", "query", "offset", "limit", "fields", "reason", "paths"] {
         if let Some(value) = args.get(key) {
             map.insert(key.into(), value.clone());
         }
@@ -1187,6 +1192,7 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
                     args.get("text").and_then(Value::as_str).unwrap_or("").chars().count()
                 ),
                 "fill" => describe_fill(tab, result, args),
+                "upload_file" => describe_upload(tab, result, args),
                 "press" => {
                     let mut line = format!(
                         "pressed {} in tab {tab}",
@@ -1262,6 +1268,84 @@ fn describe_fill(tab: i64, result: &Value, args: &Value) -> String {
     if let Some(note) = result.get("note").and_then(Value::as_str) {
         line.push_str(&format!(" — {note}"));
     }
+    line
+}
+
+/// Most files one browser_upload_file call attaches; the extension holds the same limit.
+const UPLOAD_MAX_FILES: usize = 50;
+
+/// browser_upload_file's paths, checked before anything is sent: each must be
+/// an absolute path of a regular file this process can read. The extension
+/// reaches this server over native messaging, so this is the machine running
+/// Chrome, where Chrome will read the files. Chrome itself attaches a missing
+/// path without complaint, as a file the site then fails to read.
+fn check_upload_paths(args: &Value) -> Result<(), String> {
+    let Some(paths) = args.get("paths").and_then(Value::as_array) else {
+        return Err("missing required argument 'paths' (absolute paths of the files to attach)".into());
+    };
+    if paths.is_empty() || paths.len() > UPLOAD_MAX_FILES {
+        return Err(format!("paths must list 1 to {UPLOAD_MAX_FILES} absolute file paths"));
+    }
+    for (at, path) in paths.iter().enumerate() {
+        let Some(text) = path.as_str().filter(|text| !text.trim().is_empty()) else {
+            return Err(format!("paths[{at}] must be a nonempty string"));
+        };
+        let file = std::path::Path::new(text);
+        let problem = if !file.is_absolute() {
+            Some("is not an absolute path; pass the full path of the file".to_string())
+        } else {
+            match std::fs::metadata(file) {
+                Ok(meta) if meta.is_dir() => Some("is a folder, not a file".to_string()),
+                Ok(meta) if !meta.is_file() => Some("is not a regular file".to_string()),
+                Ok(_) => std::fs::File::open(file).err().map(|error| format!("cannot be read: {error}")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Some("does not exist on this computer".to_string())
+                }
+                Err(error) => Some(format!("cannot be read: {error}")),
+            }
+        };
+        if let Some(problem) = problem {
+            return Err(format!(
+                "not attached: {text} {problem}. Paths are on the computer running Chrome and this server; \
+                 nothing was sent to the page"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// What browser_upload_file left in the input: the files it holds, read back
+/// from the page, and whether the page saw them arrive. Staging is not
+/// sending, so the reply says the site has not received them. Worded as the
+/// macOS server words it.
+fn describe_upload(tab: i64, result: &Value, args: &Value) -> String {
+    let target = result.get("target").and_then(Value::as_str).unwrap_or("the file input");
+    let files: Vec<&str> = result
+        .get("files")
+        .and_then(Value::as_array)
+        .map(|files| files.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let sent = args.get("paths").and_then(Value::as_array).map_or(0, Vec::len);
+    let mut line = format!(
+        "attached {} file{} to {target} in tab {tab}",
+        files.len(),
+        if files.len() == 1 { "" } else { "s" }
+    );
+    if !files.is_empty() {
+        line.push_str(&format!(": {}", files.join(", ")));
+    }
+    if files.len() != sent {
+        line.push_str(&format!(" — but {sent} were sent, so the input does not hold what was asked"));
+    }
+    line.push_str(if result.pointer("/events/change").and_then(Value::as_bool) == Some(true) {
+        " — the page got its change event"
+    } else {
+        " — the page got no change event, so it may not have noticed them"
+    });
+    line.push_str(
+        ". Nothing was submitted: the files are staged in the input, and the site has not received them. \
+         Submit the form or press the page's upload button yourself when that is wanted, then check the page.",
+    );
     line
 }
 
@@ -1580,7 +1664,7 @@ pub fn run_native_host() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BrowserBridge, CallError, Hub, Link, call_timeout, describe, describe_snapshot, describe_tabs, drop_connection, normalise, route};
+    use super::{BrowserBridge, CallError, Hub, Link, call_timeout, check_upload_paths, describe, describe_snapshot, describe_tabs, drop_connection, normalise, route};
     use std::time::Instant;
     use serde_json::json;
     use std::time::Duration;
@@ -2077,5 +2161,76 @@ mod tests {
             &json!({}),
         );
         assert!(rendered.contains("Example Domain"), "{rendered}");
+    }
+
+    #[test]
+    fn upload_paths_are_checked_on_this_computer_before_anything_is_sent() {
+        let dir = std::env::temp_dir().join(format!("cu-upload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("resume.pdf");
+        std::fs::write(&file, b"%PDF-1.4").expect("temp file");
+        let file = file.to_string_lossy().into_owned();
+        let missing = dir.join("missing.pdf").to_string_lossy().into_owned();
+        let folder = dir.to_string_lossy().into_owned();
+        let check = |paths: serde_json::Value| check_upload_paths(&json!({ "tab_id": 1, "index": 2, "paths": paths }));
+
+        assert_eq!(check(json!([file.clone()])), Ok(()));
+        assert_eq!(check(json!([file.clone(), file.clone()])), Ok(()));
+        let error = check(json!([file.clone(), missing.clone()])).unwrap_err();
+        assert!(error.starts_with(&format!("not attached: {missing} does not exist on this computer")), "{error}");
+        assert!(error.contains("on the computer running Chrome and this server"), "{error}");
+        assert!(check(json!([folder])).unwrap_err().contains("is a folder, not a file"));
+        assert!(check(json!(["resume.pdf"])).unwrap_err().contains("is not an absolute path"));
+        assert!(check(json!([])).unwrap_err().starts_with("paths must list 1 to 50"));
+        assert!(check(json!(vec![file.clone(); 51])).unwrap_err().starts_with("paths must list 1 to 50"));
+        assert!(check(json!([""])).unwrap_err().starts_with("paths[0] must be a nonempty string"));
+        assert!(check(json!([7])).unwrap_err().starts_with("paths[0] must be a nonempty string"));
+        assert!(check_upload_paths(&json!({ "tab_id": 1, "index": 2 })).unwrap_err().contains("missing required argument 'paths'"));
+
+        // The check runs before the bridge is consulted: a missing file is
+        // reported as missing even with no Chrome connected.
+        let mut bridge = BrowserBridge::inert();
+        let error = bridge
+            .call("upload_file", &json!({ "tab_id": 1, "index": 2, "paths": [missing.clone()] }))
+            .unwrap_err();
+        assert!(error.contains("does not exist on this computer"), "{error}");
+        // The paths travel to the extension as given.
+        let params = normalise("upload_file", &json!({ "tab_id": 1, "index": 2, "paths": [file.clone()] }));
+        assert_eq!(params["paths"], json!([file]));
+        assert_eq!(params["index"], json!(2));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn upload_says_what_the_input_holds_and_that_nothing_was_submitted() {
+        let args = json!({ "tab_id": 9, "index": 4, "paths": ["/tmp/a.txt", "/tmp/b.png"] });
+        let text = describe(
+            "upload_file",
+            &json!({ "attached": true, "target": "[4] input[file] \"Attachments\"", "files": ["a.txt", "b.png"], "count": 2,
+                     "events": { "input": true, "change": true } }),
+            &args,
+        );
+        assert!(
+            text.starts_with("attached 2 files to [4] input[file] \"Attachments\" in tab 9: a.txt, b.png — the page got its change event."),
+            "{text}"
+        );
+        assert!(text.contains("Nothing was submitted"), "{text}");
+        assert!(text.contains("the site has not received them"), "{text}");
+        let quiet = describe(
+            "upload_file",
+            &json!({ "target": "[4] input[file]", "files": ["a.txt"], "events": { "input": false, "change": false } }),
+            &args,
+        );
+        assert!(quiet.starts_with("attached 1 file to [4] input[file] in tab 9: a.txt — but 2 were sent"), "{quiet}");
+        assert!(quiet.contains("the page got no change event"), "{quiet}");
+        // return_state appends the page after the action, like every action.
+        let with_state = describe(
+            "upload_file",
+            &json!({ "target": "[4] input[file]", "files": ["a.txt", "b.png"], "events": { "change": true },
+                     "readiness": { "status": "not_requested", "condition": "document_load", "elapsedMs": 400 },
+                     "snapshot": { "title": "Upload", "url": "https://a.example/", "elements": [], "total": 0 } }),
+            &args,
+        );
+        assert!(with_state.contains("page after the action"), "{with_state}");
     }
 }

@@ -915,8 +915,29 @@ function controlStateInPage(el) {
   if (el.getAttribute("aria-expanded") === "true" && el.matches("[aria-haspopup],[role=combobox],button,summary")) {
     parts.push("expanded");
   }
+  // A file input says how many files it holds, so a staged upload shows.
+  const files = el.tagName === "INPUT" && el.type === "file" ? el.files?.length || 0 : 0;
+  if (files) parts.push(files === 1 ? "1 file" : `${files} files`);
   if (el.matches(":disabled") || el.getAttribute("aria-disabled") === "true") parts.push("disabled");
   return parts.join(", ");
+}
+
+/**
+ * A file input the page hides itself (display: none, no size, transparent),
+ * as sites do behind a styled "Upload" button that opens it from script. It
+ * is still what browser_upload_file attaches files to, so a snapshot lists it
+ * while the content around it is shown: nothing between it and its nearest
+ * sized ancestor hides it on purpose, and that ancestor is visible.
+ */
+function hiddenFileInputInPage(el, dom, visible) {
+  if (el.tagName !== "INPUT" || el.type !== "file" || el.matches(":disabled")) return false;
+  for (let at = dom.parent(el); at instanceof Element; at = dom.parent(at)) {
+    if (at.hidden || at.inert || at.getAttribute("aria-hidden")?.toLowerCase() === "true") return false;
+    if (getComputedStyle(at).display === "none") return false;
+    const r = at.getBoundingClientRect();
+    if (r.width >= 2 && r.height >= 2) return visible(at);
+  }
+  return false;
 }
 
 /// A compact outline of the interactive elements on the page, with ids the
@@ -978,6 +999,7 @@ const SNAPSHOT_JS = `((options = {}) => {
   const visible = ${isElementVisibleInPage.toString()};
   const labelOf = ${controlLabelInPage.toString()};
   const stateOf = ${controlStateInPage.toString()};
+  const hiddenFileInput = ${hiddenFileInputInPage.toString()};
   // Native modal dialogs live in Chrome's top layer, above ordinary z-indexes.
   // For custom dialogs, use paint order at their visible centre, not DOM order
   // or raw z-index (which is only meaningful inside a stacking context).
@@ -1064,7 +1086,7 @@ const SNAPSHOT_JS = `((options = {}) => {
   // as one row rather than run-together text.
   const cellText = (el) => (el.innerText || '').split(/[\\t\\n]+/).map((part) => part.replace(/\\s+/g, ' ').trim()).filter(Boolean).join(' | ');
   for (const el of dom.queryAll(document, '*')) {
-    if (!listed(el) || !inScope(el) || !visible(el)) continue;
+    if (!listed(el) || !inScope(el) || !(visible(el) || hiddenFileInput(el, dom, visible))) continue;
     const kind = kindOf(el);
     // Rows, cells and plain click targets are only worth listing by their
     // text: an empty spacer row or an icon-only wrapper is noise.
@@ -2247,6 +2269,151 @@ async function screenshot(tabId) {
   return { data: res.data };
 }
 
+// ── attaching files ─────────────────────────────────────────────────────────
+
+/** How many files one browser_upload_file call may attach. */
+const UPLOAD_MAX_FILES = 50;
+/** DevTools object group for the input's handle, released after every upload. */
+const UPLOAD_GROUP = "cu-upload";
+
+/**
+ * The file input a snapshot index names, inside the page. Exactly two things
+ * stand for one: the input itself (snapshots list it as input[file], hidden
+ * or not), and a <label> whose control is one, since sites hide the input
+ * behind a styled label. Anything else is refused, a button that opens the
+ * picker from script included: nothing ties it to an input, and pressing it
+ * would open the native picker. When it holds one listed file input, the
+ * refusal names that input's index.
+ */
+function fileInputTargetInPage(index, dom) {
+  const found = dom.byIndex(index);
+  if (!found) return { reason: `element ${index} is no longer on the page — call browser_snapshot again` };
+  const isFile = (node) => !!node && node.tagName === "INPUT" && node.type === "file";
+  if (isFile(found)) return { el: found, via: "input" };
+  if (found.tagName === "LABEL" && isFile(found.control)) return { el: found.control, via: "label" };
+  const tag = found.tagName.toLowerCase() + (found.tagName === "INPUT" ? "[" + found.type + "]" : "");
+  const inner = dom.queryAll(found, "input[type=file]").filter((input) => input.hasAttribute("data-cu-idx"));
+  const hint = inner.length === 1 ? ` (it holds file input [${inner[0].getAttribute("data-cu-idx")}]: pass that index)` : "";
+  return { reason: `element ${index} is ${tag}, not a file input or a label for one${hint}` };
+}
+
+/// The input as a DevTools object, or why the index names none. Run with
+/// returnByValue off, so the element comes back as a handle, not a copy. What
+/// the index named (the input, or its label) and that element's name are left
+/// on the input for fileInputInfoInPage.
+const UPLOAD_TARGET_JS = (index) => `(() => {
+  const dom = (${pageDomInPage.toString()})();
+  const target = (${fileInputTargetInPage.toString()})(${index}, dom);
+  if (!target.el) return String(target.reason);
+  const named = target.via === 'label' ? dom.byIndex(${index}) : target.el;
+  target.el.__cuUploadTarget = { via: target.via, label: (${controlLabelInPage.toString()})(named, dom, false) ||
+    (target.via === 'label' ? named.innerText : '') || target.el.getAttribute('name') || '' };
+  return target.el;
+})()`;
+
+/// Called on the input (`this`): what it is, and a watch for the input and
+/// change events Chrome fires when its files are set, so the reply can say
+/// whether the page saw them.
+function fileInputInfoInPage() {
+  const el = this;
+  const target = el.__cuUploadTarget || { via: "input", label: "" };
+  delete el.__cuUploadTarget;
+  el.__cuUploadSeen?.done();
+  const seen = { input: false, change: false };
+  const listener = (e) => { if (e.target === el) seen[e.type] = true; };
+  el.addEventListener("input", listener, true);
+  el.addEventListener("change", listener, true);
+  seen.done = () => {
+    el.removeEventListener("input", listener, true);
+    el.removeEventListener("change", listener, true);
+  };
+  el.__cuUploadSeen = seen;
+  return {
+    via: target.via,
+    label: String(target.label || "").replace(/\s+/g, " ").trim().slice(0, 60),
+    multiple: el.multiple,
+    disabled: el.matches(":disabled"),
+    folder: el.webkitdirectory === true,
+  };
+}
+
+/// Called on the input after its files were set: what it holds now, read
+/// back from the input rather than assumed, and the events the page got.
+function fileInputFilesInPage() {
+  const el = this;
+  const seen = el.__cuUploadSeen;
+  seen?.done();
+  delete el.__cuUploadSeen;
+  return {
+    names: Array.from(el.files || [], (file) => file.name),
+    input: seen?.input === true,
+    change: seen?.change === true,
+  };
+}
+
+/// Attach local files to a file input by its snapshot index, the way Chrome
+/// does when a person picks them: DOM.setFileInputFiles on the input, which
+/// fires its input and change events. No picker opens, the tab is not
+/// selected and no OS input is sent, and the form is never submitted: the
+/// files are only staged in the input. The paths are on the machine running
+/// Chrome; the server checked they are regular files before sending them.
+async function uploadFiles(tabId, index, paths) {
+  // The index is spliced into the script that runs in the page, so only a
+  // plain snapshot index may reach it.
+  if (!Number.isInteger(index) || index < 0) {
+    throw new Error("index must be an element index from browser_snapshot");
+  }
+  if (!Array.isArray(paths) || paths.length === 0 || paths.length > UPLOAD_MAX_FILES ||
+      paths.some((path) => typeof path !== "string" || !path)) {
+    throw new Error(`paths must list 1 to ${UPLOAD_MAX_FILES} absolute file paths`);
+  }
+  try {
+    const found = await send(tabId, "Runtime.evaluate", {
+      expression: UPLOAD_TARGET_JS(index), returnByValue: false, objectGroup: UPLOAD_GROUP,
+    });
+    if (found?.exceptionDetails) throw new Error(found.exceptionDetails.text || "upload failed");
+    const handle = found?.result;
+    if (handle?.type === "string") throw new Error(`not attached: ${handle.value}`);
+    if (handle?.subtype !== "node" || !handle.objectId) throw new Error("upload failed: the page returned no element");
+    const call = async (fn) => {
+      const res = await send(tabId, "Runtime.callFunctionOn", {
+        objectId: handle.objectId, functionDeclaration: fn.toString(), returnByValue: true,
+      });
+      if (res?.exceptionDetails) throw new Error(res.exceptionDetails.text || "upload failed");
+      return res?.result?.value || {};
+    };
+    const info = await call(fileInputInfoInPage);
+    const target = info.via === "label"
+      ? `the file input of [${index}] label${info.label ? ` "${info.label}"` : ""}`
+      : describeTarget(index, { tag: "input[file]", label: info.label });
+    const refusal = info.disabled ? "is disabled"
+      : info.folder ? "picks a folder (webkitdirectory), not files"
+      : paths.length > 1 && !info.multiple
+      ? `takes one file (it has no multiple attribute) and ${paths.length} were given; pass one path`
+      : null;
+    if (refusal) {
+      await call(fileInputFilesInPage).catch(() => {});
+      throw new Error(`not attached: ${target} ${refusal}. Nothing was changed`);
+    }
+    await send(tabId, "DOM.setFileInputFiles", { files: paths, objectId: handle.objectId });
+    const after = await call(fileInputFilesInPage);
+    await markTab(tabId);
+    return {
+      attached: true,
+      target,
+      files: after.names || [],
+      count: (after.names || []).length,
+      events: { input: after.input === true, change: after.change === true },
+    };
+  } finally {
+    try {
+      await send(tabId, "Runtime.releaseObjectGroup", { objectGroup: UPLOAD_GROUP });
+    } catch {
+      // The page navigated or closed; its objects went with it.
+    }
+  }
+}
+
 async function navigate(tabId, url) {
   await chrome.tabs.update(tabId, { url });
   return { tabId, url };
@@ -3053,6 +3220,14 @@ const handlers = {
     await checkTab(clientId, p.tabId, p.sites, "type in");
     noteAgentInput(clientId, p.tabId);
     return withState(p, await fillElement(p.tabId, p.index, p.text));
+  },
+  upload_file: async (p) => {
+    validateReadiness(p, true);
+    const clientId = requireClientId(p);
+    assertOwned(clientId, p.tabId);
+    await checkTab(clientId, p.tabId, p.sites, "upload files to");
+    noteAgentInput(clientId, p.tabId);
+    return withState(p, await uploadFiles(p.tabId, p.index, p.paths));
   },
   screenshot: async (p) => {
     const clientId = requireClientId(p);

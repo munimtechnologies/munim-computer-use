@@ -1594,6 +1594,104 @@ test("fill refuses an index that is not a plain number before anything reaches t
   }
 });
 
+/** A page with one file input at index 3, recording the DevTools calls an upload makes. */
+function playFileInput({ multiple = false, via = "input", label = "Attachments", names } = {}) {
+  const calls = [];
+  pageEval = (method, params) => {
+    calls.push([method, params]);
+    if (method === "Runtime.evaluate" && params.objectGroup === "cu-upload") {
+      return { result: { type: "object", subtype: "node", objectId: "input-1" } };
+    }
+    if (method === "Runtime.callFunctionOn" && params.functionDeclaration.startsWith("function fileInputInfoInPage")) {
+      return { result: { value: { via, label, multiple, disabled: false, folder: false } } };
+    }
+    if (method === "Runtime.callFunctionOn" && params.functionDeclaration.startsWith("function fileInputFilesInPage")) {
+      const set = calls.find(([name]) => name === "DOM.setFileInputFiles");
+      const files = names ?? (set ? set[1].files.map((file) => file.split("/").pop()) : []);
+      return { result: { value: { names: files, input: !!set, change: !!set } } };
+    }
+    return { result: { value: {} } };
+  };
+  return calls;
+}
+
+test("upload_file sets the files on the input by its handle and reads back what it holds", async () => {
+  const tab = (await call("open_tab", { url: "https://forms.example/apply", sessionId: "up1" })).tabId;
+  const calls = playFileInput({ multiple: true });
+  try {
+    const result = await callAndWait("upload_file", { tabId: tab, index: 3, paths: ["/home/a/cv.pdf", "/home/a/photo.png"], sessionId: "up1" });
+    assert.equal(result.target, '[3] input[file] "Attachments"');
+    assert.deepEqual(result.files, ["cv.pdf", "photo.png"]);
+    assert.equal(result.count, 2);
+    assert.deepEqual({ ...result.events }, { input: true, change: true });
+    const set = calls.find(([method]) => method === "DOM.setFileInputFiles");
+    assert.deepEqual(JSON.parse(JSON.stringify(set[1])), { files: ["/home/a/cv.pdf", "/home/a/photo.png"], objectId: "input-1" });
+    // Nothing else reaches the tab: no input events, no activation, no submit.
+    assert.deepEqual(calls.filter(([method]) => method.startsWith("Input.")), []);
+    assert.equal(tabs.get(tab).active, false);
+    assert.ok(calls.some(([method, params]) => method === "Runtime.releaseObjectGroup" && params.objectGroup === "cu-upload"));
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "up1" });
+  }
+});
+
+test("upload_file through a label names the label, and one file goes to an input without multiple", async () => {
+  const tab = (await call("open_tab", { url: "https://forms.example/apply", sessionId: "up2" })).tabId;
+  playFileInput({ via: "label", label: "Upload your CV" });
+  try {
+    const result = await callAndWait("upload_file", { tabId: tab, index: 3, paths: ["C:\\Users\\a\\cv.pdf"], sessionId: "up2" });
+    assert.equal(result.target, 'the file input of [3] label "Upload your CV"');
+    assert.equal(result.count, 1);
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "up2" });
+  }
+});
+
+test("upload_file refuses several files for an input without multiple, and sets nothing", async () => {
+  const tab = (await call("open_tab", { url: "https://forms.example/apply", sessionId: "up3" })).tabId;
+  const calls = playFileInput({ multiple: false });
+  try {
+    const error = await refuses("upload_file", { tabId: tab, index: 3, paths: ["/a.txt", "/b.txt"], sessionId: "up3" });
+    assert.match(error, /^not attached: \[3\] input\[file\] "Attachments" takes one file \(it has no multiple attribute\) and 2 were given/);
+    assert.equal(calls.filter(([method]) => method === "DOM.setFileInputFiles").length, 0);
+    // The event watch is taken down again, and the handle released.
+    assert.ok(calls.some(([method, params]) => method === "Runtime.callFunctionOn" && params.functionDeclaration.startsWith("function fileInputFilesInPage")));
+    assert.ok(calls.some(([method]) => method === "Runtime.releaseObjectGroup"));
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "up3" });
+  }
+});
+
+test("upload_file passes on why an index names no file input, and checks its arguments first", async () => {
+  const tab = (await call("open_tab", { url: "https://forms.example/apply", sessionId: "up4" })).tabId;
+  const calls = [];
+  pageEval = (method, params) => {
+    calls.push(method);
+    if (method === "Runtime.evaluate" && params.objectGroup === "cu-upload") {
+      return { result: { type: "string", value: "element 3 is button, not a file input or a label for one" } };
+    }
+    return { result: { value: {} } };
+  };
+  try {
+    assert.match(await refuses("upload_file", { tabId: tab, index: 3, paths: ["/a.txt"], sessionId: "up4" }),
+      /^not attached: element 3 is button, not a file input or a label for one$/);
+    assert.ok(!calls.includes("DOM.setFileInputFiles"));
+    calls.length = 0;
+    assert.match(await refuses("upload_file", { tabId: tab, index: "3); alert(1", paths: ["/a.txt"], sessionId: "up4" }), /index must be an element index/);
+    assert.match(await refuses("upload_file", { tabId: tab, index: 3, paths: [], sessionId: "up4" }), /paths must list 1 to 50/);
+    assert.match(await refuses("upload_file", { tabId: tab, index: 3, paths: "/a.txt", sessionId: "up4" }), /paths must list 1 to 50/);
+    assert.deepEqual(calls.filter((method) => method !== "Emulation.setFocusEmulationEnabled"), []);
+    // Another task's tab is refused before the page is touched.
+    assert.match(await refuses("upload_file", { tabId: tab, index: 3, paths: ["/a.txt"], sessionId: "someone-else" }), /not one of this agent's tabs/);
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "up4" });
+  }
+});
+
 // ── runner ──────────────────────────────────────────────────────────────────
 
 let failed = 0;
