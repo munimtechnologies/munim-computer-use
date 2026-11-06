@@ -940,7 +940,7 @@ if (argv.includes("--headed")) check("a click in a shown tab is real mouse input
   await ok("browser_close_tab", { tab_id: pressTab });
 });
 
-// #43: the reply must agree with browser_list_tabs about which tab is shown.
+// #43: report Chrome active-tab metadata without claiming that the page rendered.
 check("browser_select_tab reports active metadata without claiming rendering (#43)", async () => {
   const shown = Number(/tab_id=(\d+)/.exec(await ok("browser_open_tab", { url: `${base}/press` }))[1]);
   const isActive = async () =>
@@ -951,7 +951,8 @@ check("browser_select_tab reports active metadata without claiming rendering (#4
     assert.equal(await isActive(), false, "the reply said not shown, the tab list says active");
   } else {
     assert.ok(first.startsWith(`tab ${shown} is reported active by Chrome`), first);
-    assert.equal(await isActive(), true, "the reply said shown, the tab list says inactive");
+    assert.match(first, /page rendering is not verified/);
+    assert.equal(await isActive(), true, "the reply said active, the tab list says inactive");
   }
   const forced = await ok("browser_select_tab", { tab_id: shown, bring_to_front: true });
   assert.ok(forced.startsWith(`tab ${shown} is reported active by Chrome and its window was brought to front; page rendering is not verified`), forced);
