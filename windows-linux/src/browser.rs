@@ -1071,9 +1071,9 @@ fn normalise(_command: &str, args: &Value) -> Value {
 fn describe_select(tab: i64, result: &Value) -> String {
     match result.get("activated").and_then(Value::as_bool) {
         Some(true) if result.get("windowFocused").and_then(Value::as_bool) == Some(true) => {
-            format!("tab {tab} is now the visible tab and its Chrome window is in front")
+            format!("tab {tab} is reported active by Chrome and its window was brought to front; page rendering is not verified")
         }
-        Some(true) => format!("tab {tab} is now the visible tab in its window"),
+        Some(true) => format!("tab {tab} is reported active by Chrome; page rendering is not verified"),
         Some(false) => format!(
             "tab {tab} was NOT brought to front: the user is on one of their own tabs in that window, \
              so it stays in the background (browser_list_tabs still shows their tab as active). \
@@ -2037,14 +2037,14 @@ mod tests {
         assert!(describe("select_tab", &json!({}), &tab).starts_with("asked Chrome to select tab 9"));
         assert_eq!(
             describe("select_tab", &json!({ "tabId": 9, "activated": true }), &tab),
-            "tab 9 is now the visible tab in its window"
+            "tab 9 is reported active by Chrome; page rendering is not verified"
         );
         let background = describe("select_tab", &json!({ "tabId": 9, "activated": false }), &tab);
         assert!(background.starts_with("tab 9 was NOT brought to front"), "{background}");
         assert!(background.contains("bring_to_front=true"), "{background}");
         assert_eq!(
             describe("select_tab", &json!({ "tabId": 9, "activated": true, "windowFocused": true }), &tab),
-            "tab 9 is now the visible tab and its Chrome window is in front"
+            "tab 9 is reported active by Chrome and its window was brought to front; page rendering is not verified"
         );
         assert_eq!(describe("close_tab", &json!({}), &tab), "closed tab 9");
         assert_eq!(
