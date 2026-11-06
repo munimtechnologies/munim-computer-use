@@ -1313,6 +1313,9 @@ fn describe_readiness(result: &Value) -> String {
     if let Some(frames) = readiness.get("frames").and_then(Value::as_u64).filter(|&n| n > 0) {
         line.push_str(&format!(" — not searched: {}", frames_phrase(frames)));
     }
+    if let Some(note) = readiness.get("note").and_then(Value::as_str) {
+        line.push_str(&format!(" — {note}"));
+    }
     line.push_str("; only the stated condition was checked, not general app readiness. Re-observe with browser_snapshot before repeating a non-idempotent action.\n");
     line
 }
@@ -1346,6 +1349,10 @@ fn describe_read(result: &Value) -> String {
     }
     out.push_str("\n\n");
     out.push_str(if text.is_empty() && total == 0 { "(no readable text on this page)" } else { text });
+    // Why an empty page is empty: not drawn, or text hidden by CSS (#63).
+    if let Some(note) = result.get("note").and_then(Value::as_str) {
+        out.push_str(&format!("\nnote: {note}"));
+    }
     if offset > 0 || end < total {
         out.push_str(&format!("\n\n… showing characters {offset}–{end} of {total}"));
         if end < total {
@@ -1600,6 +1607,16 @@ mod tests {
         assert!(!text.contains("offset="), "{text}");
         assert!(text.contains("1 matching line\n"), "{text}");
         assert!(text.contains("Home  [https://h.example/]"), "{text}");
+    }
+
+    #[test]
+    fn an_empty_read_says_why_it_is_empty() {
+        let text = describe(
+            "read",
+            &json!({ "title": "Call", "url": "u", "text": "", "offset": 0, "end": 0, "total": 0, "note": "Chrome is not drawing this tab" }),
+            &json!({}),
+        );
+        assert!(text.contains("(no readable text on this page)\nnote: Chrome is not drawing this tab"), "{text}");
     }
 
     #[test]

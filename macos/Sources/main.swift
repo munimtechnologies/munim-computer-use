@@ -3237,6 +3237,7 @@ func describeReadiness(_ payload: [String: Any]) -> String {
     if let selector = readiness["selector"] as? String { line += " selector=\(selector)" }
     if let error = readiness["error"] as? String { line += " — \(error)" }
     if let frames = readiness["frames"] as? Int, frames > 0 { line += " — not searched: \(framesPhrase(frames))" }
+    if let note = readiness["note"] as? String { line += " — \(note)" }
     return line + "; only the stated condition was checked, not general app readiness. Re-observe with browser_snapshot before repeating a non-idempotent action.\n"
 }
 
@@ -3477,6 +3478,8 @@ func describeRead(_ payload: [String: Any]) -> String {
         out += "\n\(matches) matching line\(matches == 1 ? "" : "s")"
     }
     out += "\n\n" + (text.isEmpty && total == 0 ? "(no readable text on this page)" : text)
+    // Why an empty page is empty: not drawn, or text hidden by CSS (#63).
+    if let note = payload["note"] as? String { out += "\nnote: \(note)" }
     if offset > 0 || end < total {
         out += "\n\n… showing characters \(offset)–\(end) of \(total)"
         if end < total { out += "; call browser_read again with offset=\(end) for more" }

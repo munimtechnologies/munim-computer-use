@@ -1255,8 +1255,9 @@ test("a call behind a stuck command fails fast and says which command holds the 
   const realSet = extensionContext.setTimeout;
   extensionContext.setTimeout = (fn, ms, ...rest) => (ms === 6000 ? {} : realSet(fn, ms, ...rest));
   let release;
-  // Only the page hangs; attaching (focus emulation) still answers.
-  pageEval = (method) => method === "Runtime.evaluate" ? new Promise((resolve) => { release = resolve; }) : {};
+  // Only the page hangs; attaching (focus emulation, the frame wait) still answers.
+  pageEval = (method, params) =>
+    method === "Runtime.evaluate" && !params.awaitPromise ? new Promise((resolve) => { release = resolve; }) : { result: { value: true } };
   try {
     const first = call("snapshot", { tabId: owned.tabId, sessionId: "stuck" }).catch((error) => error);
     for (let n = 0; n < 50 && !release; n++) await new Promise((resolve) => setImmediate(resolve));
@@ -1330,6 +1331,89 @@ test("attaching to a tab turns on focus emulation, once per session", async () =
   assert.equal(seen[0][0], "Emulation.setFocusEmulationEnabled", "before anything reaches the page");
   pageEval = () => ({ result: { value: {} } });
   await call("close_all_tabs", { sessionId: "emulate" });
+});
+
+// #63: Fathom's call page is Stencil web components, hidden until their first
+// drawn frame. In a tab Chrome is not drawing, snapshot and read found nothing.
+/** A page that reports itself hidden until `drawsAfter` focus emulations, and logs what was sent. */
+function playHiddenPage({ drawsAfter = 2, listed = [{ i: 0, tag: "button", label: "Rename" }] } = {}) {
+  const seen = [];
+  let emulations = 0;
+  pageEval = (method, params) => {
+    seen.push(method === "Emulation.setFocusEmulationEnabled" ? `emulation ${params.enabled}` : method);
+    if (method === "Emulation.setFocusEmulationEnabled" && params.enabled) emulations++;
+    const shown = emulations >= drawsAfter;
+    const expression = params.expression ?? "";
+    if (params.awaitPromise) return { result: { value: shown } };
+    if (expression.includes("visibleSelectorInPage")) return { result: { value: { met: shown, frames: 0, shown } } };
+    if (expression.includes("queryAll(document, sel")) {
+      return { result: { value: { title: "Call", url: "https://fathom.example/calls/1", elements: shown ? listed : [], total: shown ? listed.length : 0, shown } } };
+    }
+    if (expression.includes("readPageInPage")) {
+      return { result: { value: { title: "Call", url: "https://fathom.example/calls/1", text: shown ? "Weekly sync" : "", shown, ...(shown ? {} : { unshown: 420 }) } } };
+    }
+    return { result: { value: {} } };
+  };
+  return seen;
+}
+
+test("a snapshot of a page Chrome is not drawing asks again for it to be shown, then lists it", async () => {
+  const tab = (await call("open_tab", { url: "https://fathom.example/calls/1", sessionId: "drawn" })).tabId;
+  const seen = playHiddenPage();
+  const result = await call("snapshot", { tabId: tab, sessionId: "drawn" });
+  assert.equal(result.total, 1);
+  assert.equal(result.elements[0].label, "Rename");
+  assert.equal(result.empty, undefined);
+  assert.deepEqual(seen.filter((entry) => entry.startsWith("emulation")), ["emulation true", "emulation false", "emulation true"]);
+  // A page that is drawn is not asked again.
+  seen.length = 0;
+  await call("snapshot", { tabId: tab, sessionId: "drawn" });
+  assert.deepEqual(seen, ["Runtime.evaluate"]);
+  pageEval = () => ({ result: { value: {} } });
+  await call("close_all_tabs", { sessionId: "drawn" });
+});
+
+test("a page that stays undrawn says so instead of reading as empty", async () => {
+  const tab = (await call("open_tab", { url: "https://fathom.example/calls/1", sessionId: "undrawn" })).tabId;
+  playHiddenPage({ drawsAfter: Infinity });
+  const snap = await call("snapshot", { tabId: tab, sessionId: "undrawn" });
+  assert.equal(snap.total, 0);
+  assert.match(snap.empty, /Chrome is not drawing this tab/);
+  const read = await call("read", { tabId: tab, sessionId: "undrawn" });
+  assert.equal(read.text, "");
+  assert.match(read.note, /Chrome is not drawing this tab/);
+  pageEval = () => ({ result: { value: {} } });
+  await call("close_all_tabs", { sessionId: "undrawn" });
+});
+
+test("read of a hidden page asks for it to be drawn and returns its text", async () => {
+  const tab = (await call("open_tab", { url: "https://fathom.example/calls/1", sessionId: "drawn-read" })).tabId;
+  playHiddenPage();
+  const read = await call("read", { tabId: tab, sessionId: "drawn-read" });
+  assert.equal(read.text, "Weekly sync");
+  assert.equal(read.note, undefined);
+  pageEval = () => ({ result: { value: {} } });
+  await call("close_all_tabs", { sessionId: "drawn-read" });
+});
+
+test("an empty read of a drawn page says how much text is hidden by CSS", async () => {
+  pageEval = (method, params) =>
+    params.expression?.includes("readPageInPage")
+      ? { result: { value: { title: "T", url: "https://p.example/", text: "", shown: true, unshown: 1200 } } }
+      : { result: { value: {} } };
+  const read = await call("read", { tabId: pageTab });
+  assert.match(read.note, /about 1200 characters of text, but none of it is shown/);
+  pageEval = () => ({ result: { value: {} } });
+});
+
+test("a selector wait on an undrawn page asks once for it to be drawn, then sees the selector", async () => {
+  const tab = (await call("open_tab", { url: "https://fathom.example/calls/1", sessionId: "drawn-wait" })).tabId;
+  const seen = playHiddenPage();
+  const result = await callAndWait("snapshot", { tabId: tab, sessionId: "drawn-wait", waitForSelector: "button", waitTimeoutMs: 2000 });
+  assert.equal(result.readiness.status, "met");
+  assert.equal(seen.filter((entry) => entry === "emulation false").length, 1);
+  pageEval = () => ({ result: { value: {} } });
+  await call("close_all_tabs", { sessionId: "drawn-wait" });
 });
 
 const resolve = (key, modifiers, mac) =>
