@@ -910,7 +910,8 @@ test("a snapshot clears indices an earlier snapshot left on now-hidden elements"
     return {
       tagName: tag.toUpperCase(),
       innerText: tag,
-      matches: () => false,
+      // Selectors are comma lists; a bare tag name in one matches this element.
+      matches: (selector) => selector.split(",").includes(tag),
       hidden,
       getAttribute: (name) => attributes.get(name) ?? null,
       setAttribute: (name, value) => attributes.set(name, String(value)),
@@ -1113,7 +1114,7 @@ test("Tab in a background tab moves focus itself and says where it went", async 
     return { result: { value: {} } };
   };
   const result = await callAndWait("press", { tabId: formTab, key: "Tab" });
-  assert.deepEqual([...keys], ["keyDown", "keyUp"], "the page still sees the keystroke");
+  assert.deepEqual([...keys], ["rawKeyDown", "keyUp"], "the page still sees the keystroke");
   assert.equal(result.focused, '[7] input "Privacy policy link"');
   pageEval = () => ({ result: { value: {} } });
 });
@@ -1223,7 +1224,8 @@ test("a call behind a stuck command fails fast and says which command holds the 
   const realSet = extensionContext.setTimeout;
   extensionContext.setTimeout = (fn, ms, ...rest) => (ms === 6000 ? {} : realSet(fn, ms, ...rest));
   let release;
-  pageEval = () => new Promise((resolve) => { release = resolve; });
+  // Only the page hangs; attaching (focus emulation) still answers.
+  pageEval = (method) => method === "Runtime.evaluate" ? new Promise((resolve) => { release = resolve; }) : {};
   try {
     const first = call("snapshot", { tabId: owned.tabId, sessionId: "stuck" }).catch((error) => error);
     for (let n = 0; n < 50 && !release; n++) await new Promise((resolve) => setImmediate(resolve));
@@ -1275,6 +1277,205 @@ test("a tab Chrome will not group still opens, is reported, and is the task's (#
     assert.ok(!tabs.has(opened.tabId), "cleanup closes it");
   } finally {
     groupFailure = null;
+  }
+});
+
+// ── background-tab input ────────────────────────────────────────────────────
+
+// A hidden tab drops trusted mouse input and runs no editing action for keys;
+// focus emulation on the debugger session is what makes both work there.
+test("attaching to a tab turns on focus emulation, once per session", async () => {
+  const tab = (await call("open_tab", { url: "https://console.example/users", sessionId: "emulate" })).tabId;
+  const seen = [];
+  pageEval = (method, params) => {
+    seen.push([method, params.enabled]);
+    return { result: { value: {} } };
+  };
+  await call("snapshot", { tabId: tab, sessionId: "emulate" });
+  await call("snapshot", { tabId: tab, sessionId: "emulate" });
+  const emulations = seen.filter(([method]) => method === "Emulation.setFocusEmulationEnabled");
+  assert.equal(emulations.length, 1);
+  assert.equal(emulations[0][1], true);
+  assert.equal(seen[0][0], "Emulation.setFocusEmulationEnabled", "before anything reaches the page");
+  pageEval = () => ({ result: { value: {} } });
+  await call("close_all_tabs", { sessionId: "emulate" });
+});
+
+const resolve = (key, modifiers, mac) =>
+  JSON.parse(vm.runInContext(`JSON.stringify(resolveKeyPress(${JSON.stringify(key)}, ${JSON.stringify(modifiers)}, ${mac}))`, extensionContext));
+
+test("select all is Cmd+A with its editing command on a Mac and Ctrl+A elsewhere", () => {
+  const mac = resolve("a", ["cmd"], true);
+  assert.equal(mac.label, "Cmd+A");
+  assert.equal(mac.modifiers, 4);
+  assert.deepEqual([...mac.commands], ["selectAll"]);
+  assert.equal(mac.text, undefined, "a shortcut types nothing");
+  const other = resolve("a", ["ctrl"], false);
+  assert.equal(other.label, "Ctrl+A");
+  assert.equal(other.modifiers, 2);
+  assert.equal(other.commands.length, 0, "Blink maps Ctrl+A itself off the Mac");
+});
+
+test("an editing shortcut means the same on every platform, and says when it was translated", () => {
+  const onMac = resolve("ctrl+a", undefined, true);
+  assert.equal(onMac.label, "Cmd+A");
+  assert.deepEqual([...onMac.commands], ["selectAll"]);
+  assert.match(onMac.note, /sent Ctrl\+A as Cmd\+A/);
+  const offMac = resolve("a", ["cmd"], false);
+  assert.equal(offMac.label, "Ctrl+A");
+  assert.match(offMac.note, /sent Cmd\+A as Ctrl\+A/);
+  assert.equal(resolve("y", ["ctrl"], true).label, "Shift+Cmd+Z", "redo on a Mac");
+  // Not every Ctrl combination is an editing shortcut.
+  assert.equal(resolve("k", ["ctrl"], true).label, "Ctrl+K");
+});
+
+test("named keys, aliases and combinations resolve to the right events", () => {
+  for (const [key, modifiers, mac, label, vk, commands] of [
+    ["Delete", [], true, "Delete", 46, ["deleteForward"]],
+    ["del", [], false, "Delete", 46, []],
+    ["Home", [], true, "Home", 36, ["moveToBeginningOfLine"]],
+    ["End", ["shift"], true, "Shift+End", 35, ["moveToEndOfLineAndModifySelection"]],
+    ["left", ["alt"], true, "Alt+ArrowLeft", 37, ["moveWordLeft"]],
+    ["ArrowDown", [], false, "ArrowDown", 40, []],
+    ["Cmd+Shift+Z", undefined, true, "Shift+Cmd+Z", 90, ["redo"]],
+    ["Escape", [], true, "Escape", 27, []],
+    ["F5", [], false, "F5", 116, []],
+    ["space", [], false, "Space", 32, []],
+  ]) {
+    const press = resolve(key, modifiers, mac);
+    assert.equal(press.label, label, key);
+    assert.equal(press.vk, vk, key);
+    assert.deepEqual([...press.commands], commands, key);
+  }
+  const enter = resolve("return", [], false);
+  assert.equal(enter.text, "\r");
+  const capital = resolve("A", [], false);
+  assert.equal(capital.text, "A");
+  assert.equal(capital.modifiers, 8, "a capital is typed with Shift");
+  const bang = resolve("!", [], false);
+  assert.equal(bang.code, "Digit1");
+  assert.equal(bang.text, "!");
+});
+
+test("unknown keys and modifiers are refused with what is accepted", () => {
+  assert.throws(() => resolve("Hyper", [], true), /unknown key "Hyper" — use a single character or one of Enter/);
+  assert.throws(() => resolve("a", ["fn"], true), /unknown modifier "fn"/);
+  assert.throws(() => resolve("", [], true), /key must be/);
+});
+
+test("a key press with modifiers sends one rawKeyDown with its command, then keyUp, and reports focus and selection", async () => {
+  const tab = (await call("open_tab", { url: "https://console.example/listing", sessionId: "keys" })).tabId;
+  vm.runInContext("macPlatform = true", extensionContext);
+  const events = [];
+  pageEval = (method, params) => {
+    if (method === "Input.dispatchKeyEvent") events.push(params);
+    if ((params.expression ?? "").includes("selectionStart === 'number'")) {
+      return { result: { value: { focused: '[4] textarea "Full description"', selected: 1612 } } };
+    }
+    return { result: { value: {} } };
+  };
+  try {
+    const result = await callAndWait("press", { tabId: tab, key: "a", modifiers: ["cmd"], sessionId: "keys" });
+    assert.equal(events.length, 2);
+    assert.equal(events[0].type, "rawKeyDown");
+    assert.equal(events[0].modifiers, 4);
+    assert.deepEqual([...events[0].commands], ["selectAll"]);
+    assert.equal(events[1].type, "keyUp");
+    assert.equal(result.pressed, "Cmd+A");
+    assert.equal(result.focused, '[4] textarea "Full description"');
+    assert.equal(result.selected, 1612);
+  } finally {
+    vm.runInContext("macPlatform = null", extensionContext);
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "keys" });
+  }
+});
+
+test("fill selects the field, inserts the text through Chrome and checks it took", async () => {
+  const tab = (await call("open_tab", { url: "https://console.example/listing", sessionId: "fill" })).tabId;
+  const steps = [];
+  pageEval = (method, params) => {
+    const expression = params.expression ?? "";
+    if (method === "Input.insertText") steps.push(["insert", params.text]);
+    if (expression.includes("__cuFillBefore = value()")) {
+      steps.push(["prepare"]);
+      return { result: { value: { ok: true, tag: "textarea", label: "Full description" } } };
+    }
+    if (expression.includes("const expected =")) {
+      steps.push(["check"]);
+      return { result: { value: { ok: true, matches: true, length: 9 } } };
+    }
+    return { result: { value: {} } };
+  };
+  try {
+    const result = await callAndWait("fill", { tabId: tab, index: 4, text: "New words", sessionId: "fill" });
+    assert.deepEqual(steps.map((step) => step.join(":")), ["prepare", "insert:New words", "check"]);
+    assert.equal(result.target, '[4] textarea "Full description"');
+    assert.equal(result.matches, true);
+    assert.equal(result.length, 9);
+    assert.equal(result.note, undefined);
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "fill" });
+  }
+});
+
+test("fill reports a direct set when Chrome's input never reached the field", async () => {
+  const tab = (await call("open_tab", { url: "https://console.example/listing", sessionId: "fill2" })).tabId;
+  const checks = [];
+  pageEval = (method, params) => {
+    const expression = params.expression ?? "";
+    if (expression.includes("__cuFillBefore = value()")) return { result: { value: { ok: true, tag: "input", label: "Title" } } };
+    if (expression.includes("const expected =")) {
+      checks.push(/if \(true &&/.test(expression));
+      return { result: { value: { ok: true, matches: true, fallback: true, length: 3 } } };
+    }
+    return { result: { value: {} } };
+  };
+  try {
+    const result = await callAndWait("fill", { tabId: tab, index: 2, text: "new", sessionId: "fill2" });
+    assert.deepEqual([...checks], [true], "one check, allowed to set the value");
+    assert.equal(result.matches, true);
+    assert.match(result.note, /set its value directly/);
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "fill2" });
+  }
+});
+
+test("fill says what a field holds when the page limited the text", async () => {
+  const tab = (await call("open_tab", { url: "https://console.example/listing", sessionId: "fill4" })).tabId;
+  pageEval = (method, params) => {
+    const expression = params.expression ?? "";
+    if (expression.includes("__cuFillBefore = value()")) return { result: { value: { ok: true, tag: "input", label: "Code" } } };
+    if (expression.includes("const expected =")) return { result: { value: { ok: true, matches: false, length: 4, value: "ABCD" } } };
+    return { result: { value: {} } };
+  };
+  try {
+    const result = await callAndWait("fill", { tabId: tab, index: 2, text: "ABCDEFG", sessionId: "fill4" });
+    assert.equal(result.matches, false);
+    assert.equal(result.actualLength, 4);
+    assert.equal(result.value, "ABCD");
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "fill4" });
+  }
+});
+
+test("fill refuses an index that is not a plain number before anything reaches the page", async () => {
+  const tab = (await call("open_tab", { url: "https://console.example/listing", sessionId: "fill3" })).tabId;
+  const expressions = [];
+  pageEval = (method, params) => {
+    if (params.expression) expressions.push(params.expression);
+    return { result: { value: {} } };
+  };
+  try {
+    assert.match(await refuses("fill", { tabId: tab, index: "1); alert(1", text: "x", sessionId: "fill3" }), /index must be an element index/);
+    assert.match(await refuses("fill", { tabId: tab, index: 1, sessionId: "fill3" }), /text is required/);
+    assert.equal(expressions.length, 0);
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "fill3" });
   }
 });
 

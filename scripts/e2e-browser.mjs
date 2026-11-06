@@ -107,6 +107,41 @@ const pages = {
     more.addEventListener('click', (e) => presses.push(['click', e.isTrusted, e.detail, e.pointerType]));
   </script>`,
 };
+// Background editing: a button that, like an Angular Material one, ignores
+// synthetic clicks; fields of every kind, some inside a web component; and
+// rows of a table, an ARIA grid and custom elements, as a users list has.
+const LONG_TEXT = Array.from({ length: 32 }, (_, i) => `Line ${i} of the old description, long enough to matter.`).join("\n");
+pages["/editor"] = `<title>Editor</title>
+  <button id="edit">Edit</button>
+  <div id="dialog" role="dialog" hidden><h2>Edit details</h2><button id="save">Save</button></div>
+  <input id="name" aria-label="Name" value="Old name">
+  <textarea id="about" aria-label="About">${LONG_TEXT}</textarea>
+  <div id="rich" contenteditable="true" aria-label="Rich">Old <b>rich</b> text</div>
+  <x-field></x-field>
+  <input id="code" aria-label="Code" maxlength="4">
+  <input id="locked" aria-label="Locked" value="keep">
+  <table><tr><th>Name</th><th>Role</th></tr><tr><td>Cara</td><td>Owner</td></tr></table>
+  <div role="grid"><div role="row"><div role="gridcell">Ben</div><div role="gridcell">Viewer</div></div></div>
+  <x-list><x-row id="ana" style="display:block;cursor:pointer"><x-cell>Ana</x-cell> <x-cell>Admin</x-cell></x-row></x-list>
+  <script>
+    window.events = [];
+    window.rowClicks = [];
+    for (const type of ['beforeinput', 'input']) addEventListener(type, (e) => events.push([type, e.isTrusted]), true);
+    document.getElementById('edit').addEventListener('click', (e) => {
+      if (e.isTrusted) document.getElementById('dialog').hidden = false;
+    });
+    document.getElementById('ana').addEventListener('click', (e) => rowClicks.push(e.isTrusted));
+    document.getElementById('locked').addEventListener('beforeinput', (e) => e.preventDefault());
+    customElements.define('x-field', class extends HTMLElement {
+      constructor() {
+        super();
+        this.attachShadow({ mode: 'open' }).innerHTML =
+          '<input id="inner" aria-label="Shadow input" value="shadow old">' +
+          '<div id="innerRich" contenteditable="true" aria-label="Shadow rich">shadow rich old</div>';
+      }
+    });
+  </script>`;
+pages["/user"] = "<title>User window</title><h1>The user's own page</h1>";
 const site = http.createServer((req, res) => {
   const body = pages[req.url.split("?")[0]];
   res.writeHead(body ? 200 : 404, { "content-type": "text/html; charset=utf-8" });
@@ -253,6 +288,22 @@ async function evaluateIn(match, expression, method = "Runtime.evaluate") {
   }
   throw new Error("no DevTools target matched");
 }
+/** One command on the browser-wide DevTools session (windows, targets). */
+async function browserCommand(method, params = {}) {
+  const { webSocketDebuggerUrl } = await (await fetch(`http://127.0.0.1:${devtoolsPort}/json/version`)).json();
+  const socket = new WebSocket(webSocketDebuggerUrl);
+  await new Promise((resolve) => socket.addEventListener("open", resolve, { once: true }));
+  const answer = new Promise((resolve) =>
+    socket.addEventListener("message", (event) => {
+      const message = JSON.parse(event.data);
+      if (message.id === 1) resolve(message.result ?? message.error);
+    }),
+  );
+  socket.send(JSON.stringify({ id: 1, method, params }));
+  const value = await answer;
+  socket.close();
+  return value;
+}
 /**
  * Evaluate in every DevTools target whose URL matches, until one returns a
  * value other than null. A popup can list more than one target for the same
@@ -353,7 +404,7 @@ let tab;
 check("tools/list advertises browser_read and browser_request_credentials", async () => {
   const reply = await rpc("tools/list");
   const names = reply.result.tools.map((entry) => entry.name);
-  assert.equal(names.length, 33);
+  assert.equal(names.length, 34);
   assert.ok(names.includes("browser_read") && names.includes("browser_request_credentials"));
 });
 
@@ -578,20 +629,193 @@ check("snapshot pagination reaches all controls with stable global indices", asy
 
 let pressTab;
 const atPress = (url) => url === `${base}/press`;
-check("a background-tab click carries a real press's button state (#42)", async () => {
+check("a background-tab click is real mouse input with a real press's button state (#42)", async () => {
   pressTab = Number(/tab_id=(\d+)/.exec(await ok("browser_open_tab", { url: `${base}/press` }))[1]);
   await ok("browser_select_tab", { tab_id: tab });
   const snapshot = await ok("browser_snapshot", { tab_id: pressTab });
   const index = Number(/\[(\d+)\] button "More message options"/.exec(snapshot)[1]);
   const text = await ok("browser_click", { tab_id: pressTab, index, return_state: true, wait_for_selector: "[role=menuitem]", wait_timeout_ms: 3000 });
-  assert.ok(text.startsWith(`clicked in tab ${pressTab} — [${index}] button "More message options", as page events (the tab is in the background)`), text);
+  assert.ok(text.startsWith(`clicked in tab ${pressTab} — [${index}] button "More message options", with real mouse input`), text);
   assert.match(text, /readiness: met/);
   assert.deepEqual(await evaluateIn(atPress, "presses"), [
-    ["pointerdown", false, 1, "mouse"],
-    ["mousedown", false, 1, 1],
-    ["mouseup", false, 0, 1],
-    ["click", false, 1, "mouse"],
+    ["pointerdown", true, 1, "mouse"],
+    ["mousedown", true, 1, 1],
+    ["mouseup", true, 0, 1],
+    ["click", true, 1, "mouse"],
   ]);
+});
+
+check("real input survives a cross-site navigation in the same background tab", async () => {
+  // 127.0.0.1 → localhost is another site, so Chrome swaps the renderer.
+  await ok("browser_navigate", { tab_id: pressTab, url: `${otherBase}/press`, return_state: true });
+  const snapshot = await ok("browser_snapshot", { tab_id: pressTab });
+  const index = Number(/\[(\d+)\] button "More message options"/.exec(snapshot)[1]);
+  const text = await ok("browser_click", { tab_id: pressTab, index, return_state: true, wait_for_selector: "[role=menuitem]", wait_timeout_ms: 3000 });
+  assert.ok(text.includes("with real mouse input"), text);
+  assert.deepEqual(await evaluateIn((url) => url === `${otherBase}/press`, "presses.map((press) => press[1])"), [true, true, true, true]);
+});
+
+// ── editing in a background tab while the user works in another window ──
+
+let editTab;
+let userTarget;
+const atEditor = (url) => url === `${base}/editor`;
+const indexOf = (snapshot, pattern) => {
+  const match = new RegExp(`\\[(\\d+)\\] ${pattern}`).exec(snapshot);
+  if (!match) throw new Error(`no ${pattern} in:\n${snapshot}`);
+  return Number(match[1]);
+};
+/** The frontmost macOS app, to prove nothing brought Chrome forward. */
+const frontApp = () => {
+  if (os.platform() !== "darwin") return null;
+  try {
+    return execFileSync("lsappinfo", ["info", "-only", "name", execFileSync("lsappinfo", ["front"], { encoding: "utf8" }).trim()], { encoding: "utf8" }).trim();
+  } catch {
+    return null;
+  }
+};
+const editTabActive = async () => new RegExp(`^\\* tab_id=${editTab}\\b`, "m").test(await ok("browser_list_tabs", { all: true }));
+/**
+ * Chrome's own record of window focus, read in the extension's service
+ * worker. Unlike document.hasFocus() in the user's page, it does not depend on
+ * what else is on screen: another app covering this Chrome hides its pages.
+ */
+const atWorker = (url) => url === `chrome-extension://${built.extensionId}/background.js`;
+const inWorker = (expression) => evaluateIn(atWorker, expression);
+let before;
+
+check("an agent tab opens in the background while the user's own window has focus", async () => {
+  editTab = Number(/tab_id=(\d+)/.exec(await ok("browser_open_tab", { url: `${base}/editor` }))[1]);
+  userTarget = await browserCommand("Target.createTarget", { url: `${base}/user`, newWindow: true });
+  await sleep(800);
+  before = {
+    front: frontApp(),
+    ...(await inWorker(`(async () => {
+      globalThis.__e2eFocus = [];
+      chrome.windows.onFocusChanged.addListener((id) => __e2eFocus.push(id));
+      const user = (await chrome.tabs.query({ url: ${JSON.stringify(`${base}/user`)} }))[0];
+      return { agentWindow: (await chrome.tabs.get(${editTab})).windowId, userWindow: user.windowId,
+        lastFocused: (await chrome.windows.getLastFocused()).id };
+    })()`)),
+  };
+  assert.notEqual(before.agentWindow, before.userWindow, "the user's page is in a window of its own");
+  assert.equal(before.lastFocused, before.userWindow, "the user's window has focus");
+  assert.equal(await editTabActive(), false, "the agent tab is not the active tab");
+});
+
+check("a click in the background tab is trusted: a button that ignores synthetic clicks opens its dialog", async () => {
+  const snapshot = await ok("browser_snapshot", { tab_id: editTab });
+  const edit = indexOf(snapshot, 'button "Edit"');
+  const text = await ok("browser_click", {
+    tab_id: editTab, index: edit, return_state: true, wait_for_selector: "#dialog button", wait_timeout_ms: 3000,
+  });
+  assert.ok(text.includes("with real mouse input"), text);
+  assert.match(text, /readiness: met/);
+  assert.match(text, /button "Save"/);
+  await evaluateIn(atEditor, "document.getElementById('dialog').hidden = true; true");
+});
+
+check("select all with a modifier, then type, replaces an input's value", async () => {
+  const snapshot = await ok("browser_snapshot", { tab_id: editTab });
+  await ok("browser_click", { tab_id: editTab, index: indexOf(snapshot, 'input "Name"') });
+  const selected = await ok("browser_press_key", { tab_id: editTab, key: "a", modifiers: ["cmd"] });
+  assert.match(selected, /focus is now on \[\d+\] input "Name" with 8 characters selected/, selected);
+  await ok("browser_type", { tab_id: editTab, text: "New name" });
+  assert.equal(await evaluateIn(atEditor, "document.getElementById('name').value"), "New name");
+});
+
+check("ctrl and cmd select all alike, in the platform's own way", async () => {
+  const text = await ok("browser_press_key", { tab_id: editTab, key: "a", modifiers: ["ctrl"] });
+  assert.match(text, /with 8 characters selected/, text);
+  if (os.platform() === "darwin") assert.match(text, /sent Ctrl\+A as Cmd\+A/, text);
+});
+
+check("Home, shift+End and Delete edit within the field", async () => {
+  await ok("browser_press_key", { tab_id: editTab, key: "Home" });
+  await ok("browser_type", { tab_id: editTab, text: ">" });
+  assert.equal(await evaluateIn(atEditor, "document.getElementById('name').value"), ">New name");
+  await ok("browser_press_key", { tab_id: editTab, key: "ArrowLeft" });
+  const selected = await ok("browser_press_key", { tab_id: editTab, key: "End", modifiers: ["shift"] });
+  assert.match(selected, /with 9 characters selected/, selected);
+  await ok("browser_press_key", { tab_id: editTab, key: "Delete" });
+  assert.equal(await evaluateIn(atEditor, "document.getElementById('name').value"), "");
+});
+
+check("browser_fill replaces a long multi-line textarea in one call", async () => {
+  const snapshot = await ok("browser_snapshot", { tab_id: editTab });
+  const next = Array.from({ length: 35 }, (_, i) => `New line ${i}, with "quotes" and émoji 🙂.`).join("\n");
+  const text = await ok("browser_fill", { tab_id: editTab, index: indexOf(snapshot, 'textarea "About"'), text: next });
+  assert.match(text, /^filled \[\d+\] textarea "About" in tab \d+ with \d+ characters, replacing its value$/, text);
+  assert.equal(await evaluateIn(atEditor, "document.getElementById('about').value"), next);
+});
+
+check("browser_fill replaces contenteditable text and fields inside a shadow root", async () => {
+  const snapshot = await ok("browser_snapshot", { tab_id: editTab });
+  await ok("browser_fill", { tab_id: editTab, index: indexOf(snapshot, '[a-z]+ "Rich"'), text: "Plain new text" });
+  await ok("browser_fill", { tab_id: editTab, index: indexOf(snapshot, 'input "Shadow input"'), text: "shadow new" });
+  await ok("browser_fill", { tab_id: editTab, index: indexOf(snapshot, '[a-z]+ "Shadow rich"'), text: "shadow rich new" });
+  assert.deepEqual(await evaluateIn(atEditor, `(() => {
+    const root = document.querySelector('x-field').shadowRoot;
+    return [document.getElementById('rich').innerText, root.getElementById('inner').value, root.getElementById('innerRich').innerText];
+  })()`), ["Plain new text", "shadow new", "shadow rich new"]);
+});
+
+check("browser_fill with an empty string clears the field", async () => {
+  const snapshot = await ok("browser_snapshot", { tab_id: editTab });
+  const text = await ok("browser_fill", { tab_id: editTab, index: indexOf(snapshot, 'input "Shadow input"'), text: "" });
+  assert.match(text, /^cleared \[\d+\] input "Shadow input"/, text);
+  assert.equal(await evaluateIn(atEditor, "document.querySelector('x-field').shadowRoot.getElementById('inner').value"), "");
+});
+
+check("browser_fill says what the field holds when the page limits or refuses the text", async () => {
+  const snapshot = await ok("browser_snapshot", { tab_id: editTab });
+  const limited = await ok("browser_fill", { tab_id: editTab, index: indexOf(snapshot, 'input "Code"'), text: "ABCDEFG" });
+  assert.match(limited, /but the field now holds 4 characters that differ from the text: "ABCD"/, limited);
+  // A page that cancels the input decided; the extension does not force it.
+  const refused = await ok("browser_fill", { tab_id: editTab, index: indexOf(snapshot, 'input "Locked"'), text: "changed" });
+  assert.match(refused, /holds 4 characters that differ from the text: "keep"/, refused);
+  assert.doesNotMatch(refused, /set its value directly/);
+  assert.equal(await evaluateIn(atEditor, "document.getElementById('locked').value"), "keep");
+});
+
+check("every edit reached the page as trusted input events", async () => {
+  const events = await evaluateIn(atEditor, "events");
+  assert.ok(events.length >= 10, `only ${events.length} input events`);
+  assert.deepEqual(events.filter(([, trusted]) => !trusted), [], "an untrusted input event");
+});
+
+check("a browser shortcut stays in the page: cmd+w does not close the tab", async () => {
+  await ok("browser_press_key", { tab_id: editTab, key: "w", modifiers: ["cmd"] });
+  await ok("browser_press_key", { tab_id: editTab, key: "w", modifiers: ["ctrl"] });
+  await sleep(300);
+  assert.match(await ok("browser_list_tabs"), new RegExp(`tab_id=${editTab}\\b`));
+});
+
+check("snapshot lists table, grid and custom-element rows, and a row click is trusted", async () => {
+  const snapshot = await ok("browser_snapshot", { tab_id: editTab });
+  assert.match(snapshot, /\] row "Cara \| Owner"/);
+  assert.match(snapshot, /\] row "Name \| Role"/);
+  assert.match(snapshot, /\] row "Ben \| Viewer"/);
+  assert.doesNotMatch(snapshot, /cell "Ben"/, "grid cells that are not click targets stay out");
+  const ana = indexOf(snapshot, 'x-row\\[clickable\\] "Ana Admin"');
+  const text = await ok("browser_click", { tab_id: editTab, index: ana });
+  assert.ok(text.includes("with real mouse input"), text);
+  assert.deepEqual(await evaluateIn(atEditor, "rowClicks"), [true]);
+});
+
+check("none of it selected the agent tab, raised Chrome or took focus from the user's window", async () => {
+  assert.equal(await editTabActive(), false, "the agent tab became the active tab");
+  const after = await inWorker(`(async () => ({ focus: __e2eFocus, lastFocused: (await chrome.windows.getLastFocused()).id }))()`);
+  assert.ok(!after.focus.includes(before.agentWindow), `the agent's window took focus (${JSON.stringify(after.focus)})`);
+  assert.equal(after.lastFocused, before.userWindow, "focus left the user's window");
+  // The person at this computer may switch apps during the run; what must not
+  // happen is this Chrome coming forward when it was not in front.
+  const front = frontApp();
+  if (before.front !== null && !/Chrome for Testing|Chromium/.test(before.front)) {
+    assert.doesNotMatch(front ?? "", /Chrome for Testing|Chromium/, "the test Chrome came to the front");
+  }
+  await browserCommand("Target.closeTarget", { targetId: userTarget.targetId });
+  await ok("browser_close_tab", { tab_id: editTab });
 });
 
 // Headless Chrome reports every tab hidden, the front one too, so only a

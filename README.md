@@ -65,7 +65,7 @@
 - [Why it works well](#why-it-works-well)
 - [Works alongside you](#works-alongside-you)
 - [Apps and sites the agent may use](#apps-and-sites-the-agent-may-use)
-- [Tools](#tools-33)
+- [Tools](#tools-34)
 - [Repository layout](#repository-layout)
 - [Environment flags](#environment-flags)
 - [Embedding in an app](#embedding-in-an-app)
@@ -138,7 +138,7 @@ Then ask: _"Open Safari, find the cheapest flight to Denver on Tuesday and put i
 | Sign-in without the model seeing the password  | **✅**                 | ❌          | ❌                 | ✅                | ❌                       | ❌          | ❌        | ❌                | ❌                        | `browser_request_credentials` opens a Chrome window naming the site's real origin; what the user types goes into the page and never into the conversation. The Agents API hands sign-in to the developer's app the same way. Desktop password fields refuse typing by default.                                                                                                                                                                                                                                                            |
 | Per-app and per-site allow / ask / block rules | **✅**                 | ❌          | ⚠️                 | ⚠️                | ❌                       | ❌          | ❌        | ❌                | ❌                        | A policy file the user controls; `ask` shows an approval prompt once per task. Codex asks before each new app and keeps an "Always allow" list; the Agents API asks the developer's app before each new website.                                                                                                                                                                                                                                                                                                                          |
 | Works with any MCP client                      | **✅**                 | ✅          | ❌                 | ❌                | ❌                       | ✅          | ✅        | ✅                | ✅                        | Codex Computer Use is Codex only; the Anthropic demo is Claude only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| Identical tool surface on every platform       | **✅**                 | ⚠️          | n/a                | n/a               | n/a                      | n/a         | n/a       | ⚠️                | ✅                        | 33 tools with byte-identical schemas across the Swift and Rust servers. Cua Driver keeps shared parameters in step with a CI check, with a few tools on one platform only.                                                                                                                                                                                                                                                                                                                                                                |
+| Identical tool surface on every platform       | **✅**                 | ⚠️          | n/a                | n/a               | n/a                      | n/a         | n/a       | ⚠️                | ✅                        | 34 tools with byte-identical schemas across the Swift and Rust servers. Cua Driver keeps shared parameters in step with a CI check, with a few tools on one platform only.                                                                                                                                                                                                                                                                                                                                                                |
 | Prebuilt signed binaries + npm launcher        | **✅**                 | ✅ (script) | ✅                 | n/a               | ❌                       | ❌          | ❌        | ✅ (npm)          | ✅ (npm)                  | macOS universal (Developer ID signed) and Windows x64 on Releases.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | Open source                                    | **✅ Apache-2.0**      | ✅ MIT      | ❌                 | ❌                | ✅                       | ✅ MIT      | ✅ MIT    | ✅ MIT            | ✅ MIT                    |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 
@@ -326,20 +326,31 @@ You decide which apps and websites the agent may touch. Put a `policy.json` in t
 
 This is a guard rail for an agent that follows its instructions, not a sandbox. A coordinate click lands wherever it points, and a whole-display screenshot shows every window.
 
-## Tools (33)
+## Tools (34)
 
 | Area    | Tools                                                                                                                                                                                                      |
 | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | See     | `list_apps`, `get_app_state` (with `query`), `screenshot`, `zoom`, `list_displays`                                                                                                                         |
 | Act     | `click`, `right_click`, `hover`, `drag`, `scroll`, `type_text`, `set_value`, `select_text`, `press_key`, `activate_app`, `wait`, `run_steps`                                                               |
 | Clipboard | `clipboard_read`, `clipboard_write` (plain text)                                                                                                                                                         |
-| Browser | `browser_open_tab`, `browser_list_tabs`, `browser_use_tab`, `browser_release_tab`, `browser_select_tab`, `browser_navigate`, `browser_snapshot`, `browser_read`, `browser_click`, `browser_type`, `browser_request_credentials`, `browser_press_key`, `browser_close_tab`, `browser_close_all_tabs` |
+| Browser | `browser_open_tab`, `browser_list_tabs`, `browser_use_tab`, `browser_release_tab`, `browser_select_tab`, `browser_navigate`, `browser_snapshot`, `browser_read`, `browser_click`, `browser_type`, `browser_fill`, `browser_request_credentials`, `browser_press_key`, `browser_close_tab`, `browser_close_all_tabs` |
 
 Every action tool also takes `return_state`, which returns current state after the action in the same call. `run_steps` runs a list of them in one call and stops at the first that fails.
 
+### Editing a page in a background tab
+
+The agent's tabs stay in the background: the browser tools never select them, raise Chrome's window, or send OS keystrokes. While the agent holds a tab, its DevTools session emulates focus, so Chrome keeps rendering the tab and real input reaches it:
+
+- `browser_click` presses with trusted mouse events, which frameworks that ignore synthetic clicks (Angular Material buttons, for example) respond to. Page events remain only as a fallback, and the reply says which route ran.
+- `browser_press_key` takes any key plus `modifiers` (`cmd`, `ctrl`, `alt`, `shift`): Delete, arrows, Home/End, PageUp/PageDown, F-keys, characters and shortcuts. Editing shortcuts such as select all (`key: "a", modifiers: ["cmd"]`) mean the same with `cmd` or `ctrl` on every platform. Browser shortcuts like close-tab never reach Chrome itself.
+- `browser_fill` replaces a field's whole value by its snapshot index: input, textarea or contenteditable, open shadow roots included. It selects everything, inserts the new text through Chrome's text input (trusted `beforeinput`/`input` events), and says whether the field now holds exactly that text.
+- `browser_snapshot` also lists table and grid rows (`row "Ana | Admin | Active"`), cells and other elements that are only clickable by handler or pointer cursor, so list rows can be found and clicked.
+
+The desktop `press_key` and `type_text` go to whichever Chrome window is in front, which may be the user's, so never use them on an agent tab.
+
 ### Browser readiness and safe re-observation
 
-`browser_click`, `browser_type`, `browser_press_key`, and `browser_navigate` accept
+`browser_click`, `browser_type`, `browser_fill`, `browser_press_key`, and `browser_navigate` accept
 `wait_for_selector` together with `return_state: true`. `browser_snapshot` accepts
 the same wait **without performing an action**:
 
