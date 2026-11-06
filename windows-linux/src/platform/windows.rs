@@ -13,7 +13,8 @@ use uiautomation::UIElement;
 use uiautomation::core::{UICacheRequest, UICondition};
 use uiautomation::inputs::{Mouse, MouseButton};
 use uiautomation::patterns::{
-    UIInvokePattern, UIScrollPattern, UISelectionItemPattern, UITextPattern, UITogglePattern, UIValuePattern,
+    UIInvokePattern, UIScrollItemPattern, UIScrollPattern, UISelectionItemPattern, UITextPattern, UITogglePattern,
+    UIValuePattern,
 };
 use uiautomation::types::{Handle, Point as UIPoint, ScrollAmount, TreeScope, UIProperty};
 use uiautomation::variants::Variant;
@@ -207,20 +208,86 @@ impl WindowsDesktop {
     }
 
     /// Where a coordinate action aims at a resolved target.
-    fn target_point(id: u32, target: &Target) -> Result<(f64, f64)> {
+    fn target_point(&self, id: u32, target: &Target) -> Result<(f64, f64)> {
         let (x, y, window) = match target {
             Target::Ocr { x, y, window } => (*x, *y, *window),
             // A minimized window's controls sit far off screen: a click there
             // would land on whatever is actually at those coordinates.
             Target::Element { minimized: true, .. } => return Err(outline::minimized_error(id)),
             Target::Element { element, window, .. } => {
-                let (x, y) = Self::center(element)?;
-                Self::check_on_screen(id, *window, x, y)?;
+                let (mut x, mut y) = Self::center(element)?;
+                // Out of view, or something else in front: let the control
+                // scroll itself into view once, then measure again.
+                let placed = Self::check_on_screen(id, *window, x, y).and_then(|()| self.check_hit(id, element, x, y));
+                if let Err(error) = placed {
+                    let scrolled = element
+                        .get_pattern::<UIScrollItemPattern>()
+                        .and_then(|pattern| pattern.scroll_into_view())
+                        .is_ok();
+                    if !scrolled {
+                        return Err(error);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    (x, y) = Self::center(element)?;
+                    Self::check_on_screen(id, *window, x, y)?;
+                    self.check_hit(id, element, x, y)?;
+                }
                 (x, y, *window)
             }
         };
         Self::check_uncovered(id, window, x, y)?;
         Ok((x, y))
+    }
+
+    /// What a press at the point would land on, from UI Automation's own hit
+    /// test. An element's bounds say where it would be; inside a scrolled
+    /// page or list that point can belong to a sticky header, a dialog or
+    /// another checkbox, and clicking it there acts on that instead. Accepts
+    /// the element, anything inside it, or a small wrapper around it; refuses
+    /// anything else. A hit test that does not answer changes nothing.
+    fn check_hit(&self, id: u32, element: &UIElement, x: f64, y: f64) -> Result<()> {
+        let Ok(hit) = self.automation.element_from_point(UIPoint::new(x.round() as i32, y.round() as i32)) else {
+            return Ok(());
+        };
+        let Ok(walker) = self.automation.get_raw_view_walker() else {
+            return Ok(());
+        };
+        let same = |a: &UIElement, b: &UIElement| self.automation.compare_elements(a, b).unwrap_or(false);
+        let mut at = Some(hit.clone());
+        for _ in 0..60 {
+            let Some(node) = at else { break };
+            if same(&node, element) {
+                return Ok(());
+            }
+            at = walker.get_parent(&node).ok();
+        }
+        let area = |el: &UIElement| {
+            el.get_bounding_rectangle()
+                .map(|rect| f64::from(rect.get_right() - rect.get_left()) * f64::from(rect.get_bottom() - rect.get_top()))
+                .unwrap_or(f64::MAX)
+        };
+        let mut at = walker.get_parent(element).ok();
+        for _ in 0..8 {
+            let Some(node) = at else { break };
+            if same(&node, &hit) {
+                if area(&hit) <= area(element).max(48.0 * 48.0) * 4.0 {
+                    return Ok(());
+                }
+                break;
+            }
+            at = walker.get_parent(&node).ok();
+        }
+        let kind = hit.get_localized_control_type().unwrap_or_default();
+        let name = hit.get_name().unwrap_or_default();
+        let what = match (kind.is_empty(), name.trim().is_empty()) {
+            (_, false) => format!("{} \"{}\"", if kind.is_empty() { "an element" } else { kind.as_str() }, name.trim().chars().take(50).collect::<String>()),
+            (false, true) => kind,
+            (true, true) => "another element".to_string(),
+        };
+        Err(DesktopError::new(format!(
+            "not clicked: e{id} is covered at ({x:.0}, {y:.0}) by {what}, or is scrolled out of view, so nothing was \
+             pressed. Scroll it into view or close what is in front, then call get_app_state again"
+        )))
     }
 
     /// A control can be listed with bounds far outside its window: an input
@@ -376,7 +443,7 @@ impl WindowsDesktop {
                 check_display_point(x, y)?;
                 Ok((x, y))
             }
-            Point::Element(id) => Self::target_point(id, &self.resolve(id)?),
+            Point::Element(id) => self.target_point(id, &self.resolve(id)?),
         }
     }
 
@@ -2015,7 +2082,7 @@ impl Desktop for WindowsDesktop {
                 {
                     return Ok(done);
                 }
-                Self::target_point(id, &resolved)?
+                self.target_point(id, &resolved)?
             }
         };
         AgentCursor::shared().press(x, y);
@@ -2134,7 +2201,7 @@ impl Desktop for WindowsDesktop {
             match self.resolve(id)? {
                 // OCR text has no focus to take: click it, as a person would.
                 ocr @ Target::Ocr { .. } => {
-                    let (x, y) = Self::target_point(id, &ocr)?;
+                    let (x, y) = self.target_point(id, &ocr)?;
                     self.click(Point::Screen(x, y), 1)?;
                     std::thread::sleep(std::time::Duration::from_millis(60));
                     window = self.input_window.map(|raw| HWND(raw as *mut _));
@@ -2225,7 +2292,7 @@ impl Desktop for WindowsDesktop {
         let label = format!("scrolled {direction:?} by {amount}").to_lowercase();
         if let Some(id) = element {
             let resolved = self.resolve(id)?;
-            let point = Self::target_point(id, &resolved);
+            let point = self.target_point(id, &resolved);
             if let Ok((x, y)) = point {
                 AgentCursor::shared().show(x, y);
             }
