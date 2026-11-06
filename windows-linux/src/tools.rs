@@ -1094,6 +1094,62 @@ fn all_tool_defs() -> Value {
             }
         },
         {
+            "name": "browser_upload_file",
+            "description": "Attach local files to a file input in one of the agent's tabs, by its browser_snapshot index, as if the user had picked them: Chrome sets the input's files and the page gets its usual input and change events. No file picker opens, the tab is not selected or raised, and no keyboard or mouse input is used. Snapshots list file inputs as input[file], including ones a page hides behind a styled upload button; the index of a label for one works too, and any other element is refused. Paths are absolute paths of regular files on the computer running Chrome and this server, which may not be the machine you run on; each is checked before anything is sent. Several paths need an input that takes several files (multiple). This only stages the files in the input: it never submits the form, and the site has not received them until the page shows it has. Submit or press the page's upload button yourself when the user wants that, then check the page. The reply names the files the input now holds. Never click a file input or its upload button to open the picker: the native dialog cannot be driven from here.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session."
+                    },
+                    "tab_id": {
+                        "type": "integer",
+                        "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs"
+                    },
+                    "index": {
+                        "type": "integer",
+                        "description": "Element index of the file input (input[file]), or of a label for one, from the latest browser_snapshot of this tab."
+                    },
+                    "paths": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "minItems": 1,
+                        "maxItems": 50,
+                        "description": "Absolute paths of the files to attach, on the computer running Chrome and this server. Each must exist and be a regular file, not a folder. More than one needs an input with the multiple attribute. Replaces whatever files the input held."
+                    },
+                    "return_state": {
+                        "type": "boolean",
+                        "description": "Append a current snapshot and readiness status after acting. Without wait_for_selector, only a short pause and bounded navigation wait are used; SPA readiness is not guaranteed. Snapshot indices replace earlier ones. A timeout does not mean the action failed: re-observe with browser_snapshot before repeating it."
+                    },
+                    "wait_for_selector": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2000,
+                        "description": "Wait for any visible element matching this CSS selector in the page, including open shadow roots (web components); child frames are not searched, and a timeout says how many were visible. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
+                    },
+                    "wait_timeout_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 10000,
+                        "description": "Bound for wait_for_selector in milliseconds (default 8000, maximum 10000; 0 checks once). Requires wait_for_selector. Timeout preserves action success and returns current state. Use browser_snapshot with the same wait to re-observe without repeating an action."
+                    }
+                },
+                "required": ["tab_id", "index", "paths"]
+            },
+            "annotations": {
+                "title": "Attach files in browser",
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
             "name": "browser_request_credentials",
             "description": "Ask the user to sign in on the page in one of the agent's tabs without the values passing through you. Chrome shows the user a small window naming the site's real origin, with one field per input you list; what they type goes straight into those inputs and is never returned to you. Use it for passwords, verification codes and any secret instead of browser_type, and never ask the user to paste a secret into the conversation. Take the input indices from browser_snapshot (password inputs show as input[password]), then click the page's sign-in button yourself. Waits until the user answers, cancels, or the time runs out.",
             "inputSchema": {
@@ -1281,7 +1337,7 @@ fn all_tool_defs() -> Value {
 mod tests {
     use super::{all_tool_defs, tool_defs};
 
-    /// The macOS server advertises exactly these 34 tools. Drifting apart would
+    /// The macOS server advertises exactly these 35 tools. Drifting apart would
     /// silently give a model different capabilities per platform.
     #[test]
     fn advertises_the_macos_tool_surface() {
@@ -1293,7 +1349,7 @@ mod tests {
             .map(|tool| tool["name"].as_str().expect("tool has a name"))
             .collect();
 
-        assert_eq!(names.len(), 34, "tool count drifted from the macOS server");
+        assert_eq!(names.len(), 35, "tool count drifted from the macOS server");
         for expected in [
             "list_apps",
             "get_app_state",
@@ -1325,6 +1381,7 @@ mod tests {
             "browser_click",
             "browser_type",
             "browser_fill",
+            "browser_upload_file",
             "browser_request_credentials",
             "browser_press_key",
             "browser_close_all_tabs",

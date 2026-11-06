@@ -170,6 +170,33 @@ pages["/perms"] = `<title>Permissions</title>
     document.getElementById('list').style.height = '320px';
   </script>`;
 pages["/user"] = "<title>User window</title><h1>The user's own page</h1><textarea id=\"mine\" aria-label=\"Mine\"></textarea>";
+// #67: file inputs as sites build them: plain ones, one taking several files,
+// one hidden behind a styled label and one hidden behind a button that opens
+// it from script. The page logs every input/change event and what it saw.
+pages["/upload"] = `<title>Upload</title>
+  <form id="form" action="/next" method="post" enctype="multipart/form-data">
+    <label for="one">Resume</label><input id="one" type="file" name="resume">
+    <label for="many">Attachments</label><input id="many" type="file" name="attachments" multiple>
+    <label for="photo" style="cursor:pointer;display:inline-block;padding:8px;border:1px solid #888">Choose photo</label>
+    <input id="photo" type="file" name="photo" style="display:none">
+    <button type="button" id="pick">Add document</button><input id="doc" type="file" name="doc" hidden aria-label="Document">
+    <button id="send">Send</button>
+  </form>
+  <p id="status">nothing yet</p>
+  <script>
+    window.changes = [];
+    window.submitted = false;
+    for (const input of document.querySelectorAll('input[type=file]')) {
+      input.addEventListener('input', (e) => changes.push(['input', input.id, e.isTrusted]));
+      input.addEventListener('change', (e) => {
+        const files = [...input.files];
+        changes.push(['change', input.id, e.isTrusted, files.map((file) => file.name)]);
+        document.getElementById('status').textContent = input.id + ': ' + files.map((file) => file.name + ' (' + file.size + ' bytes)').join(', ');
+      });
+    }
+    document.getElementById('pick').onclick = () => document.getElementById('doc').click();
+    document.getElementById('form').addEventListener('submit', () => { window.submitted = true; });
+  </script>`;
 const site = http.createServer((req, res) => {
   const body = pages[req.url.split("?")[0]];
   res.writeHead(body ? 200 : 404, { "content-type": "text/html; charset=utf-8" });
@@ -432,7 +459,7 @@ let tab;
 check("tools/list advertises browser_read and browser_request_credentials", async () => {
   const reply = await rpc("tools/list");
   const names = reply.result.tools.map((entry) => entry.name);
-  assert.equal(names.length, 34);
+  assert.equal(names.length, 35);
   assert.ok(names.includes("browser_read") && names.includes("browser_request_credentials"));
 });
 
@@ -919,6 +946,144 @@ check("a checkbox behind a banner is not clicked, and nothing else is pressed in
   assert.match(result.text, /Nothing was pressed/);
   assert.deepEqual(await checkedBoxes(), ["p12", "labelled"], "no checkbox changed");
   await ok("browser_close_tab", { tab_id: permsTab });
+});
+
+// ── attaching files (#67): staged in the input, never submitted ──
+
+let uploadTab;
+const atUpload = (url) => url === `${base}/upload`;
+const uploadDir = path.join(root, "uploads");
+fs.mkdirSync(uploadDir, { recursive: true });
+const upload = (name, body) => {
+  const file = path.join(uploadDir, name);
+  fs.writeFileSync(file, body);
+  return file;
+};
+const cv = upload("cv.txt", "curriculum vitae\n");
+const first = upload("first.txt", "one");
+const second = upload("second.csv", "a,b\n1,2\n");
+const pageChanges = () => evaluateIn(atUpload, "changes");
+const uploadTabActive = async () => new RegExp(`^\\* tab_id=${uploadTab}\\b`, "m").test(await ok("browser_list_tabs", { all: true }));
+
+check("snapshot lists file inputs, ones hidden behind a label or a button too", async () => {
+  uploadTab = Number(/tab_id=(\d+)/.exec(await ok("browser_open_tab", { url: `${base}/upload` }))[1]);
+  await sleep(500);
+  const snapshot = await ok("browser_snapshot", { tab_id: uploadTab });
+  for (const name of ["Resume", "Attachments", "Choose photo", "Document"]) {
+    indexOf(snapshot, `input\\[file\\] "${name}"`);
+  }
+  indexOf(snapshot, 'label\\[clickable\\] "Choose photo"');
+});
+
+check("browser_upload_file stages one file; the page's change handler sees it and nothing is submitted", async () => {
+  const wasActive = await uploadTabActive();
+  const snapshot = await ok("browser_snapshot", { tab_id: uploadTab });
+  const text = await ok("browser_upload_file", { tab_id: uploadTab, index: indexOf(snapshot, 'input\\[file\\] "Resume"'), paths: [cv] });
+  assert.match(text, /^attached 1 file to \[\d+\] input\[file\] "Resume" in tab \d+: cv\.txt — the page got its change event\. Nothing was submitted/, text);
+  assert.match(text, /the site has not received them/);
+  assert.equal(await evaluateIn(atUpload, "document.getElementById('status').textContent"), "one: cv.txt (17 bytes)");
+  assert.deepEqual(await pageChanges(), [["input", "one", true], ["change", "one", true, ["cv.txt"]]]);
+  assert.deepEqual(await evaluateIn(atUpload, "[window.submitted, location.pathname]"), [false, "/upload"]);
+  assert.equal(await uploadTabActive(), wasActive, "uploading changed which tab is active");
+});
+
+check("browser_upload_file stages several files on a multiple input and return_state shows them", async () => {
+  const snapshot = await ok("browser_snapshot", { tab_id: uploadTab });
+  const text = await ok("browser_upload_file", {
+    tab_id: uploadTab, index: indexOf(snapshot, 'input\\[file\\] "Attachments"'), paths: [first, second], return_state: true,
+  });
+  assert.match(text, /^attached 2 files to \[\d+\] input\[file\] "Attachments" in tab \d+: first\.txt, second\.csv — the page got its change event/, text);
+  assert.match(text, /page after the action/);
+  assert.match(text, /input\[file\] "Attachments" \(2 files\)/);
+  assert.deepEqual(await evaluateIn(atUpload, "[...document.getElementById('many').files].map((file) => [file.name, file.size])"),
+    [["first.txt", 3], ["second.csv", 8]]);
+});
+
+check("several files for an input without multiple are refused and the input keeps its file", async () => {
+  const snapshot = await ok("browser_snapshot", { tab_id: uploadTab });
+  const before = (await pageChanges()).length;
+  const result = await tool("browser_upload_file", { tab_id: uploadTab, index: indexOf(snapshot, 'input\\[file\\] "Resume"'), paths: [first, second] });
+  assert.equal(result.isError, true, result.text);
+  assert.match(result.text, /not attached: \[\d+\] input\[file\] "Resume" takes one file \(it has no multiple attribute\) and 2 were given/);
+  assert.deepEqual(await evaluateIn(atUpload, "[...document.getElementById('one').files].map((file) => file.name)"), ["cv.txt"]);
+  assert.equal((await pageChanges()).length, before, "the page got events for a refused upload");
+});
+
+check("a label for a hidden file input, and the hidden input itself, take files", async () => {
+  const snapshot = await ok("browser_snapshot", { tab_id: uploadTab });
+  const viaLabel = await ok("browser_upload_file", { tab_id: uploadTab, index: indexOf(snapshot, 'label\\[clickable\\] "Choose photo"'), paths: [first] });
+  assert.match(viaLabel, /^attached 1 file to the file input of \[\d+\] label "Choose photo" in tab \d+: first\.txt/, viaLabel);
+  const direct = await ok("browser_upload_file", { tab_id: uploadTab, index: indexOf(snapshot, 'input\\[file\\] "Document"'), paths: [second] });
+  assert.match(direct, /^attached 1 file to \[\d+\] input\[file\] "Document" in tab \d+: second\.csv/, direct);
+  const changes = await pageChanges();
+  assert.deepEqual(changes.slice(-4), [
+    ["input", "photo", true], ["change", "photo", true, ["first.txt"]],
+    ["input", "doc", true], ["change", "doc", true, ["second.csv"]],
+  ]);
+});
+
+check("a missing file is refused before anything reaches the page", async () => {
+  const snapshot = await ok("browser_snapshot", { tab_id: uploadTab });
+  const before = (await pageChanges()).length;
+  const missing = path.join(uploadDir, "not-there.pdf");
+  const result = await tool("browser_upload_file", { tab_id: uploadTab, index: indexOf(snapshot, 'input\\[file\\] "Attachments"'), paths: [first, missing] });
+  assert.equal(result.isError, true, result.text);
+  assert.match(result.text, /not attached: .*not-there\.pdf does not exist on this computer/);
+  assert.match(result.text, /nothing was sent to the page/);
+  const folder = await tool("browser_upload_file", { tab_id: uploadTab, index: indexOf(snapshot, 'input\\[file\\] "Resume"'), paths: [uploadDir] });
+  assert.match(folder.text, /is a folder, not a file/);
+  assert.equal((await pageChanges()).length, before);
+  assert.deepEqual(await evaluateIn(atUpload, "document.getElementById('many').files.length"), 2);
+});
+
+check("an element that is not a file input is refused, the button that opens one included", async () => {
+  const snapshot = await ok("browser_snapshot", { tab_id: uploadTab });
+  const result = await tool("browser_upload_file", { tab_id: uploadTab, index: indexOf(snapshot, 'button "Add document"'), paths: [cv] });
+  assert.equal(result.isError, true, result.text);
+  assert.match(result.text, /not attached: element \d+ is button, not a file input or a label for one/);
+  const send = await tool("browser_upload_file", { tab_id: uploadTab, index: indexOf(snapshot, 'button "Send"'), paths: [cv] });
+  assert.match(send.text, /is button, not a file input/);
+  assert.deepEqual(await evaluateIn(atUpload, "[window.submitted, location.pathname]"), [false, "/upload"]);
+});
+
+check("a stale index is refused, not sent to whatever took its place", async () => {
+  const snapshot = await ok("browser_snapshot", { tab_id: uploadTab });
+  const index = indexOf(snapshot, 'input\\[file\\] "Resume"');
+  // The page re-renders the input, as frameworks do: the old index is gone.
+  // (A clone would carry the old input's files, so build a new one.)
+  await evaluateIn(atUpload, `(() => {
+    const fresh = Object.assign(document.createElement('input'), { type: 'file', id: 'one', name: 'resume' });
+    document.getElementById('one').replaceWith(fresh);
+    return true;
+  })()`);
+  const result = await tool("browser_upload_file", { tab_id: uploadTab, index, paths: [cv] });
+  assert.equal(result.isError, true, result.text);
+  assert.match(result.text, new RegExp(`element ${index} is no longer on the page — call browser_snapshot again`));
+  assert.equal(await evaluateIn(atUpload, "document.getElementById('one').files.length"), 0);
+});
+
+check("another session cannot attach files in this session's tab", async () => {
+  const snapshot = await ok("browser_snapshot", { tab_id: uploadTab });
+  const result = await tool("browser_upload_file", {
+    session_id: "e2e-other", tab_id: uploadTab, index: indexOf(snapshot, 'input\\[file\\] "Resume"'), paths: [cv],
+  });
+  assert.equal(result.isError, true, result.text);
+  assert.match(result.text, /not one of this agent's tabs/);
+  assert.equal(await evaluateIn(atUpload, "document.getElementById('one').files.length"), 0);
+});
+
+check("a blocked site gets no files", async () => {
+  const snapshot = await ok("browser_snapshot", { tab_id: uploadTab });
+  fs.writeFileSync(policyPath, JSON.stringify({ sites: { "127.0.0.1": "block" } }));
+  try {
+    const result = await tool("browser_upload_file", { tab_id: uploadTab, index: indexOf(snapshot, 'input\\[file\\] "Resume"'), paths: [cv] });
+    assert.equal(result.isError, true, result.text);
+    assert.match(result.text, /blocked by the user's Computer Use policy/);
+  } finally {
+    fs.rmSync(policyPath, { force: true });
+  }
+  assert.equal(await evaluateIn(atUpload, "document.getElementById('one').files.length"), 0);
+  await ok("browser_close_tab", { tab_id: uploadTab });
 });
 
 // Headless Chrome reports every tab hidden, the front one too, so only a
