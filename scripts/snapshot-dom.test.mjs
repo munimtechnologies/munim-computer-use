@@ -489,6 +489,8 @@ try {
       chrome: { tabs: { get: async () => tab } },
       requireClientId: () => "test",
       checkTab: async () => {},
+      // No JavaScript dialog is open in this page (the extension tracks them per tab).
+      dialogs: new Map(),
       send: async (_tabId, _method, params) => {
         try { return { result: { value: await evaluate(params.expression) } }; }
         catch (error) { return { exceptionDetails: { text: error.message } }; }

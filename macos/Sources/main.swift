@@ -3428,9 +3428,102 @@ func framesNote(_ frames: Int) -> String {
     "note: \(framesPhrase(frames)) on the page \(frames == 1 ? "was" : "were") not searched — controls inside a frame are not listed here; take a screenshot to see them"
 }
 
+/// ` — note` for a reply that carries one (a dialog the action made the page
+/// open, for instance), or nothing.
+func noteSuffix(_ payload: [String: Any]) -> String {
+    (payload["note"] as? String).map { " — \($0)" } ?? ""
+}
+
+/// A JavaScript dialog as the extension reports it: type, id, message, and a
+/// prompt's default text. Worded as the Windows and Linux server words it.
+func dialogPhrase(_ dialog: [String: Any]) -> String {
+    var phrase = "JavaScript \(dialog["type"] as? String ?? "?") dialog \(dialog["id"] as? String ?? "?"): \"\(dialog["message"] as? String ?? "")\""
+    if let text = dialog["defaultPrompt"] as? String, !text.isEmpty { phrase += " (default text \"\(text)\")" }
+    return phrase
+}
+
+/// browser_handle_dialog: what was answered, and whether the page opened
+/// another dialog straight after.
+func describeHandledDialog(_ payload: [String: Any], tabId: Int) -> String {
+    let tab = payload["tabId"] as? Int ?? tabId
+    let verb = payload["action"] as? String == "accept" ? "accepted" : "dismissed"
+    var line = "\(verb) the dialog in tab \(tab) — \((payload["dialog"] as? [String: Any]).map(dialogPhrase) ?? "")"
+    if let chars = payload["promptChars"] as? Int {
+        line += ", entering \(chars) character\(chars == 1 ? "" : "s")"
+    } else if payload["promptDefault"] as? Bool == true {
+        line += ", keeping its default text"
+    }
+    if let next = payload["next"] as? [String: Any] {
+        line += ". The page opened another at once: \(dialogPhrase(next)) — it is paused until browser_handle_dialog answers that one too (dialog_id=\(next["id"] as? String ?? "?"))"
+    } else {
+        line += ". The page runs again; browser_snapshot to see it"
+    }
+    return line
+}
+
+/// browser_page_errors: the exceptions and console errors the page has logged
+/// since it loaded (as far as Chrome kept them), and the failed requests since
+/// the agent attached, oldest first. Worded as the Windows and Linux server words it.
+func describePageErrors(_ payload: [String: Any], tabId: Int) -> String {
+    let tab = payload["tabId"] as? Int ?? tabId
+    let fresh = payload["fresh"] as? Bool == true
+    let requests = fresh
+        ? "failed requests since the agent began watching it just now"
+        : "failed requests since the agent attached \(payload["since"] as? String ?? "?") ago"
+    // Why exceptions and console errors could not be read, when they could not.
+    let note = payload["note"] as? String
+    let entries = payload["entries"] as? [[String: Any]] ?? []
+    if entries.isEmpty {
+        if let note { return "no \(requests) in tab \(tab)\nnote: \(note)" }
+        var line = "no problems in tab \(tab): no uncaught exceptions or console errors logged since the page loaded, and no \(requests)"
+        if fresh { line += ". A request that failed before then is not seen: repeat what went wrong, then call browser_page_errors again" }
+        return line
+    }
+    var header = "\(entries.count) problem\(entries.count == 1 ? "" : "s") in tab \(tab): exceptions and console errors the page has logged since it loaded (Chrome keeps a limited number), and \(requests)"
+    let dropped = payload["dropped"] as? Int ?? 0
+    if dropped > 0 {
+        header += " (\(dropped) older one\(dropped == 1 ? "" : "s") dropped; the latest \(payload["limit"] as? Int ?? 50) are kept)"
+    }
+    header += ". URLs are shown without query strings or fragments:"
+    var lines = [header]
+    for entry in entries {
+        var line = "  \(entry["kind"] as? String ?? "") \(entry["ago"] as? String ?? "") ago"
+        if entry["earlier"] as? Bool == true { line += " (before the agent attached)" }
+        line += ": \(entry["text"] as? String ?? "")"
+        if let url = entry["url"] as? String, !url.isEmpty { line += "  [\(url)]" }
+        if let repeats = entry["repeats"] as? Int { line += " (repeated \(repeats) times)" }
+        lines.append(line)
+    }
+    if let note { lines.append("note: \(note)") }
+    return lines.joined(separator: "\n")
+}
+
+func toolBrowserHandleDialog(_ args: [String: Any]) -> String {
+    guard let tabId = args["tab_id"] as? Int else { return "error: missing required argument 'tab_id'" }
+    guard let action = args["action"] as? String else { return "error: missing required argument 'action' (accept or dismiss)" }
+    var params: [String: Any] = ["tabId": tabId, "action": action]
+    // Passed through as given: the extension checks them, the same on every platform.
+    if let text = args["prompt_text"] { params["promptText"] = text }
+    if let id = args["dialog_id"] { params["dialogId"] = id }
+    return bridgeText(browserSessionCall("handle_dialog", params, args: args)) { payload in
+        describeHandledDialog(payload, tabId: tabId)
+    }
+}
+
+func toolBrowserPageErrors(_ args: [String: Any]) -> String {
+    guard let tabId = args["tab_id"] as? Int else { return "error: missing required argument 'tab_id'" }
+    return bridgeText(browserSessionCall("page_errors", ["tabId": tabId], args: args)) { payload in
+        describePageErrors(payload, tabId: tabId)
+    }
+}
+
 func describeSnapshot(_ payload: [String: Any]) -> String {
     let elements = payload["elements"] as? [[String: Any]] ?? []
     var lines = ["\(payload["title"] as? String ?? "?")  [\(payload["url"] as? String ?? "")]"]
+    // A page paused behind a JavaScript dialog: the dialog comes first.
+    if let dialog = payload["jsDialog"] as? [String: Any] {
+        lines.append("dialog open: \(dialogPhrase(dialog)) — the page is paused until browser_handle_dialog answers it (dialog_id=\(dialog["id"] as? String ?? "?"))")
+    }
     if let total = payload["total"] as? Int {
         let offset = payload["offset"] as? Int ?? 0
         let limit = payload["limit"] as? Int ?? 250
@@ -3588,7 +3681,7 @@ func toolBrowserType(_ args: [String: Any]) -> String {
     guard let tabId = args["tab_id"] as? Int else { return "error: missing required argument 'tab_id'" }
     guard let text = args["text"] as? String else { return "error: missing required argument 'text'" }
     return bridgeText(browserSessionCall("type", withReturnState(["tabId": tabId, "text": text], args), args: args)) { payload in
-        withPageAfter("typed \(text.count) characters into tab \(tabId)", payload)
+        withPageAfter("typed \(text.count) characters into tab \(tabId)\(noteSuffix(payload))", payload)
     }
 }
 
@@ -3737,7 +3830,7 @@ func toolBrowserNavigate(_ args: [String: Any]) -> String {
     guard let tabId = args["tab_id"] as? Int else { return "error: missing required argument 'tab_id'" }
     guard let url = args["url"] as? String else { return "error: missing required argument 'url'" }
     return bridgeText(browserSessionCall("navigate", withReturnState(["tabId": tabId, "url": url], args), args: args)) { payload in
-        withPageAfter("navigated tab \(tabId) to \(url)", payload)
+        withPageAfter("navigated tab \(tabId) to \(url)\(noteSuffix(payload))", payload)
     }
 }
 
@@ -4633,7 +4726,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "browser_snapshot",
-        "description": "List the interactive elements (links, buttons, inputs, tabs, checkboxes, table and grid rows listed as row with their cell text, and other clickable elements) on the page in one of the agent's tabs, with the index each one has for browser_click, plus the page title and URL. Inputs show their type, such as input[password], and text the page lets you edit in place shows as [editable], such as span[editable] (click it, or browser_fill it); checkboxes, radios and switches are named by their label and show their state, such as (checked) or (unchecked, disabled). Works on a background tab, so the user can be looking at something else. Use it before every browser_click, because indices change when the page changes; use browser_read for the page's text. Read-only. Automatically scopes to the topmost visible dialog when one is open, naming it on a dialog: line, excluding hidden/inert controls but retaining reachable offscreen controls. Results report scope, total and truncation. Continue with offset and limit on the same tab/session; indices stay global across pages of an unchanged UI. Snapshot again after UI changes.",
+        "description": "List the interactive elements (links, buttons, inputs, tabs, checkboxes, table and grid rows listed as row with their cell text, and other clickable elements) on the page in one of the agent's tabs, with the index each one has for browser_click, plus the page title and URL. Inputs show their type, such as input[password], and text the page lets you edit in place shows as [editable], such as span[editable] (click it, or browser_fill it); checkboxes, radios and switches are named by their label and show their state, such as (checked) or (unchecked, disabled). Works on a background tab, so the user can be looking at something else. Use it before every browser_click, because indices change when the page changes; use browser_read for the page's text. Read-only. Automatically scopes to the topmost visible dialog when one is open, naming it on a dialog: line, excluding hidden/inert controls but retaining reachable offscreen controls. Results report scope, total and truncation. Continue with offset and limit on the same tab/session; indices stay global across pages of an unchanged UI. Snapshot again after UI changes. While the page has a JavaScript dialog open (alert, confirm, prompt), the snapshot shows the dialog's type, message and dialog_id instead, for browser_handle_dialog.",
         "inputSchema": [
             "type": "object",
             "properties": [
@@ -4719,6 +4812,33 @@ let toolDefs: [[String: Any]] = [
         ],
         "annotations": [
             "title": "Read page text",
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": true,
+        ],
+    ],
+    [
+        "name": "browser_page_errors",
+        "description": "List the problems the page in one of the agent's tabs has reported: uncaught JavaScript exceptions and console errors the page has logged since it loaded (Chrome keeps a limited number), and requests that failed since the agent attached to the tab (network errors and HTTP status 400 or above), oldest first, with how long ago each happened. Use it when a page is empty, broken or ignores an action, before navigating again or assuming a sign-in problem. The reply says when watching for failed requests began; ones Chrome still held from before are marked as earlier. Exceptions and console errors are read from what Chrome keeps for the page during this call only, so the page is not watched for them in between. The latest 50 are listed. URLs are shown without query strings, fragments or credentials, and request headers, cookies and bodies are never read. Read-only: it does not reload, navigate or show the tab.",
+        "inputSchema": [
+            "type": "object",
+            "properties": [
+                "session_id": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session.",
+                ],
+                "tab_id": [
+                    "type": "integer",
+                    "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs",
+                ],
+            ],
+            "required": ["tab_id"],
+        ],
+        "annotations": [
+            "title": "List page errors",
             "readOnlyHint": true,
             "destructiveHint": false,
             "idempotentHint": true,
@@ -5047,6 +5167,46 @@ let toolDefs: [[String: Any]] = [
         ],
     ],
     [
+        "name": "browser_handle_dialog",
+        "description": "Answer the JavaScript dialog (alert, confirm, prompt or leave-page) open in one of the agent's tabs. While one is open the page is paused: browser_snapshot shows the dialog's type, message and dialog_id instead of the page, and other browser commands on the tab say a dialog is open. accept presses OK and dismiss presses Cancel. prompt_text is entered into a prompt before accepting it; without it, a prompt is accepted with its default text. Pass the dialog_id from the snapshot, so a dialog that replaced the one you read is refused instead of answered. Works on a background tab without showing it or using the keyboard. A dialog that opened before the agent attached to the tab cannot be seen or answered; the user answers that one in Chrome. Accepting a confirm can submit, delete or leave a page with unsaved changes, so read the message, and ask the user before confirming anything irreversible.",
+        "inputSchema": [
+            "type": "object",
+            "properties": [
+                "session_id": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session.",
+                ],
+                "tab_id": [
+                    "type": "integer",
+                    "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs",
+                ],
+                "action": [
+                    "type": "string",
+                    "enum": ["accept", "dismiss"],
+                    "description": "accept (OK) or dismiss (Cancel)",
+                ],
+                "prompt_text": [
+                    "type": "string",
+                    "description": "Text to enter into a prompt dialog before accepting it. Only with action=accept on a prompt",
+                ],
+                "dialog_id": [
+                    "type": "string",
+                    "description": "dialog_id of the dialog being answered, from browser_snapshot (such as d3). A different dialog open now is refused instead of answered",
+                ],
+            ],
+            "required": ["tab_id", "action"],
+        ],
+        "annotations": [
+            "title": "Answer JavaScript dialog",
+            "readOnlyHint": false,
+            "destructiveHint": true,
+            "idempotentHint": false,
+            "openWorldHint": true,
+        ],
+    ],
+    [
         "name": "browser_close_all_tabs",
         "description": "Close every tab the agent opened, including tabs its clicks opened, and remove its tab group. Tabs taken over with browser_use_tab are released back to the user, not closed. Call this when finished with the browser so no empty group is left in the user's tab strip. The MCP process also runs this automatically when the Computer Use session ends. Unsaved state in the agent's tabs is lost.",
         "inputSchema": [
@@ -5147,7 +5307,7 @@ func negotiatedProtocolVersion(_ params: [String: Any]) -> String {
 }
 
 /// Returned in the `initialize` result; identical in the Rust server.
-let serverInstructions = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. In a Chrome tab the agent works in, use browser_click, browser_type, browser_fill (to replace a field's value) and browser_press_key (keys and shortcuts such as cmd+a); they act on that tab in the background without bringing Chrome forward. Never use the desktop click, press_key or type_text on a Chrome tab: they go to whichever Chrome window is in front, which can be the user's. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Pass return_state on an action to get current state back in the same call. Use run_steps for several actions you already know, like click, type, press return: one call, stopping at the first that fails. For delayed browser UI, use wait_for_selector with return_state and inspect readiness; a loaded tab is not SPA readiness. A timeout does not undo the action: re-observe with browser_snapshot and the same wait before repeating a non-idempotent action. Use browser_read to read a page's text. Never ask for, or type, a password or code yourself: browser_request_credentials lets the user enter it without you seeing it. The user's Computer Use policy can block apps and sites or require their approval; when a call says so, do not work around it. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf."
+let serverInstructions = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. In a Chrome tab the agent works in, use browser_click, browser_type, browser_fill (to replace a field's value) and browser_press_key (keys and shortcuts such as cmd+a); they act on that tab in the background without bringing Chrome forward. Never use the desktop click, press_key or type_text on a Chrome tab: they go to whichever Chrome window is in front, which can be the user's. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Pass return_state on an action to get current state back in the same call. Use run_steps for several actions you already know, like click, type, press return: one call, stopping at the first that fails. For delayed browser UI, use wait_for_selector with return_state and inspect readiness; a loaded tab is not SPA readiness. A timeout does not undo the action: re-observe with browser_snapshot and the same wait before repeating a non-idempotent action. Use browser_read to read a page's text. When a page opens a JavaScript alert, confirm or prompt, browser_snapshot shows it and browser_handle_dialog answers it; browser_page_errors lists a page's exceptions, console errors and failed requests. Never ask for, or type, a password or code yourself: browser_request_credentials lets the user enter it without you seeing it. The user's Computer Use policy can block apps and sites or require their approval; when a call says so, do not work around it. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf."
 
 // MARK: - Clipboard
 
@@ -5253,6 +5413,8 @@ func dispatchTool(_ name: String, _ args: [String: Any]) -> String {
     case "browser_close_tab": return toolBrowserCloseTab(args)
     case "browser_snapshot": return toolBrowserSnapshot(args)
     case "browser_read": return toolBrowserRead(args)
+    case "browser_page_errors": return toolBrowserPageErrors(args)
+    case "browser_handle_dialog": return toolBrowserHandleDialog(args)
     case "browser_click": return toolBrowserClick(args)
     case "browser_type": return toolBrowserType(args)
     case "browser_fill": return toolBrowserFill(args)

@@ -1044,7 +1044,7 @@ fn normalise(_command: &str, args: &Value) -> Value {
     if let Some(session) = args.get("session_id").filter(|v| !v.is_null()) {
         map.insert("sessionId".into(), session.clone());
     }
-    for key in ["url", "text", "key", "modifiers", "index", "x", "y", "all", "query", "offset", "limit", "fields", "reason", "paths"] {
+    for key in ["url", "text", "key", "modifiers", "index", "x", "y", "all", "query", "offset", "limit", "fields", "reason", "paths", "action"] {
         if let Some(value) = args.get(key) {
             map.insert(key.into(), value.clone());
         }
@@ -1056,6 +1056,8 @@ fn normalise(_command: &str, args: &Value) -> Value {
         ("wait_for_selector", "waitForSelector"),
         ("wait_timeout_ms", "waitTimeoutMs"),
         ("bring_to_front", "bringToFront"),
+        ("prompt_text", "promptText"),
+        ("dialog_id", "dialogId"),
     ] {
         if let Some(value) = args.get(from) {
             map.insert(to.into(), value.clone());
@@ -1146,6 +1148,8 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
         }
         "snapshot" => format!("{}{}", describe_readiness(result), describe_snapshot(result)),
         "read" => describe_read(result),
+        "page_errors" => describe_page_errors(result, args),
+        "handle_dialog" => describe_handled_dialog(result, args),
         "request_credentials" => describe_credentials(result, args),
         "close_all_tabs" => {
             let closed = result.get("closed").and_then(Value::as_i64).unwrap_or(0);
@@ -1188,8 +1192,9 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
             let line = match other {
                 "click" => format!("clicked in tab {tab}{}", describe_click_route(result)),
                 "type" => format!(
-                    "typed {} characters into tab {tab}",
-                    args.get("text").and_then(Value::as_str).unwrap_or("").chars().count()
+                    "typed {} characters into tab {tab}{}",
+                    args.get("text").and_then(Value::as_str).unwrap_or("").chars().count(),
+                    note_suffix(result)
                 ),
                 "fill" => describe_fill(tab, result, args),
                 "upload_file" => describe_upload(tab, result, args),
@@ -1222,8 +1227,9 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
                     line
                 }
                 "navigate" => format!(
-                    "navigated tab {tab} to {}",
-                    args.get("url").and_then(Value::as_str).unwrap_or("")
+                    "navigated tab {tab} to {}{}",
+                    args.get("url").and_then(Value::as_str).unwrap_or(""),
+                    note_suffix(result)
                 ),
                 "select_tab" => describe_select(tab, result),
                 // An adopted tab comes back as a release, so say what happened.
@@ -1354,7 +1360,8 @@ fn describe_upload(tab: i64, result: &Value, args: &Value) -> String {
 /// extensions older than 0.9.2, report neither.
 fn describe_click_route(result: &Value) -> String {
     let Some(target) = result.get("target").and_then(Value::as_str) else {
-        return String::new();
+        // A coordinate click still says when it made the page open a dialog.
+        return note_suffix(result);
     };
     let mut line = match result.get("route").and_then(Value::as_str) {
         Some("input") => format!(" — {target}, with real mouse input"),
@@ -1540,12 +1547,144 @@ fn describe_tabs(result: &Value) -> String {
     lines.join("\n")
 }
 
+/// ` — note` for a reply that carries one (a dialog the action made the page
+/// open, for instance), or nothing.
+fn note_suffix(result: &Value) -> String {
+    result
+        .get("note")
+        .and_then(Value::as_str)
+        .map(|note| format!(" — {note}"))
+        .unwrap_or_default()
+}
+
+/// A JavaScript dialog as the extension reports it: type, id, message, and a
+/// prompt's default text. Worded as the macOS server words it.
+fn dialog_phrase(dialog: &Value) -> String {
+    let text = |key: &str| dialog.get(key).and_then(Value::as_str).unwrap_or("");
+    let mut phrase = format!(
+        "JavaScript {} dialog {}: \"{}\"",
+        dialog.get("type").and_then(Value::as_str).unwrap_or("?"),
+        dialog.get("id").and_then(Value::as_str).unwrap_or("?"),
+        text("message")
+    );
+    if !text("defaultPrompt").is_empty() {
+        phrase.push_str(&format!(" (default text \"{}\")", text("defaultPrompt")));
+    }
+    phrase
+}
+
+/// browser_handle_dialog: what was answered, and whether the page opened
+/// another dialog straight after.
+fn describe_handled_dialog(result: &Value, args: &Value) -> String {
+    let tab = result
+        .get("tabId")
+        .and_then(Value::as_i64)
+        .or_else(|| args.get("tab_id").and_then(Value::as_i64))
+        .unwrap_or(-1);
+    let verb = if result.get("action").and_then(Value::as_str) == Some("accept") { "accepted" } else { "dismissed" };
+    let mut line = format!(
+        "{verb} the dialog in tab {tab} — {}",
+        result.get("dialog").map(dialog_phrase).unwrap_or_default()
+    );
+    if let Some(chars) = result.get("promptChars").and_then(Value::as_u64) {
+        line.push_str(&format!(", entering {chars} character{}", if chars == 1 { "" } else { "s" }));
+    } else if result.get("promptDefault").and_then(Value::as_bool) == Some(true) {
+        line.push_str(", keeping its default text");
+    }
+    match result.get("next") {
+        Some(next) => line.push_str(&format!(
+            ". The page opened another at once: {} — it is paused until browser_handle_dialog answers that one too (dialog_id={})",
+            dialog_phrase(next),
+            next.get("id").and_then(Value::as_str).unwrap_or("?")
+        )),
+        None => line.push_str(". The page runs again; browser_snapshot to see it"),
+    }
+    line
+}
+
+/// browser_page_errors: the exceptions and console errors the page has logged
+/// since it loaded (as far as Chrome kept them), and the failed requests since
+/// the agent attached, oldest first. Worded as the macOS server words it.
+fn describe_page_errors(result: &Value, args: &Value) -> String {
+    let tab = result
+        .get("tabId")
+        .and_then(Value::as_i64)
+        .or_else(|| args.get("tab_id").and_then(Value::as_i64))
+        .unwrap_or(-1);
+    let fresh = result.get("fresh").and_then(Value::as_bool) == Some(true);
+    let requests = if fresh {
+        "failed requests since the agent began watching it just now".to_string()
+    } else {
+        format!(
+            "failed requests since the agent attached {} ago",
+            result.get("since").and_then(Value::as_str).unwrap_or("?")
+        )
+    };
+    // Why exceptions and console errors could not be read, when they could not.
+    let note = result.get("note").and_then(Value::as_str);
+    let entries = result.get("entries").and_then(Value::as_array).cloned().unwrap_or_default();
+    if entries.is_empty() {
+        if let Some(note) = note {
+            return format!("no {requests} in tab {tab}\nnote: {note}");
+        }
+        let mut line = format!(
+            "no problems in tab {tab}: no uncaught exceptions or console errors logged since the page loaded, and no {requests}"
+        );
+        if fresh {
+            line.push_str(". A request that failed before then is not seen: repeat what went wrong, then call browser_page_errors again");
+        }
+        return line;
+    }
+    let mut header = format!(
+        "{} problem{} in tab {tab}: exceptions and console errors the page has logged since it loaded (Chrome keeps a limited number), and {requests}",
+        entries.len(),
+        if entries.len() == 1 { "" } else { "s" }
+    );
+    let dropped = result.get("dropped").and_then(Value::as_u64).unwrap_or(0);
+    if dropped > 0 {
+        header.push_str(&format!(
+            " ({dropped} older one{} dropped; the latest {} are kept)",
+            if dropped == 1 { "" } else { "s" },
+            result.get("limit").and_then(Value::as_u64).unwrap_or(50)
+        ));
+    }
+    header.push_str(". URLs are shown without query strings or fragments:");
+    let mut lines = vec![header];
+    for entry in entries {
+        let text = |key: &str| entry.get(key).and_then(Value::as_str).unwrap_or("");
+        let mut line = format!("  {} {} ago", text("kind"), text("ago"));
+        if entry.get("earlier").and_then(Value::as_bool) == Some(true) {
+            line.push_str(" (before the agent attached)");
+        }
+        line.push_str(&format!(": {}", text("text")));
+        if !text("url").is_empty() {
+            line.push_str(&format!("  [{}]", text("url")));
+        }
+        if let Some(repeats) = entry.get("repeats").and_then(Value::as_u64) {
+            line.push_str(&format!(" (repeated {repeats} times)"));
+        }
+        lines.push(line);
+    }
+    if let Some(note) = note {
+        lines.push(format!("note: {note}"));
+    }
+    lines.join("\n")
+}
+
 fn describe_snapshot(result: &Value) -> String {
     let mut lines = vec![format!(
         "{}  [{}]",
         result.get("title").and_then(Value::as_str).unwrap_or("?"),
         result.get("url").and_then(Value::as_str).unwrap_or("")
     )];
+    // A page paused behind a JavaScript dialog: the dialog comes first.
+    if let Some(dialog) = result.get("jsDialog") {
+        lines.push(format!(
+            "dialog open: {} — the page is paused until browser_handle_dialog answers it (dialog_id={})",
+            dialog_phrase(dialog),
+            dialog.get("id").and_then(Value::as_str).unwrap_or("?")
+        ));
+    }
     if let Some(total) = result.get("total").and_then(Value::as_u64) {
         let offset = result.get("offset").and_then(Value::as_u64).unwrap_or(0);
         let limit = result.get("limit").and_then(Value::as_u64).unwrap_or(250);
@@ -2237,5 +2376,131 @@ mod tests {
             &args,
         );
         assert!(with_state.contains("page after the action"), "{with_state}");
+    }
+
+    #[test]
+    fn dialog_arguments_reach_the_extension_under_its_names() {
+        let params = normalise(
+            "handle_dialog",
+            &json!({ "tab_id": 4, "action": "accept", "prompt_text": "Hardware", "dialog_id": "d3", "session_id": "t1" }),
+        );
+        assert_eq!(params, json!({ "tabId": 4, "action": "accept", "promptText": "Hardware", "dialogId": "d3", "sessionId": "t1" }));
+    }
+
+    #[test]
+    fn a_snapshot_of_a_paused_page_names_the_dialog_first() {
+        let dialog = json!({ "id": "d3", "type": "prompt", "message": "Name the list", "defaultPrompt": "Groceries" });
+        let snapshot = json!({ "title": "Lists", "url": "https://l.example/", "elements": [], "total": 0, "jsDialog": dialog,
+            "empty": "nothing is listed while the page waits on its JavaScript prompt dialog (d3); answer it with browser_handle_dialog" });
+        let text = describe("snapshot", &snapshot, &json!({ "tab_id": 2 }));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "Lists  [https://l.example/]");
+        assert_eq!(
+            lines[1],
+            "dialog open: JavaScript prompt dialog d3: \"Name the list\" (default text \"Groceries\") — the page is paused until browser_handle_dialog answers it (dialog_id=d3)"
+        );
+        assert!(text.contains("note: nothing is listed while the page waits"), "{text}");
+        // The page after an action shows it the same way.
+        let after = describe(
+            "click",
+            &json!({ "snapshot": snapshot, "readiness": { "status": "not_requested", "condition": "document_load", "elapsedMs": 1 } }),
+            &json!({ "tab_id": 2 }),
+        );
+        assert!(after.contains("dialog open: JavaScript prompt dialog d3"), "{after}");
+    }
+
+    #[test]
+    fn an_action_that_opened_a_dialog_says_so() {
+        let note = "the page opened a JavaScript alert dialog d4: \"Saved\" and is paused until it is answered: call browser_handle_dialog with dialog_id=d4 to accept or dismiss it";
+        for command in ["click", "press", "type", "navigate"] {
+            let text = describe(
+                command,
+                &json!({ "jsDialog": { "id": "d4", "type": "alert", "message": "Saved" }, "note": note, "pressed": "Enter" }),
+                &json!({ "tab_id": 6, "text": "hi", "url": "https://a.test", "key": "Enter" }),
+            );
+            assert!(text.ends_with(&format!(" — {note}")), "{command}: {text}");
+        }
+    }
+
+    #[test]
+    fn an_answered_dialog_says_what_was_answered_and_what_came_next() {
+        let accepted = describe(
+            "handle_dialog",
+            &json!({ "tabId": 5, "action": "accept", "dialog": { "id": "d3", "type": "prompt", "message": "Name the list", "defaultPrompt": "" }, "promptChars": 8 }),
+            &json!({}),
+        );
+        assert_eq!(
+            accepted,
+            "accepted the dialog in tab 5 — JavaScript prompt dialog d3: \"Name the list\", entering 8 characters. The page runs again; browser_snapshot to see it"
+        );
+        let chained = describe(
+            "handle_dialog",
+            &json!({ "tabId": 5, "action": "dismiss", "dialog": { "id": "d5", "type": "confirm", "message": "Delete?" }, "next": { "id": "d6", "type": "alert", "message": "Kept" } }),
+            &json!({}),
+        );
+        assert_eq!(
+            chained,
+            "dismissed the dialog in tab 5 — JavaScript confirm dialog d5: \"Delete?\". The page opened another at once: JavaScript alert dialog d6: \"Kept\" — it is paused until browser_handle_dialog answers that one too (dialog_id=d6)"
+        );
+        let kept = describe(
+            "handle_dialog",
+            &json!({ "tabId": 5, "action": "accept", "dialog": { "id": "d7", "type": "prompt", "message": "Name", "defaultPrompt": "List" }, "promptDefault": true }),
+            &json!({}),
+        );
+        assert!(kept.contains("(default text \"List\"), keeping its default text."), "{kept}");
+    }
+
+    #[test]
+    fn page_errors_list_each_problem_and_when_watching_began() {
+        let text = describe(
+            "page_errors",
+            &json!({ "tabId": 8, "since": "4m", "limit": 50, "dropped": 2, "entries": [
+                { "kind": "request", "ago": "5m", "text": "HTTP 404 Not Found", "url": "https://s.example/old.png", "earlier": true },
+                { "kind": "console.error", "ago": "5m", "text": "boot failed" },
+                { "kind": "exception", "ago": "12s", "text": "Uncaught TypeError: x is null", "url": "https://s.example/app.js:12:5" },
+                { "kind": "request", "ago": "11s", "text": "HTTP 500 Internal Server Error", "url": "https://api.example/orders", "repeats": 3 }
+            ] }),
+            &json!({ "tab_id": 8 }),
+        );
+        assert_eq!(
+            text,
+            [
+                "4 problems in tab 8: exceptions and console errors the page has logged since it loaded (Chrome keeps a limited number), and failed requests since the agent attached 4m ago (2 older ones dropped; the latest 50 are kept). URLs are shown without query strings or fragments:",
+                "  request 5m ago (before the agent attached): HTTP 404 Not Found  [https://s.example/old.png]",
+                "  console.error 5m ago: boot failed",
+                "  exception 12s ago: Uncaught TypeError: x is null  [https://s.example/app.js:12:5]",
+                "  request 11s ago: HTTP 500 Internal Server Error  [https://api.example/orders] (repeated 3 times)",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn a_clean_page_says_so_and_a_fresh_capture_says_it_just_began() {
+        let clean = describe("page_errors", &json!({ "tabId": 8, "since": "2m", "limit": 50, "dropped": 0, "entries": [] }), &json!({}));
+        assert_eq!(
+            clean,
+            "no problems in tab 8: no uncaught exceptions or console errors logged since the page loaded, and no failed requests since the agent attached 2m ago"
+        );
+        let fresh = describe(
+            "page_errors",
+            &json!({ "tabId": 8, "since": "0s", "fresh": true, "limit": 50, "dropped": 0, "entries": [] }),
+            &json!({}),
+        );
+        assert!(fresh.contains("and no failed requests since the agent began watching it just now"), "{fresh}");
+        assert!(fresh.ends_with("repeat what went wrong, then call browser_page_errors again"), "{fresh}");
+    }
+
+    #[test]
+    fn page_errors_say_why_exceptions_could_not_be_read() {
+        let note = "exceptions and console errors cannot be read while the page waits on JavaScript dialog d2";
+        let empty = describe("page_errors", &json!({ "tabId": 8, "since": "1m", "note": note, "entries": [] }), &json!({}));
+        assert_eq!(empty, format!("no failed requests since the agent attached 1m ago in tab 8\nnote: {note}"));
+        let listed = describe(
+            "page_errors",
+            &json!({ "tabId": 8, "since": "1m", "note": note, "entries": [{ "kind": "request", "ago": "3s", "text": "HTTP 403 Forbidden" }] }),
+            &json!({}),
+        );
+        assert!(listed.ends_with(&format!("  request 3s ago: HTTP 403 Forbidden\nnote: {note}")), "{listed}");
     }
 }
