@@ -646,6 +646,55 @@ async function attach(tabId) {
   } catch {
     // Older Chrome, or a session Chrome ended at once.
   }
+  // A page that loaded while Chrome was not drawing it has done no frame work
+  // yet. Web-component apps (Stencil, which Fathom uses) keep every component
+  // `visibility: hidden` until its first frame hydrates it, so read at once it
+  // is a page with no text and no controls (#63). Let it draw first.
+  await nextFrames(tabId);
+}
+
+/// True after two animation frames in the page, false after `ms` without. Never
+/// throws: a page that will not answer is the caller's next command's problem.
+async function nextFrames(tabId, ms = 300) {
+  try {
+    const res = await withDeadline(
+      chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
+        expression: `new Promise((done) => {
+          const timer = setTimeout(() => done(false), ${ms});
+          requestAnimationFrame(() => requestAnimationFrame(() => { clearTimeout(timer); done(true); }));
+        })`,
+        awaitPromise: true,
+        returnByValue: true,
+        timeout: EVALUATE_TIMEOUT_MS,
+      }),
+      "waiting for the page to draw",
+      ms + 1000,
+    );
+    return res?.result?.value === true;
+  } catch {
+    return false;
+  }
+}
+
+// A page reports itself hidden when Chrome is not drawing it: its window is
+// minimized or covered and focus emulation did not take (an older Chrome, or
+// a session that lost it). Nothing that waits for a frame runs there.
+const NOT_DRAWN_NOTE =
+  "Chrome is not drawing this tab (the page reports itself hidden: its window is minimized or covered, " +
+  "and Chrome would not treat it as shown for the agent). A page that reveals its content on its first " +
+  "drawn frame, such as a web-component app, shows nothing until then. Restore or uncover the tab's " +
+  "Chrome window, then try again";
+
+/// Ask Chrome again to treat the tab as shown, then give the page its frames.
+/// True when the page draws frames again.
+async function redraw(tabId) {
+  try {
+    await send(tabId, "Emulation.setFocusEmulationEnabled", { enabled: false });
+    await send(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true });
+  } catch {
+    // Refused: the frame check below says whether it is drawn anyway.
+  }
+  return nextFrames(tabId, 500);
 }
 
 // Chrome ends a session on its own when the user cancels the "is debugging
@@ -1080,6 +1129,7 @@ const SNAPSHOT_JS = `((options = {}) => {
   }
   const end = Math.min(i, offset + out.length);
   return { title: document.title, url: location.href, elements: out, ...(empty ? { empty } : {}),
+    shown: document.visibilityState === 'visible',
     scope: modal ? 'modal' : 'page', total: i, offset, limit, frames,
     truncated: end < i, nextOffset: end < i ? end : null };
 })()`;
@@ -1087,12 +1137,22 @@ const SNAPSHOT_JS = `((options = {}) => {
 async function snapshot(tabId, { offset = 0, limit = 250 } = {}) {
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > 2147483647) throw new Error("offset must be an integer from 0 to 2147483647");
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 250) throw new Error("limit must be an integer from 1 to 250");
-  const res = await send(tabId, "Runtime.evaluate", {
-    expression: SNAPSHOT_JS.slice(0, -2) + `(${JSON.stringify({ offset, limit })})`,
-    returnByValue: true,
-  });
-  if (res?.exceptionDetails) throw new Error(res.exceptionDetails.text || "evaluate failed");
-  return res.result.value;
+  const take = async () => {
+    const res = await send(tabId, "Runtime.evaluate", {
+      expression: SNAPSHOT_JS.slice(0, -2) + `(${JSON.stringify({ offset, limit })})`,
+      returnByValue: true,
+    });
+    if (res?.exceptionDetails) throw new Error(res.exceptionDetails.text || "evaluate failed");
+    return res.result.value;
+  };
+  let value = await take();
+  // Nothing listed on a page Chrome is not drawing: ask once more for it to
+  // be shown and look again, and if it still is not, say so (#63).
+  if (value?.shown === false && value.total === 0) {
+    if (await redraw(tabId)) value = await take();
+    if (value?.shown === false && value.total === 0) value.empty = NOT_DRAWN_NOTE;
+  }
+  return value;
 }
 
 async function clickAt(tabId, x, y) {
@@ -2406,11 +2466,12 @@ function visibleSelectorInPage(selector, visible, dom) {
     return { error: "invalid CSS selector" };
   }
   if (matches.some(visible)) return { met: true };
+  const shown = document.visibilityState === "visible";
   const frames = dom.queryAll(document, "iframe,frame").filter((frame) => {
     const r = frame.getBoundingClientRect();
     return r.width >= 100 && r.height >= 40 && visible(frame);
   }).length;
-  return { met: false, frames };
+  return { met: false, frames, shown };
 }
 
 /** Poll an explicit condition, including delayed same-document rendering. */
@@ -2422,6 +2483,7 @@ async function waitForReadiness(p) {
     status, condition: "visible_selector", selector: p.waitForSelector,
     elapsedMs: Date.now() - start, ...extra,
   });
+  let redrawn = false;
   while (true) {
     // Recheck on every observation: the action or a redirect may leave the
     // allowed site during the wait. Never evaluate selectors on a blocked page.
@@ -2445,7 +2507,19 @@ async function waitForReadiness(p) {
     const value = res?.result?.value;
     if (value?.error) return outcome("error", { error: value.error });
     if (value?.met === true) return outcome("met");
-    if (Date.now() >= deadline) return outcome("timeout", value?.frames ? { frames: value.frames } : {});
+    // Nothing waiting for a frame runs on a page Chrome is not drawing; ask
+    // once more for it to be shown, then keep polling (#63).
+    if (value?.shown === false && !redrawn && Date.now() < deadline) {
+      redrawn = true;
+      await redraw(p.tabId);
+      continue;
+    }
+    if (Date.now() >= deadline) {
+      return outcome("timeout", {
+        ...(value?.frames ? { frames: value.frames } : {}),
+        ...(value?.shown === false ? { note: NOT_DRAWN_NOTE } : {}),
+      });
+    }
     await sleep(Math.min(100, deadline - Date.now()));
   }
 }
@@ -2507,6 +2581,18 @@ function readPageInPage(includeLinks, dom) {
     lines.push(level ? "#".repeat(level) + " " + line : line);
   }
   out.text = lines.join("\n").trim();
+  out.shown = document.visibilityState === "visible";
+  // No shown text: count the text the page holds but does not show (hidden
+  // by CSS), so an empty read can say the page is not empty.
+  if (!out.text) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: (node) => node.parentElement?.closest("script,style,noscript,template")
+        ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT,
+    });
+    let held = 0;
+    for (let node = walker.nextNode(); node && held < 1e6; node = walker.nextNode()) held += node.data.trim().length;
+    if (held) out.unshown = held;
+  }
   if (includeLinks) {
     const seen = new Set();
     for (const a of dom.queryAll(root, "a[href]")) {
@@ -2556,12 +2642,26 @@ const READ_DEFAULT_CHARS = 20000;
 const READ_MAX_CHARS = 200000;
 
 async function readPage(tabId, { query, maxChars, offset, includeLinks } = {}) {
-  const res = await send(tabId, "Runtime.evaluate", {
-    expression: `(${readPageInPage.toString()})(${includeLinks === true}, (${pageDomInPage.toString()})())`,
-    returnByValue: true,
-  });
-  if (res?.exceptionDetails) throw new Error(res.exceptionDetails.text || "could not read the page");
-  const page = res.result.value || {};
+  const take = async () => {
+    const res = await send(tabId, "Runtime.evaluate", {
+      expression: `(${readPageInPage.toString()})(${includeLinks === true}, (${pageDomInPage.toString()})())`,
+      returnByValue: true,
+    });
+    if (res?.exceptionDetails) throw new Error(res.exceptionDetails.text || "could not read the page");
+    return res.result.value || {};
+  };
+  let page = await take();
+  // No text on a page Chrome is not drawing: ask once more for it to be
+  // shown and read again (#63).
+  if (!page.text && page.shown === false && await redraw(tabId)) page = await take();
+  let note;
+  if (!page.text) {
+    if (page.shown === false) note = NOT_DRAWN_NOTE;
+    else if (page.unshown) {
+      note = `the page holds about ${page.unshown} characters of text, but none of it is shown (hidden by CSS). ` +
+        "It may still be loading or behind a closed panel: wait_for_selector on what you expect, then read again";
+    }
+  }
   let text = page.text || "";
   let matches;
   if (typeof query === "string" && query.trim()) {
@@ -2579,6 +2679,7 @@ async function readPage(tabId, { query, maxChars, offset, includeLinks } = {}) {
     total: text.length,
     ...(matches === undefined ? {} : { matches }),
     ...(includeLinks === true ? { links: page.links || [] } : {}),
+    ...(note ? { note } : {}),
   };
 }
 

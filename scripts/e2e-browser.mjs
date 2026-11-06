@@ -92,6 +92,11 @@ const pages = {
     </form>
     <a href="/next">Next page</a>`,
   "/next": "<title>Next</title><h1>You made it</h1><button>Continue</button>",
+  // #63: Fathom's call page is Stencil web components, each kept
+  // visibility: hidden until its first drawn frame hydrates it.
+  "/stencil": `<title>Recording</title><style>call-page{visibility:hidden}.hydrated{visibility:inherit}</style>
+    <call-page><h1>Weekly sync</h1><button>Rename</button></call-page>
+    <script>requestAnimationFrame(() => document.querySelector('call-page').classList.add('hydrated'));</script>`,
   // Issue #42: a menu that, like Gmail's, opens only for a press that carries
   // the left button's state. Every press event is logged with its metadata.
   "/press": `<title>Press</title><button id="more" aria-label="More message options">More</button>
@@ -952,6 +957,27 @@ check("browser_select_tab says whether the tab became visible, and bring_to_fron
   assert.ok(forced.startsWith(`tab ${shown} is now the visible tab and its Chrome window is in front`), forced);
   assert.equal(await isActive(), true, "bring_to_front left the tab inactive");
   await ok("browser_close_tab", { tab_id: shown });
+});
+
+// #63: a tab whose window is minimized gets no frames, so a page that shows
+// itself on its first frame read as empty: no controls and no text.
+check("a page hidden until its first frame is listed and read with its window minimized (#63)", async () => {
+  const id = Number(/tab_id=(\d+)/.exec(await ok("browser_open_tab", { url: `${base}/stencil` }))[1]);
+  await sleep(800);
+  const { targetInfos } = await browserCommand("Target.getTargets");
+  const target = targetInfos.find((info) => info.type === "page" && info.url.endsWith("/stencil"));
+  const { windowId } = await browserCommand("Browser.getWindowForTarget", { targetId: target.targetId });
+  await browserCommand("Browser.setWindowBounds", { windowId, bounds: { windowState: "minimized" } });
+  try {
+    await sleep(500);
+    const snap = await ok("browser_snapshot", { tab_id: id });
+    assert.match(snap, /button "Rename"/);
+    assert.doesNotMatch(snap, /not drawing/);
+    assert.match(await ok("browser_read", { tab_id: id }), /# Weekly sync\nRename/);
+  } finally {
+    await browserCommand("Browser.setWindowBounds", { windowId, bounds: { windowState: "normal" } });
+    await ok("browser_close_tab", { tab_id: id });
+  }
 });
 
 let failed = 0;
