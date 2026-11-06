@@ -794,12 +794,43 @@ test("a click in a background tab plays the press as page events", async () => {
   pageEval = () => ({ result: { value: {} } });
 });
 
-test("a hover that lands elsewhere never presses there", async () => {
+test("a hover that lands elsewhere never presses there, nor plays page events", async () => {
   const log = playClick({ found: { reachable: true }, hover: false });
-  const result = await callAndWait("click", { tabId: pageTab, index: 4 });
+  assert.match(await refuses("click", { tabId: pageTab, index: 4 }), /not clicked: \[4\] div "More" moved before it could be pressed.*Nothing was pressed/);
   assert.deepEqual(log.input, ["mouseMoved"]);
-  assert.equal(log.pageEvents, 1);
-  assert.equal(result.why, "real input landed somewhere else");
+  assert.equal(log.pageEvents, 0);
+  pageEval = () => ({ result: { value: {} } });
+});
+
+// Play Console: a checkbox below the fold was "covered", the press went out as
+// page events, and the Admin box at the top was the one that changed.
+test("a covered element is never pressed: no real input, no page events, an error naming the cover", async () => {
+  const log = playClick({
+    found: { reachable: false, covered: true, why: '[3] input "Admin (all permissions)" covers it even after scrolling it into view' },
+  });
+  const error = await refuses("click", { tabId: pageTab, index: 4 });
+  assert.match(error, /not clicked: \[4\] div "More" cannot be reached — \[3\] input "Admin \(all permissions\)" covers it/);
+  assert.match(error, /Nothing was pressed/);
+  assert.deepEqual(log.input, []);
+  assert.equal(log.pageEvents, 0);
+  pageEval = () => ({ result: { value: {} } });
+});
+
+test("a checkbox click says what the box is now, and when it did not change", async () => {
+  for (const [after, note] of [["checked", undefined], ["unchecked", "its state did not change (still unchecked)"]]) {
+    const log = playClick({ found: { reachable: true, toggle: true, before: "unchecked", tag: "input", label: "Release manager" } });
+    const inner = pageEval;
+    pageEval = (method, params) =>
+      (params.expression ?? "").includes("{ gone: true }") && (params.expression ?? "").includes("state:")
+        ? { result: { value: { state: after } } }
+        : inner(method, params);
+    const result = await callAndWait("click", { tabId: pageTab, index: 4 });
+    assert.equal(result.route, "input");
+    assert.equal(result.state, after);
+    assert.equal(result.note, note);
+    assert.equal(result.target, '[4] input "Release manager"');
+    assert.equal(log.pageEvents, 0);
+  }
   pageEval = () => ({ result: { value: {} } });
 });
 

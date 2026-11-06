@@ -361,7 +361,10 @@ func post(_ event: CGEvent?, to pid: pid_t) {
 /// modifiers and buttons out of the agent's events (a combined-session source
 /// would turn the agent's click into a cmd-click while the user holds cmd).
 func agentEventSource() -> CGEventSource? {
-    CGEventSource(stateID: .privateState)
+    let source = CGEventSource(stateID: .privateState)
+    // Marks the agent's events, so the key hold lets them through.
+    source?.userData = agentEventMark
+    return source
 }
 
 /// Why an action was refused rather than taking over the user's pointer.
@@ -491,8 +494,15 @@ enum SkyLight {
     static func borrowFocus(pid: pid_t, wid: UInt32) -> FocusLoan? {
         waitForUserPause()
         let user = userFocus()
-        guard activateWithoutRaise(pid: pid, wid: wid) else { return nil }
-        return FocusLoan(pid: pid, wid: wid, user: user)
+        // Keys the person presses while their focus is lent out are held and
+        // given back to their window (see UserKeyHold). Nothing to hold when
+        // the agent works in the window they are already in.
+        let hold = user.flatMap { $0.wid == wid ? nil : UserKeyHold.start() }
+        guard activateWithoutRaise(pid: pid, wid: wid) else {
+            hold?.finish(replay: true)
+            return nil
+        }
+        return FocusLoan(pid: pid, wid: wid, user: user, hold: hold)
     }
 }
 
@@ -501,30 +511,40 @@ struct FocusLoan {
     let pid: pid_t
     let wid: UInt32
     let user: (psn: [UInt8], pid: pid_t, wid: UInt32)?
+    /// The person's keys held while the agent has their focus.
+    let hold: UserKeyHold?
 
     /// Give the user's window its keyboard focus back, once the target has
     /// taken the routed events. Kept with the agent when there was nothing to
     /// return to, when the user was in that very window, or when the action
     /// opened a menu: an app closes its menus as soon as it loses focus.
     func giveBack(afterKeys keys: Int = 0) {
+        // Held keys go back to the person's window once it has focus again;
+        // when the agent's window keeps focus (a menu it opened), replaying
+        // them would type into that menu, so they are dropped instead.
+        let returned = giveFocusBack(afterKeys: keys)
+        hold?.finish(replay: returned)
+    }
+
+    private func giveFocusBack(afterKeys keys: Int) -> Bool {
         guard let user, user.wid != wid, let post = SkyLight.postEventRecord,
               let forPID = SkyLight.getProcessForPID
-        else { return }
+        else { return false }
         // Posted keys are handled after they are posted; let the app finish
         // them while it still has focus.
         usleep(useconds_t(min(60 + keys * 2, 1500)) * 1000)
         // A click's menu opens a moment after the click, so look a few times.
         for attempt in 0..<(keys == 0 ? 8 : 1) {
             if attempt > 0 { usleep(15_000) }
-            if menuOpen(in: pid) { return }
+            if menuOpen(in: pid) { return false }
         }
         var psn = ProcessSerialNumber()
-        guard forPID(pid, &psn) == 0 else { return }
+        guard forPID(pid, &psn) == 0 else { return false }
         var target = [UInt8](repeating: 0, count: 8)
         withUnsafeBytes(of: &psn) { raw in for i in 0..<8 { target[i] = raw[i] } }
         var theirs = user.psn
         _ = SkyLight.postFocusRecord(post, psn: &target, wid: wid, focus: false)
-        _ = SkyLight.postFocusRecord(post, psn: &theirs, wid: user.wid, focus: true)
+        return SkyLight.postFocusRecord(post, psn: &theirs, wid: user.wid, focus: true)
     }
 }
 
@@ -694,6 +714,158 @@ func visibleCenter(of element: AXUIElement) -> CGPoint? {
     // Entirely off-window (scrolled away / off-screen) — no clickable target.
     guard !visible.isNull, !visible.isEmpty else { return nil }
     return CGPoint(x: visible.midX, y: visible.midY)
+}
+
+/// The part of an element a person can see: its frame clipped to its window
+/// and to every scroll area and web page it sits inside. A checkbox scrolled
+/// below a dialog's list is inside the window but not visible, and clipping
+/// to the window alone gave two such checkboxes the same point.
+func viewportRect(of element: AXUIElement) -> CGRect? {
+    guard let position = axPoint(element, kAXPositionAttribute as String),
+          let size = axSize(element, kAXSizeAttribute as String), size.width > 0, size.height > 0 else { return nil }
+    var rect = CGRect(origin: position, size: size)
+    if let target = windowTarget(for: element), !target.frame.isEmpty { rect = rect.intersection(target.frame) }
+    var node = axElement(element, kAXParentAttribute as String)
+    var depth = 0
+    while let current = node, depth < 60, !rect.isNull, !rect.isEmpty {
+        let role = axString(current, kAXRoleAttribute as String)
+        if role == "AXScrollArea" || role == "AXWebArea",
+           let origin = axPoint(current, kAXPositionAttribute as String),
+           let extent = axSize(current, kAXSizeAttribute as String), extent.width > 0, extent.height > 0 {
+            rect = rect.intersection(CGRect(origin: origin, size: extent))
+        }
+        if role == "AXWindow" { break }
+        node = axElement(current, kAXParentAttribute as String)
+        depth += 1
+    }
+    return rect.isNull || rect.isEmpty ? nil : rect
+}
+
+/// Whether `node` is `ancestor` or sits somewhere inside it.
+func isWithin(_ node: AXUIElement, _ ancestor: AXUIElement) -> Bool {
+    var current: AXUIElement? = node
+    var depth = 0
+    while let at = current, depth < 80 {
+        if CFEqual(at, ancestor) { return true }
+        current = axElement(at, kAXParentAttribute as String)
+        depth += 1
+    }
+    return false
+}
+
+func describeHit(_ element: AXUIElement) -> String {
+    let role = axString(element, kAXRoleAttribute as String) ?? "an element"
+    let name = axString(element, kAXTitleAttribute as String) ?? axString(element, kAXDescriptionAttribute as String) ?? ""
+    return name.isEmpty ? role : "\(role) \"\(truncate(name, 50))\""
+}
+
+/// A point where a press reaches this element, checked with the app's own hit
+/// test rather than assumed from its frame. A frame says where an element
+/// would be; only the hit test says what a press there would land on: the
+/// element, or a sticky header, a dialog, another checkbox. Scrolls the
+/// element into view first when it is out of sight. `nil` hit-test support
+/// (an app that does not answer) keeps the frame's centre outside web content.
+func verifiedClickPoint(_ element: AXUIElement, id: String) -> Result<CGPoint, String> {
+    let web = isInWebContent(element)
+    let fullArea: CGFloat = {
+        guard let size = axSize(element, kAXSizeAttribute as String) else { return 0 }
+        return size.width * size.height
+    }()
+    let canScroll = axActions(element).contains("AXScrollToVisible")
+    let mostlyHidden = { (rect: CGRect?) -> Bool in
+        guard let rect else { return true }
+        return fullArea > 0 && rect.width * rect.height < fullArea * 0.5
+    }
+    var scrolled = false
+    var cover: AXUIElement?
+    var answered = false
+    var lastRect: CGRect?
+    // First as it stands; then, if the hit test says something else is there
+    // (a list that is not an AXScrollArea clips without saying so), scrolled
+    // into view and measured again, giving the page time to report its new
+    // positions.
+    for attempt in 0..<3 {
+        var visible = viewportRect(of: element)
+        if canScroll, !scrolled, attempt > 0 || mostlyHidden(visible) {
+            AXUIElementPerformAction(element, "AXScrollToVisible" as CFString)
+            scrolled = true
+            usleep(300_000)
+            visible = viewportRect(of: element)
+        } else if attempt > 0 {
+            usleep(300_000)
+            visible = viewportRect(of: element)
+        }
+        guard let rect = visible else {
+            if canScroll, !scrolled { continue }
+            return .failure("error: not clicked: \(id) is scrolled out of view and could not be brought into view — "
+                + "scroll it into view and call get_app_state again")
+        }
+        lastRect = rect
+        guard let pid = pidOf(element) else { return .success(CGPoint(x: rect.midX, y: rect.midY)) }
+        let app = AXUIElementCreateApplication(pid)
+        let points = [(0.5, 0.5), (0.3, 0.5), (0.7, 0.5), (0.5, 0.3), (0.5, 0.7), (0.25, 0.25), (0.75, 0.75)]
+            .map { CGPoint(x: rect.minX + rect.width * $0.0, y: rect.minY + rect.height * $0.1) }
+        cover = nil
+        for point in points {
+            var hit: AXUIElement?
+            guard AXUIElementCopyElementAtPosition(app, Float(point.x), Float(point.y), &hit) == .success, let hit else { continue }
+            answered = true
+            if isWithin(hit, element) { return .success(point) }
+            // A small wrapper around the element (a web checkbox's group) is
+            // the same target; a large one (the whole page) is not.
+            if isWithin(element, hit), let size = axSize(hit, kAXSizeAttribute as String),
+               size.width * size.height <= max(fullArea, 48 * 48) * 4 {
+                return .success(point)
+            }
+            if cover == nil { cover = hit }
+        }
+        if !answered { break }
+        if !canScroll && attempt > 0 { break }
+    }
+    if !answered, let rect = lastRect {
+        // No hit test to check against. Outside web content keep the old
+        // behaviour; in a web page a guessed point is how a stale position
+        // clicked the wrong checkbox, so refuse.
+        if !web { return .success(CGPoint(x: rect.midX, y: rect.midY)) }
+        return .failure("error: not clicked: the app would not say what is at \(id)'s position, so the click could land "
+            + "on something else — use browser_click for Chrome tabs, or call get_app_state again")
+    }
+    let at = lastRect.map { " at (\(Int($0.midX)), \(Int($0.midY)))" } ?? ""
+    let what = cover.map(describeHit) ?? "another element"
+    return .failure("error: not clicked: \(id) is covered\(at) by \(what), or is out of view. Nothing was pressed. "
+        + "Scroll it into view or close what is in front, then call get_app_state again")
+}
+
+/// A checkbox, radio button or switch's value (0, 1, 2 for mixed), or nil
+/// for anything else.
+func toggleValue(_ element: AXUIElement) -> Int? {
+    let role = axString(element, kAXRoleAttribute as String)
+    guard role == "AXCheckBox" || role == "AXRadioButton" else { return nil }
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value) == .success else { return nil }
+    return (value as? NSNumber)?.intValue
+}
+
+/// After a coordinate click on a checkbox, radio button or switch: what it is
+/// now, or an error when it did not change. A hit test cannot see everything
+/// painted in front (an unlabelled banner over a web page is invisible to
+/// accessibility), so the box itself is the check: a click that changed
+/// nothing went somewhere else. Nil for other elements.
+func checkedToggle(_ element: AXUIElement, id: String, before: Int?, at point: CGPoint) -> String? {
+    guard let before else { return nil }
+    var after = before
+    for _ in 0..<6 {
+        usleep(100_000)
+        after = toggleValue(element) ?? before
+        if after != before { break }
+    }
+    let word = { (value: Int) -> String in value == 1 ? "checked" : value == 2 ? "mixed" : "unchecked" }
+    let role = axString(element, kAXRoleAttribute as String)
+    if after == before && !(role == "AXRadioButton" && before == 1) {
+        return "error: clicked at (\(Int(point.x)), \(Int(point.y))), but \(id) did not change (still \(word(before))): "
+            + "something in front of it may have taken the click. Look with screenshot before clicking again"
+    }
+    return "clicked \(id) at (\(Int(point.x)), \(Int(point.y))) — it is now \(word(after))"
 }
 
 var clickGroupCounter: Int64 = 0x4000
@@ -1426,17 +1598,24 @@ func toolClick(_ args: [String: Any]) -> String {
         {
             return "error: cannot click \(id): \(refusal)"
         }
-        guard let center = visibleCenter(of: el) else {
-            return "error: \(id) is not visible in its window — scroll it into view and call get_app_state again"
+        // Never click a point that is not the element: an offscreen checkbox's
+        // clipped frame pointed at a different one (#61 follow-up).
+        let center: CGPoint
+        switch verifiedClickPoint(el, id: id) {
+        case .failure(let message): return message
+        case .success(let point): center = point
         }
+        let toggleBefore = toggleValue(el)
         if let target = windowTarget(for: el), backgroundClick(target, at: center, clickCount: clickCount) {
-            return "clicked \(id) at (\(Int(center.x)), \(Int(center.y))) in background"
+            return checkedToggle(el, id: id, before: toggleBefore, at: center)
+                ?? "clicked \(id) at (\(Int(center.x)), \(Int(center.y))) in background"
         }
         guard let pid = pidOf(el) else {
             return refuseGlobalInput("click \(id)", "Its app could not be identified; call get_app_state again.")
         }
         postClick(at: center, clickCount: clickCount, pid: pid)
-        return "clicked \(id) at (\(Int(center.x)), \(Int(center.y))) by posting to its app"
+        return checkedToggle(el, id: id, before: toggleBefore, at: center)
+            ?? "clicked \(id) at (\(Int(center.x)), \(Int(center.y))) by posting to its app"
     }
 
     if let x = args["x"] as? Double, let y = args["y"] as? Double {
@@ -3267,7 +3446,9 @@ func describeSnapshot(_ payload: [String: Any]) -> String {
         let tag = element["tag"] as? String ?? "?"
         let label = element["label"] as? String ?? ""
         let offscreen = (element["inView"] as? Bool == false) ? "  (scrolled out of view)" : ""
-        lines.append("  [\(index)] \(tag)\(label.isEmpty ? "" : " \"\(label)\"")\(offscreen)")
+        // Checked, selected, disabled: what a person sees on the control.
+        let state = (element["state"] as? String).map { $0.isEmpty ? "" : " (\($0))" } ?? ""
+        lines.append("  [\(index)] \(tag)\(label.isEmpty ? "" : " \"\(label)\"")\(state)\(offscreen)")
     }
     return lines.joined(separator: "\n")
 }
@@ -3381,6 +3562,9 @@ func toolBrowserClick(_ args: [String: Any]) -> String {
                 line += " — \(target), as page events (\(why))"
             }
         }
+        // A checkbox, radio or switch says what it is now, and whether that changed.
+        if let state = payload["state"] as? String, !state.isEmpty { line += " — it is now \(state)" }
+        if let note = payload["note"] as? String { line += " — \(note)" }
         if let cursor = payload["cursor"] as? [String: Any] {
             if cursor["ok"] as? Bool == true {
                 let glow = cursor["hasGlow"] as? Bool == true ? "glow" : "no-glow"
@@ -3640,7 +3824,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "click",
-        "description": "Click an element by element_id (preferred: it uses the accessibility press action, so it works even when the element is scrolled out of view) or at absolute screen coordinates taken from a screenshot or zoom. Pass element_id or x and y, not both. Use browser_click for pages in the agent's Chrome tabs, right_click for context menus, and drag for press-move-release. The click reaches the target app for real and can trigger any action the user could, so read the target with get_app_state first. The agent's own pointer overlay moves to the target. On macOS the user's mouse pointer never moves; on Windows and Linux a target that ignores background input gets real mouse input, which moves the user's pointer, and the result then says via cursor.",
+        "description": "Click an element by element_id (preferred: it uses the accessibility press action, so it works even when the element is scrolled out of view) or at absolute screen coordinates taken from a screenshot or zoom. Pass element_id or x and y, not both. When element_id is clicked by position (web content, or no press action), the point is checked with the app's own hit test first, and the element is scrolled into view if needed; if something else is there the call fails without clicking. A checkbox or radio button says what it is now, and a click that left it unchanged is reported as an error. Use browser_click for pages in the agent's Chrome tabs, right_click for context menus, and drag for press-move-release. The click reaches the target app for real and can trigger any action the user could, so read the target with get_app_state first. The agent's own pointer overlay moves to the target. On macOS the user's mouse pointer never moves; on Windows and Linux a target that ignores background input gets real mouse input, which moves the user's pointer, and the result then says via cursor.",
         "inputSchema": [
             "type": "object",
             "properties": [
@@ -4370,7 +4554,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "browser_snapshot",
-        "description": "List the interactive elements (links, buttons, inputs, tabs, checkboxes, table and grid rows listed as row with their cell text, and other clickable elements) on the page in one of the agent's tabs, with the index each one has for browser_click, plus the page title and URL. Inputs show their type, such as input[password]. Works on a background tab, so the user can be looking at something else. Use it before every browser_click, because indices change when the page changes; use browser_read for the page's text. Read-only. Automatically scopes to the topmost visible dialog when one is open, excluding hidden/inert controls but retaining reachable offscreen controls. Results report scope, total and truncation. Continue with offset and limit on the same tab/session; indices stay global across pages of an unchanged UI. Snapshot again after UI changes.",
+        "description": "List the interactive elements (links, buttons, inputs, tabs, checkboxes, table and grid rows listed as row with their cell text, and other clickable elements) on the page in one of the agent's tabs, with the index each one has for browser_click, plus the page title and URL. Inputs show their type, such as input[password]; checkboxes, radios and switches are named by their label and show their state, such as (checked) or (unchecked, disabled). Works on a background tab, so the user can be looking at something else. Use it before every browser_click, because indices change when the page changes; use browser_read for the page's text. Read-only. Automatically scopes to the topmost visible dialog when one is open, excluding hidden/inert controls but retaining reachable offscreen controls. Results report scope, total and truncation. Continue with offset and limit on the same tab/session; indices stay global across pages of an unchanged UI. Snapshot again after UI changes.",
         "inputSchema": [
             "type": "object",
             "properties": [
@@ -4464,7 +4648,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "browser_click",
-        "description": "Click in one of the agent's tabs, either an element by its index from browser_snapshot (preferred) or a point given in page coordinates. Pass index or x and y, not both. Works on a background tab with real (trusted) mouse input, without selecting the tab or raising its window. A tab the click opens (a target=_blank link or a popup) becomes one of the agent's tabs; find it with browser_list_tabs. Use click for native app windows. A click can submit forms or follow links, so snapshot first.",
+        "description": "Click in one of the agent's tabs, either an element by its index from browser_snapshot (preferred) or a point given in page coordinates. Pass index or x and y, not both. Works on a background tab with real (trusted) mouse input, without selecting the tab or raising its window. An element out of view is scrolled into view first; when something else covers it (a banner, a dialog, another control) nothing is pressed and the call fails, naming what is in front. A checkbox, radio or switch reports what it is now. A tab the click opens (a target=_blank link or a popup) becomes one of the agent's tabs; find it with browser_list_tabs. Use click for native app windows. A click can submit forms or follow links, so snapshot first.",
         "inputSchema": [
             "type": "object",
             "properties": [

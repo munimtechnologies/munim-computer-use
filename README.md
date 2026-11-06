@@ -344,9 +344,14 @@ The agent's tabs stay in the background: the browser tools never select them, ra
 - `browser_click` presses with trusted mouse events, which frameworks that ignore synthetic clicks (Angular Material buttons, for example) respond to. Page events remain only as a fallback, and the reply says which route ran.
 - `browser_press_key` takes any key plus `modifiers` (`cmd`, `ctrl`, `alt`, `shift`): Delete, arrows, Home/End, PageUp/PageDown, F-keys, characters and shortcuts. Editing shortcuts such as select all (`key: "a", modifiers: ["cmd"]`) mean the same with `cmd` or `ctrl` on every platform. Browser shortcuts like close-tab never reach Chrome itself.
 - `browser_fill` replaces a field's whole value by its snapshot index: input, textarea or contenteditable, open shadow roots included. It selects everything, inserts the new text through Chrome's text input (trusted `beforeinput`/`input` events), and says whether the field now holds exactly that text.
-- `browser_snapshot` also lists table and grid rows (`row "Ana | Admin | Active"`), cells and other elements that are only clickable by handler or pointer cursor, so list rows can be found and clicked.
+- `browser_snapshot` also lists table and grid rows (`row "Ana | Admin | Active"`), cells and other elements that are only clickable by handler or pointer cursor, so list rows can be found and clicked. Checkboxes, radios and switches are named by their label, never their value ("on"), and show their state: `input[checkbox] "Admin (all permissions)" (unchecked)`.
+- A click never lands on the wrong thing. An element out of view is scrolled into view, and the press goes only to a point where the element itself (or its own label) is on top. When a banner, dialog or another control covers it, nothing is pressed and the call fails naming what is in front. A checkbox click reports what the box is now.
 
 The desktop `press_key` and `type_text` go to whichever Chrome window is in front, which may be the user's, so never use them on an agent tab.
+
+### Typing alongside the user
+
+The person at the computer can keep typing in their own windows while the agent types elsewhere. Browser tools never touch the OS keyboard. On the desktop, delivering keys or a click to a background app lends that app keyboard focus for the length of the action. On macOS, keys the person presses during that moment are held in a short-lived session event tap and replayed, in order, to their own window once it has focus again (set `MUNIM_COMPUTER_USE_HOLD_USER_KEYS=0` to turn this off). Windows holds and replays them the same way. A desktop `click` by `element_id` that has to use a position checks it with the app's own hit test first, and fails instead of clicking whatever else is there.
 
 ### Browser readiness and safe re-observation
 

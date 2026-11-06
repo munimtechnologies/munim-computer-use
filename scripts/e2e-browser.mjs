@@ -141,7 +141,30 @@ pages["/editor"] = `<title>Editor</title>
       }
     });
   </script>`;
-pages["/user"] = "<title>User window</title><h1>The user's own page</h1>";
+// Play Console's permissions dialog, reduced: Admin at the top, the rest in
+// a scrolled list as Material checkboxes (a pointer-cursor wrapper, a hidden
+// native input, the text beside it), one hidden behind a banner.
+const permission = (id, text) =>
+  `<div class="mat-checkbox" style="cursor:pointer;display:flex;gap:6px;align-items:center;height:40px">` +
+  `<span style="position:relative;width:18px;height:18px;border:2px solid #555">` +
+  `<input type="checkbox" id="${id}" style="position:absolute;inset:0;margin:0;opacity:0;cursor:pointer"></span>` +
+  `<span>${text}</span></div>`;
+pages["/perms"] = `<title>Permissions</title>
+  <div role="dialog" aria-modal="true" style="position:fixed;inset:20px;background:white;display:flex;flex-direction:column">
+    <h2>Manage permissions</h2>
+    ${permission("admin", "Admin (all permissions)")}
+    <div id="list" style="overflow:auto;height:200px;border:1px solid #ccc">
+      ${Array.from({ length: 30 }, (_, i) => permission(`p${i}`, `Permission ${i}`)).join("")}
+    </div>
+    <label><input type="checkbox" id="labelled" disabled checked> Labelled and locked</label>
+    <div role="checkbox" aria-checked="true" tabindex="0" aria-labelledby="ariaName">x</div><span id="ariaName">Aria named</span>
+    <div id="banner" style="position:absolute;left:0;right:0;bottom:0;height:140px;background:#fee;z-index:5">Unsaved changes</div>
+  </div>
+  <script>
+    // The last permissions sit under the banner whatever the scroll.
+    document.getElementById('list').style.height = '320px';
+  </script>`;
+pages["/user"] = "<title>User window</title><h1>The user's own page</h1><textarea id=\"mine\" aria-label=\"Mine\"></textarea>";
 const site = http.createServer((req, res) => {
   const body = pages[req.url.split("?")[0]];
   res.writeHead(body ? 200 : 404, { "content-type": "text/html; charset=utf-8" });
@@ -778,6 +801,38 @@ check("browser_fill says what the field holds when the page limits or refuses th
   assert.equal(await evaluateIn(atEditor, "document.getElementById('locked').value"), "keep");
 });
 
+check("the user keeps typing in their own window while the agent types in its tab", async () => {
+  const user = (await (await fetch(`http://127.0.0.1:${devtoolsPort}/json`)).json()).find((t) => t.type === "page" && t.url === `${base}/user`);
+  const socket = new WebSocket(user.webSocketDebuggerUrl);
+  await new Promise((resolve) => socket.addEventListener("open", resolve, { once: true }));
+  let next = 0;
+  const send = (method, params) => new Promise((resolve) => {
+    const id = ++next;
+    socket.addEventListener("message", function answer(event) {
+      if (JSON.parse(event.data).id === id) { socket.removeEventListener("message", answer); resolve(); }
+    });
+    socket.send(JSON.stringify({ id, method, params }));
+  });
+  await send("Runtime.evaluate", { expression: "document.getElementById('mine').focus()" });
+  const mine = "the user's own words, typed one key at a time";
+  const typing = (async () => {
+    for (const char of mine) {
+      await send("Input.dispatchKeyEvent", { type: "keyDown", key: char, text: char });
+      await send("Input.dispatchKeyEvent", { type: "keyUp", key: char });
+      await sleep(15);
+    }
+  })();
+  const snapshot = await ok("browser_snapshot", { tab_id: editTab });
+  const agent = Array.from({ length: 20 }, (_, i) => `agent line ${i}`).join("\n");
+  await ok("browser_fill", { tab_id: editTab, index: indexOf(snapshot, 'textarea "About"'), text: agent });
+  await ok("browser_press_key", { tab_id: editTab, key: "End", modifiers: ["cmd"] });
+  await ok("browser_type", { tab_id: editTab, text: " and more" });
+  await typing;
+  socket.close();
+  assert.equal(await evaluateIn(atEditor, "document.getElementById('about').value"), agent + " and more");
+  assert.equal(await evaluateIn((url) => url === `${base}/user`, "document.getElementById('mine').value"), mine);
+});
+
 check("every edit reached the page as trusted input events", async () => {
   const events = await evaluateIn(atEditor, "events");
   assert.ok(events.length >= 10, `only ${events.length} input events`);
@@ -816,6 +871,48 @@ check("none of it selected the agent tab, raised Chrome or took focus from the u
   }
   await browserCommand("Target.closeTarget", { targetId: userTarget.targetId });
   await ok("browser_close_tab", { tab_id: editTab });
+});
+
+// ── checkboxes: real labels, state, and no press on whatever is in front ──
+
+let permsTab;
+const atPerms = (url) => url === `${base}/perms`;
+const checkedBoxes = () => evaluateIn(atPerms, "[...document.querySelectorAll('input[type=checkbox]')].filter((box) => box.checked).map((box) => box.id)");
+
+check("checkboxes are listed by their label with their state, never as \"on\"", async () => {
+  permsTab = Number(/tab_id=(\d+)/.exec(await ok("browser_open_tab", { url: `${base}/perms` }))[1]);
+  await sleep(500);
+  const snapshot = await ok("browser_snapshot", { tab_id: permsTab });
+  assert.match(snapshot, /\] input\[checkbox\] "Admin \(all permissions\)" \(unchecked\)/);
+  assert.match(snapshot, /\] input\[checkbox\] "Permission 29" \(unchecked\)  \(scrolled out of view\)/);
+  assert.match(snapshot, /\] input\[checkbox\] "Labelled and locked" \(checked, disabled\)/);
+  assert.match(snapshot, /\] div "Aria named" \(checked\)/);
+  assert.doesNotMatch(snapshot, /"on"/);
+  assert.doesNotMatch(snapshot, /div\[clickable\] "Permission/, "a checkbox's wrapper is not listed beside it");
+  // Indices hold from one snapshot to the next of an unchanged page.
+  assert.equal(await ok("browser_snapshot", { tab_id: permsTab }), snapshot);
+});
+
+check("an out-of-view checkbox is scrolled into view, pressed, and reports its new state; Admin is untouched", async () => {
+  const snapshot = await ok("browser_snapshot", { tab_id: permsTab });
+  const index = indexOf(snapshot, 'input\\[checkbox\\] "Permission 12"');
+  const text = await ok("browser_click", { tab_id: permsTab, index });
+  assert.ok(text.includes(`[${index}] input "Permission 12", with real mouse input — it is now checked`), text);
+  assert.deepEqual(await checkedBoxes(), ["p12", "labelled"]);
+});
+
+check("a checkbox behind a banner is not clicked, and nothing else is pressed in its place", async () => {
+  await evaluateIn(atPerms, "document.getElementById('list').scrollTop = 1e6; true");
+  // Pin it under the banner: the list cannot scroll it any higher.
+  await evaluateIn(atPerms, "document.getElementById('list').style.height = '2000px'; true");
+  const snapshot = await ok("browser_snapshot", { tab_id: permsTab });
+  const index = indexOf(snapshot, 'input\\[checkbox\\] "Permission 29"');
+  const result = await tool("browser_click", { tab_id: permsTab, index });
+  assert.equal(result.isError, true, result.text);
+  assert.match(result.text, /not clicked: \[\d+\] input "Permission 29" cannot be reached — div "Unsaved changes" covers it/);
+  assert.match(result.text, /Nothing was pressed/);
+  assert.deepEqual(await checkedBoxes(), ["p12", "labelled"], "no checkbox changed");
+  await ok("browser_close_tab", { tab_id: permsTab });
 });
 
 // Headless Chrome reports every tab hidden, the front one too, so only a

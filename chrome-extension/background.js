@@ -817,6 +817,59 @@ function pageDomInPage() {
   return { queryAll, parent, contains, stack, hit, byIndex, byId };
 }
 
+/**
+ * What a person reads as a control's name, serialized into the page. A
+ * checkbox's value is "on" for every checkbox on the page, so it must never
+ * stand in for the name: a list of permissions all labelled "on" is how an
+ * agent ticked Admin when it meant another box. In order: aria-label,
+ * aria-labelledby, an associated <label>, then the nearest wrapper with text
+ * that holds no other control (custom checkbox components such as Angular
+ * Material's put the text beside the input, not in a label).
+ */
+function controlLabelInPage(el, dom, wrappers = true) {
+  const clean = (text) => String(text || "").replace(/\s+/g, " ").trim();
+  const aria = clean(el.getAttribute("aria-label"));
+  if (aria) return aria;
+  const ids = clean(el.getAttribute("aria-labelledby"));
+  if (ids) {
+    const text = clean(ids.split(" ").map((id) => dom.byId(el, id)?.innerText || "").join(" "));
+    if (text) return text;
+  }
+  for (const label of el.labels || []) {
+    const text = clean(label.innerText);
+    if (text) return text;
+  }
+  if (!wrappers) return "";
+  const controls = "input:not([type=hidden]),button,select,textarea,a[href],[role=checkbox],[role=radio],[role=switch],[role=button]";
+  for (let at = dom.parent(el), steps = 0; at instanceof Element && steps < 5; at = dom.parent(at), steps++) {
+    if (at === document.body || at === document.documentElement) break;
+    const text = clean(at.innerText);
+    if (!text) continue;
+    const others = dom.queryAll(at, controls).filter((other) => other !== el && !el.contains(other));
+    return others.length === 0 ? text : "";
+  }
+  return clean(el.getAttribute("title"));
+}
+
+/** Whether a control is checked, selected or disabled, as words: "checked, disabled". */
+function controlStateInPage(el) {
+  const parts = [];
+  const role = (el.getAttribute("role") || "").toLowerCase();
+  if (el.tagName === "INPUT" && (el.type === "checkbox" || el.type === "radio")) {
+    parts.push(el.indeterminate ? "mixed" : el.checked ? "checked" : "unchecked");
+  } else if (/^(checkbox|radio|switch|menuitemcheckbox|menuitemradio)$/.test(role)) {
+    const checked = (el.getAttribute("aria-checked") || "").toLowerCase();
+    parts.push(checked === "true" ? "checked" : checked === "mixed" ? "mixed" : "unchecked");
+  } else if (/^(tab|option|treeitem|row|gridcell)$/.test(role) && el.getAttribute("aria-selected") === "true") {
+    parts.push("selected");
+  }
+  if (el.getAttribute("aria-expanded") === "true" && el.matches("[aria-haspopup],[role=combobox],button,summary")) {
+    parts.push("expanded");
+  }
+  if (el.matches(":disabled") || el.getAttribute("aria-disabled") === "true") parts.push("disabled");
+  return parts.join(", ");
+}
+
 /// A compact outline of the interactive elements on the page, with ids the
 /// agent can click. Mirrors the accessibility-tree tools on the desktop side.
 const SNAPSHOT_JS = `((options = {}) => {
@@ -848,7 +901,11 @@ const SNAPSHOT_JS = `((options = {}) => {
     for (let at = dom.parent(el); at instanceof Element; at = dom.parent(at)) if (at.matches(sel)) return true;
     return false;
   };
-  const plainTarget = (el) => (el.hasAttribute('onclick') || pointer(el)) && !inControl(el);
+  // Nor is a wrapper around one (a checkbox component's host, a label): the
+  // control inside is the target, and listing both shifted every index after
+  // it the moment the wrapper's pointer cursor appeared.
+  const holdsControl = (el) => dom.queryAll(el, sel).length > 0;
+  const plainTarget = (el) => (el.hasAttribute('onclick') || pointer(el)) && !inControl(el) && !holdsControl(el);
   const listed = (el) => {
     if (el.matches(sel + ',' + rowSel + ',iframe,frame')) return true;
     if (el === document.body || el === document.documentElement) return false;
@@ -870,6 +927,8 @@ const SNAPSHOT_JS = `((options = {}) => {
   // Accessibility-hidden/inert ancestors are not actionable. Do not use viewport
   // intersection here: indexed click scrolls reachable offscreen controls into view.
   const visible = ${isElementVisibleInPage.toString()};
+  const labelOf = ${controlLabelInPage.toString()};
+  const stateOf = ${controlStateInPage.toString()};
   // Native modal dialogs live in Chrome's top layer, above ordinary z-indexes.
   // For custom dialogs, use paint order at their visible centre, not DOM order
   // or raw z-index (which is only meaningful inside a stacking context).
@@ -977,16 +1036,24 @@ const SNAPSHOT_JS = `((options = {}) => {
     // A password field's value is the secret itself: never let it reach the
     // model as a label (browser_request_credentials fills these instead).
     const secret = el.tagName === 'INPUT' && el.type === 'password';
+    // A checkbox or radio is named by its label, never its value ("on").
+    const toggle = (el.tagName === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio')) ||
+      /^(checkbox|radio|switch|menuitemcheckbox|menuitemradio)$/i.test(el.getAttribute('role') || '');
+    const field = el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT';
     const label = kind === 'row' || kind === 'cell'
       ? (el.getAttribute('aria-label') || cellText(el)).replace(/\\s+/g, ' ').trim().slice(0, 160)
-      : (el.getAttribute('aria-label') || el.innerText || (secret ? '' : el.value) ||
+      : toggle
+      ? labelOf(el, dom).slice(0, 90)
+      : (el.getAttribute('aria-label') || (field ? labelOf(el, dom, false) : '') || el.innerText || (secret ? '' : el.value) ||
          el.getAttribute('title') || el.getAttribute('placeholder') || '')
         .replace(/\\s+/g, ' ').trim().slice(0, 90);
+    const state = stateOf(el);
     const type = el.tagName === 'INPUT' && el.type && el.type !== 'text' ? '[' + el.type + ']' : '';
     out.push({
       i: index,
       tag: kind === 'row' || kind === 'cell' ? kind : el.tagName.toLowerCase() + (kind === 'clickable' ? '[clickable]' : type),
       label,
+      ...(state ? { state } : {}),
       x: Math.round(r.left + r.width / 2),
       y: Math.round(r.top + r.height / 2),
       inView: r.top >= 0 && r.bottom <= innerHeight && r.left >= 0 && r.right <= innerWidth,
@@ -1298,35 +1365,95 @@ async function hideCursor(tabId) {
   }
 }
 
-/// Find a snapshotted element, bring it to the middle of the view, and say
-/// whether real input can reach it: only in a tab Chrome is showing, and only
-/// when the element itself is what a press at its centre would hit. When it
-/// can, a probe records which trusted events land on it, so the click can
-/// check its hover reached the element before pressing anything.
+/// Find a snapshotted element, scroll it to the middle of the view, and find a
+/// point where a press reaches it: the element itself, or its own label. Then
+/// say whether real input can reach it there: only in a tab Chrome is showing.
+/// When something else is painted over every point (a sticky bar, another
+/// checkbox, a dialog), the click fails: pressing there would press that
+/// instead. When it can, a probe records which trusted events land on it, so
+/// the click can check its hover reached the element before pressing anything.
 const CLICK_TARGET_JS = (index) => `(() => {
   const dom = (${pageDomInPage.toString()})();
+  const labelOf = ${controlLabelInPage.toString()};
+  const stateOf = ${controlStateInPage.toString()};
   const el = dom.byIndex(${index});
   if (!el) return { ok: false, reason: 'element ${index} is no longer on the page' };
   // Instant, so a page with smooth scrolling is not measured mid-flight.
   el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
   const r = el.getBoundingClientRect();
-  const x = r.left + r.width / 2;
-  const y = r.top + r.height / 2;
-  const label = (el.getAttribute('aria-label') || el.innerText || el.getAttribute('title') || '')
-    .replace(/\\s+/g, ' ').trim().slice(0, 60);
-  const hit = dom.hit(x, y);
+  const clean = (text) => String(text || '').replace(/\\s+/g, ' ').trim();
+  const toggle = (el.tagName === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio')) ||
+    /^(checkbox|radio|switch|menuitemcheckbox|menuitemradio)$/i.test(el.getAttribute('role') || '');
+  const label = clean(toggle ? labelOf(el, dom) : (el.getAttribute('aria-label') || el.innerText || el.getAttribute('title') || '')).slice(0, 60);
+  const describe = (node) => {
+    if (!(node instanceof Element)) return 'nothing';
+    const idx = node.closest?.('[data-cu-idx]')?.getAttribute('data-cu-idx');
+    const text = clean(node.getAttribute('aria-label') || node.innerText).slice(0, 40);
+    return (idx !== null && idx !== undefined ? '[' + idx + '] ' : '') + node.tagName.toLowerCase() + (text ? ' "' + text + '"' : '');
+  };
   const shown = document.visibilityState === 'visible';
-  const reachable = shown && !!hit && (hit === el || dom.contains(el, hit));
-  const found = { ok: true, tag: el.tagName.toLowerCase(), label, href: el.href || null, x, y, reachable };
+  const found = { ok: true, tag: el.tagName.toLowerCase(), label, href: el.href || null, toggle, before: stateOf(el) };
   window.__cuClickProbe?.done();
   delete window.__cuClickProbe;
-  if (!reachable) return { ...found, why: shown ? 'another element covers it' : 'the tab is in the background' };
-  const seen = { hover: false, press: false };
-  const kinds = { pointerover: 'hover', pointermove: 'hover', mousemove: 'hover', pointerdown: 'press', mousedown: 'press' };
-  const listener = (e) => { if (e.isTrusted && e.composedPath().includes(el)) seen[kinds[e.type]] = true; };
+  // A press lands on the element itself, or on its own label, or on the
+  // decoration of a small widget that holds this control and no other (a
+  // checkbox component's box and ripple). Anything else at the point is a
+  // different control, a sticky header or a dialog in front: never pressed.
+  const controls = 'input:not([type=hidden]),button,select,textarea,a[href],[role=button],[role=link],[role=checkbox],' +
+    '[role=radio],[role=switch],[role=option],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],[role=tab]';
+  const own = (hit) => !!hit && (hit === el || dom.contains(el, hit));
+  const belongs = (hit) => {
+    if (!hit) return false;
+    for (const owner of el.labels || []) if (dom.contains(owner, hit) || owner === hit) return true;
+    let common = dom.parent(el);
+    while (common instanceof Element && !dom.contains(common, hit) && common !== hit) common = dom.parent(common);
+    if (!(common instanceof Element) || common === document.body || common === document.documentElement) return false;
+    const box = common.getBoundingClientRect();
+    if (box.width * box.height > Math.max(r.width * r.height, 48 * 48) * 12) return false;
+    return dom.queryAll(common, controls).every((other) => other === el || dom.contains(el, other) || dom.contains(other, el));
+  };
+  // The centre first, then points around it, kept inside the viewport.
+  const points = [[0.5, 0.5], [0.25, 0.5], [0.75, 0.5], [0.5, 0.25], [0.5, 0.75], [0.2, 0.2], [0.8, 0.8], [0.2, 0.8], [0.8, 0.2]]
+    .map(([fx, fy]) => [r.left + r.width * fx, r.top + r.height * fy])
+    .filter(([x, y]) => x >= 0 && y >= 0 && x < innerWidth && y < innerHeight);
+  if (!points.length) {
+    return { ...found, x: r.left + r.width / 2, y: r.top + r.height / 2, reachable: false, covered: true,
+      why: 'it is outside the visible page even after scrolling it into view' };
+  }
+  let chosen = null;
+  let through = null;
+  let cover = null;
+  for (const [x, y] of points) {
+    const hit = dom.hit(x, y);
+    if (own(hit)) { chosen = [x, y]; break; }
+    if (!through && belongs(hit)) through = [x, y];
+    if (!cover) cover = hit;
+  }
+  const via = chosen ? 'own' : through ? 'label' : null;
+  const [x, y] = chosen || through || points[0];
+  if (!shown) return { ...found, x, y, reachable: false, why: 'the tab is in the background' };
+  if (!via) {
+    return { ...found, x, y, reachable: false, covered: true,
+      why: (cover ? describe(cover) + ' covers it' : 'nothing is painted at its position') + ' even after scrolling it into view' };
+  }
+  const seen = { hover: false, press: false, click: false };
+  const kinds = { pointerover: 'hover', pointermove: 'hover', mousemove: 'hover', pointerdown: 'press', mousedown: 'press', click: 'click' };
+  const accept = (node) => own(node) || (via === 'label' && belongs(node));
+  const listener = (e) => {
+    if (!e.isTrusted) return;
+    const kind = kinds[e.type];
+    if (kind === 'click' ? e.composedPath().includes(el) : accept(e.composedPath()[0])) seen[kind] = true;
+  };
   for (const type in kinds) addEventListener(type, listener, true);
   window.__cuClickProbe = { seen, done: () => { for (const type in kinds) removeEventListener(type, listener, true); } };
-  return found;
+  return { ...found, x, y, reachable: true, via };
+})()`;
+
+/// The state of a clicked toggle after the press, so the reply can say what
+/// it is now rather than leave the agent to assume.
+const CLICK_STATE_JS = (index) => `(() => {
+  const el = (${pageDomInPage.toString()})().byIndex(${index});
+  return el ? { state: (${controlStateInPage.toString()})(el) } : { gone: true };
 })()`;
 
 /// What the click probe has seen; `finish` also removes it. Gone means the
@@ -1394,6 +1521,15 @@ async function clickElement(tabId, index) {
   }
   const found = await evaluateValue(tabId, CLICK_TARGET_JS(index), "click failed");
   if (!found.ok) throw new Error(found.reason || "click failed");
+  const target = describeTarget(index, found);
+  // Covered or outside the page: a press at that point would land on
+  // whatever is there, so nothing is pressed at all.
+  if (found.covered) {
+    throw new Error(
+      `not clicked: ${target} cannot be reached — ${found.why}. Nothing was pressed. ` +
+        "Close or scroll away what is in front of it, then browser_snapshot again",
+    );
+  }
   const { x, y } = found;
   let route = "page-events";
   let why = found.why;
@@ -1410,10 +1546,15 @@ async function clickElement(tabId, index) {
         // it. Otherwise not pressed means not delivered, so the page events
         // below are not a second click.
         const seen = await evaluateValue(tabId, CLICK_PROBE_JS(true), "click failed").catch(() => ({ gone: true }));
-        if (seen.press || seen.gone) route = "input";
+        if (seen.press || seen.click || seen.gone) route = "input";
         else why = "real input did not reach it";
       } else {
-        why = "real input landed somewhere else";
+        // The page moved between finding the point and hovering it. Pressing
+        // now could land on something else, so stop here.
+        throw new Error(
+          `not clicked: ${target} moved before it could be pressed, and the pointer landed on something else. ` +
+            "Nothing was pressed; browser_snapshot again",
+        );
       }
     } finally {
       await evaluateValue(tabId, CLICK_PROBE_JS(true), "click failed").catch(() => {});
@@ -1423,12 +1564,25 @@ async function clickElement(tabId, index) {
     const fired = await evaluateValue(tabId, CLICK_EVENTS_JS(index), "click failed");
     if (!fired.ok) throw new Error(fired.reason || "click failed");
   }
+  // A checkbox, radio or switch says what it is now.
+  let state;
+  let note;
+  if (found.toggle) {
+    const after = await evaluateValue(tabId, CLICK_STATE_JS(index), "click failed").catch(() => ({}));
+    if (typeof after.state === "string") {
+      state = after.state;
+      if (after.state === found.before) note = `its state did not change (still ${after.state || "the same"})`;
+    }
+  }
   const cursor = await paintCursor(tabId, x, y);
   await markTab(tabId);
   return {
     ok: true, tag: found.tag, href: found.href, x, y, route,
     ...(route === "input" ? {} : { why }),
-    target: describeTarget(index, found), cursor,
+    ...(found.via === "label" ? { via: "label" } : {}),
+    ...(state !== undefined ? { state } : {}),
+    ...(note ? { note } : {}),
+    target, cursor,
   };
 }
 

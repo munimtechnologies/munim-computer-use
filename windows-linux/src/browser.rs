@@ -1272,13 +1272,21 @@ fn describe_click_route(result: &Value) -> String {
     let Some(target) = result.get("target").and_then(Value::as_str) else {
         return String::new();
     };
-    match result.get("route").and_then(Value::as_str) {
+    let mut line = match result.get("route").and_then(Value::as_str) {
         Some("input") => format!(" — {target}, with real mouse input"),
         _ => {
             let why = result.get("why").and_then(Value::as_str).unwrap_or("real input could not reach it");
             format!(" — {target}, as page events ({why})")
         }
+    };
+    // A checkbox, radio or switch says what it is now, and whether that changed.
+    if let Some(state) = result.get("state").and_then(Value::as_str).filter(|state| !state.is_empty()) {
+        line.push_str(&format!(" — it is now {state}"));
     }
+    if let Some(note) = result.get("note").and_then(Value::as_str) {
+        line.push_str(&format!(" — {note}"));
+    }
+    line
 }
 
 /// Readiness is separate from action success; never imply a retry is safe.
@@ -1471,8 +1479,15 @@ fn describe_snapshot(result: &Value) -> String {
         .unwrap_or_default()
     {
         let label = element.get("label").and_then(Value::as_str).unwrap_or("");
+        // Checked, selected, disabled: what a person sees on the control.
+        let state = element
+            .get("state")
+            .and_then(Value::as_str)
+            .filter(|state| !state.is_empty())
+            .map(|state| format!(" ({state})"))
+            .unwrap_or_default();
         lines.push(format!(
-            "  [{}] {}{}{}",
+            "  [{}] {}{}{state}{}",
             element.get("i").and_then(Value::as_i64).unwrap_or(-1),
             element.get("tag").and_then(Value::as_str).unwrap_or("?"),
             if label.is_empty() {
@@ -1976,6 +1991,25 @@ mod tests {
         );
         let params = normalise("press", &json!({ "tab_id": 9, "key": "a", "modifiers": ["cmd"] }));
         assert_eq!(params["modifiers"], json!(["cmd"]));
+    }
+
+    #[test]
+    fn checkbox_state_shows_in_snapshots_and_after_a_click() {
+        let snapshot = describe_snapshot(&json!({
+            "title": "Users", "url": "https://play.example/users",
+            "elements": [
+                { "i": 3, "tag": "input[checkbox]", "label": "Admin (all permissions)", "state": "unchecked", "inView": true },
+                { "i": 10, "tag": "input[checkbox]", "label": "Release apps", "state": "checked, disabled", "inView": false }
+            ]
+        }));
+        assert!(snapshot.contains("[3] input[checkbox] \"Admin (all permissions)\" (unchecked)"), "{snapshot}");
+        assert!(snapshot.contains("[10] input[checkbox] \"Release apps\" (checked, disabled)  (scrolled out of view)"), "{snapshot}");
+        let clicked = describe(
+            "click",
+            &json!({ "route": "input", "target": "[10] input[checkbox] \"Release apps\"", "state": "checked" }),
+            &json!({ "tab_id": 9, "index": 10 }),
+        );
+        assert_eq!(clicked, "clicked in tab 9 — [10] input[checkbox] \"Release apps\", with real mouse input — it is now checked");
     }
 
     #[test]
