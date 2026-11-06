@@ -925,7 +925,10 @@ const SNAPSHOT_JS = `((options = {}) => {
   const offset = options.offset ?? 0;
   const limit = options.limit ?? 250;
   const out = [];
-  const sel = 'a,button,input,textarea,select,cfc-select,mat-option,[role=button],[role=link],[role=textbox],[role=combobox],[role=listbox],[role=option],[role=menu],[role=menuitem],[aria-haspopup],[contenteditable=true],summary,' +
+  // Every spelling that makes an element editable (contenteditable="",
+  // "true", "plaintext-only"), not just "true": an inline title editor that
+  // is a bare span is still the place to type (#72).
+  const sel = 'a,button,input,textarea,select,cfc-select,mat-option,[role=button],[role=link],[role=textbox],[role=combobox],[role=listbox],[role=option],[role=menu],[role=menuitem],[aria-haspopup],[contenteditable]:not([contenteditable=false i]),summary,' +
     '[role=tab],[role=checkbox],[role=radio],[role=switch],[role=treeitem],[role=menuitemcheckbox],[role=menuitemradio]';
   // Table and grid rows are listed too, so a row in a list of users or orders
   // can be found by its text and clicked. Rows built from custom elements
@@ -982,7 +985,14 @@ const SNAPSHOT_JS = `((options = {}) => {
   // For custom dialogs, use paint order at their visible centre, not DOM order
   // or raw z-index (which is only meaningful inside a stacking context).
   // Modeless native dialogs and explicit aria-modal=false keep page controls.
-  const dialogs = Array.from(dom.queryAll(document, 'dialog:modal,[role=dialog]:not([aria-modal=false i]),[role=alertdialog]:not([aria-modal=false i]),[aria-modal=true i]')).filter((dialog) => {
+  // Component libraries often build a dialog with no dialog role at all, as
+  // a custom element named for it (Fathom's <ui-dialog>, #71). Those count as
+  // implicit dialogs, held to the same test below: painted on top at the
+  // page's centre, or inside a backdrop that is.
+  const roleDialogs = dom.queryAll(document, 'dialog:modal,[role=dialog]:not([aria-modal=false i]),[role=alertdialog]:not([aria-modal=false i]),[aria-modal=true i]');
+  const namedDialogs = dom.queryAll(document, '*').filter((el) => /-(dialog|modal)$/.test(el.localName) &&
+    !el.matches('[aria-modal=false i]') && !roleDialogs.includes(el));
+  const dialogs = [...roleDialogs, ...namedDialogs].filter((dialog) => {
     if (!visible(dialog)) return false;
     if (dialog.matches('dialog:modal,[aria-modal=true i]')) return true;
     // An implicit ARIA dialog is not automatically modal. Preserve full-page
@@ -1033,6 +1043,13 @@ const SNAPSHOT_JS = `((options = {}) => {
   // the modal's controls point at (aria-controls/aria-owns), open popovers, and
   // any control painted on top of the modal: inside the modal's rectangle, and
   // the topmost element at its own centre.
+  // The dialog's name, so a snapshot scoped to it says which one it is:
+  // its ARIA name, or its first heading.
+  let dialogName = '';
+  if (modal) {
+    const heading = dom.queryAll(modal, 'h1,h2,h3,h4,h5,h6,[role=heading]').find((h) => visible(h) && (h.innerText || '').trim());
+    dialogName = (labelOf(modal, dom, false) || heading?.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 90);
+  }
   const floating = [];
   if (modal) {
     for (const owner of dom.queryAll(modal, '[aria-controls],[aria-owns]')) {
@@ -1097,7 +1114,10 @@ const SNAPSHOT_JS = `((options = {}) => {
          el.getAttribute('title') || el.getAttribute('placeholder') || '')
         .replace(/\\s+/g, ' ').trim().slice(0, 90);
     const state = stateOf(el);
-    const type = el.tagName === 'INPUT' && el.type && el.type !== 'text' ? '[' + el.type + ']' : '';
+    // Text the page lets the user edit in place reads as a plain span or div
+    // otherwise, and an agent then clicks it expecting an editor to open (#72).
+    const type = el.tagName === 'INPUT' && el.type && el.type !== 'text' ? '[' + el.type + ']'
+      : !field && el.isContentEditable ? '[editable]' : '';
     out.push({
       i: index,
       tag: kind === 'row' || kind === 'cell' ? kind : el.tagName.toLowerCase() + (kind === 'clickable' ? '[clickable]' : type),
@@ -1130,7 +1150,7 @@ const SNAPSHOT_JS = `((options = {}) => {
   const end = Math.min(i, offset + out.length);
   return { title: document.title, url: location.href, elements: out, ...(empty ? { empty } : {}),
     shown: document.visibilityState === 'visible',
-    scope: modal ? 'modal' : 'page', total: i, offset, limit, frames,
+    scope: modal ? 'modal' : 'page', ...(dialogName ? { dialog: dialogName } : {}), total: i, offset, limit, frames,
     truncated: end < i, nextOffset: end < i ? end : null };
 })()`;
 

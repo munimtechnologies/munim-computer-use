@@ -779,9 +779,10 @@ check("browser_fill replaces a long multi-line textarea in one call", async () =
 
 check("browser_fill replaces contenteditable text and fields inside a shadow root", async () => {
   const snapshot = await ok("browser_snapshot", { tab_id: editTab });
-  await ok("browser_fill", { tab_id: editTab, index: indexOf(snapshot, '[a-z]+ "Rich"'), text: "Plain new text" });
+  // #72: editable-in-place text says so.
+  await ok("browser_fill", { tab_id: editTab, index: indexOf(snapshot, 'div\\[editable\\] "Rich"'), text: "Plain new text" });
   await ok("browser_fill", { tab_id: editTab, index: indexOf(snapshot, 'input "Shadow input"'), text: "shadow new" });
-  await ok("browser_fill", { tab_id: editTab, index: indexOf(snapshot, '[a-z]+ "Shadow rich"'), text: "shadow rich new" });
+  await ok("browser_fill", { tab_id: editTab, index: indexOf(snapshot, 'div\\[editable\\] "Shadow rich"'), text: "shadow rich new" });
   assert.deepEqual(await evaluateIn(atEditor, `(() => {
     const root = document.querySelector('x-field').shadowRoot;
     return [document.getElementById('rich').innerText, root.getElementById('inner').value, root.getElementById('innerRich').innerText];

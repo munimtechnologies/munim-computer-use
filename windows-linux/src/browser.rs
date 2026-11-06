@@ -1467,6 +1467,9 @@ fn describe_snapshot(result: &Value) -> String {
         let limit = result.get("limit").and_then(Value::as_u64).unwrap_or(250);
         let scope = result.get("scope").and_then(Value::as_str).unwrap_or("page");
         lines.push(format!("scope: {scope}; offset={offset}, limit={limit}, total={total}"));
+        if let Some(dialog) = result.get("dialog").and_then(Value::as_str).filter(|name| !name.is_empty()) {
+            lines.push(format!("dialog: \"{dialog}\" — only its controls are listed"));
+        }
         if result.get("truncated").and_then(Value::as_bool) == Some(true) {
             if let Some(next) = result.get("nextOffset").and_then(Value::as_u64) {
                 lines.push(format!("truncated — continue with browser_snapshot offset={next}, limit={limit} (same tab_id/session_id; unchanged UI keeps indices)"));
@@ -1928,12 +1931,14 @@ mod tests {
         assert_eq!(params["offset"], 250);
         assert_eq!(params["limit"], 20);
         let result = json!({
-            "title": "Many controls", "url": "https://example.com/", "scope": "modal",
+            "title": "Many controls", "url": "https://example.com/", "scope": "modal", "dialog": "Share Recording",
             "offset": 250, "limit": 20, "total": 300, "truncated": true, "nextOffset": 270,
             "elements": [{"i": 250, "tag": "button", "label": "Next", "inView": true}]
         });
         let text = describe_snapshot(&result);
         assert!(text.contains("scope: modal; offset=250, limit=20, total=300"));
+        // #71: the dialog the snapshot is scoped to is named.
+        assert!(text.contains("dialog: \"Share Recording\" — only its controls are listed"), "{text}");
         assert!(text.contains("truncated — continue with browser_snapshot offset=270, limit=20"));
         assert!(text.contains("[250] button \"Next\""));
         let last = describe_snapshot(&json!({"total": 300, "offset": 300, "truncated": false}));

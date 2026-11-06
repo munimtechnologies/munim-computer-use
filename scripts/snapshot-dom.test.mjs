@@ -157,6 +157,34 @@ try {
     assert.equal((await snapshot()).total, 2);
     console.log("PASS modeless and explicitly nonmodal dialogs retain page controls");
 
+    // #71: Fathom's share dialog is a <ui-dialog> web component with no dialog
+    // role, its title and close button in its shadow root, over the page.
+    await evaluate(`(() => {
+      if (!customElements.get('ui-dialog')) customElements.define('ui-dialog', class extends HTMLElement {
+        connectedCallback() {
+          if (this.shadowRoot) return;
+          this.attachShadow({ mode: 'open' }).innerHTML = '<div style="margin:80px auto;width:400px;background:white"><h2>Share Recording</h2><button aria-label="Close">x</button><slot></slot></div>';
+        }
+      });
+      document.body.innerHTML = '<span style="cursor:pointer">Recording title</span><button>Share</button>' +
+        '<ui-dialog style="position:fixed;inset:0;display:block;background:rgba(0,0,0,.4)"><input aria-label="Add users and emails"></ui-dialog>';
+      return true;
+    })()`);
+    const shared = await snapshot();
+    assert.equal(shared.scope, "modal", JSON.stringify(shared));
+    assert.equal(shared.dialog, "Share Recording");
+    assert.deepEqual(shared.elements.map((el) => el.label), ["Add users and emails", "Close"]);
+    // A custom element named like a dialog that is not in front keeps the page.
+    await set('<button>Page action</button><app-confirm-dialog style="position:fixed;right:0;bottom:0;width:200px;height:80px;display:block"><button>Corner</button></app-confirm-dialog>');
+    assert.equal((await snapshot()).scope, "page");
+    console.log("PASS a role-less <ui-dialog> component over the page scopes the snapshot and is named");
+
+    // #72: an inline editor that is a contenteditable span says it is editable.
+    await set('<h1><span contenteditable="">Weekly sync</span></h1><span contenteditable="plaintext-only">Notes</span><span contenteditable="false">Fixed</span><div role="textbox" contenteditable="true">Body</div>');
+    assert.deepEqual((await snapshot()).elements.map((el) => el.tag + " " + el.label),
+      ["span[editable] Weekly sync", "span[editable] Notes", "div[editable] Body"]);
+    console.log("PASS contenteditable editors are listed as [editable] in every spelling");
+
     await set('<div style="position:fixed;inset:0;z-index:30"><div role="dialog" style="position:absolute;inset:0;background:white"><button>High context</button></div></div><div style="position:fixed;inset:0;z-index:10"><div role="dialog" style="position:absolute;inset:0;z-index:9999;background:white"><button>Low context</button></div></div>');
     assert.equal((await snapshot()).elements[0].label, "High context");
     await set('<div role="dialog" style="position:fixed;inset:0;background:white"><button>Parent</button><div role="alertdialog" style="position:fixed;inset:100px;background:white"><button>Nested</button></div></div>');
