@@ -18,6 +18,10 @@ pub enum TypedCheck {
     /// The field could be read and does not hold the text. Lengths in
     /// characters, line breaks not counted.
     Incomplete { before: usize, after: usize, sent: usize },
+    /// The field holds the typed text and more that was neither typed nor
+    /// there before: an autocomplete (Chrome's address bar, a search box)
+    /// finished it (#69). Pressing Return would use the completed value.
+    Completed { before: usize, after: usize, sent: usize },
     /// Nothing to compare against; the reason says why.
     Unverified(&'static str),
 }
@@ -50,11 +54,27 @@ pub fn check_typed(text: &str, before: Option<&str>, after: Option<&str>) -> Typ
         // Text the field already held proves nothing unless the field grew by it.
         let already = before.as_deref().is_some_and(|b| b.contains(&wanted));
         if !already || after_len >= before_len + sent {
+            if !explained(&wanted, before.as_deref(), &after) {
+                return TypedCheck::Completed { before: before_len, after: after_len, sent };
+            }
             return TypedCheck::Verified;
         }
         return TypedCheck::Unverified("the field already held this text");
     }
     TypedCheck::Incomplete { before: before_len, after: after_len, sent }
+}
+
+/// Whether everything in `after` besides the typed text was already in the
+/// field: typing at a caret keeps the text on either side of it, and typing
+/// over a selection keeps what was outside the selection. So the text before
+/// the typed text must start the old content and the text after it must end
+/// it. A field that could not be read before cannot be judged, and passes.
+fn explained(wanted: &str, before: Option<&str>, after: &str) -> bool {
+    let Some(before) = before else { return true };
+    after.match_indices(wanted).any(|(at, _)| {
+        let (lead, trail) = (&after[..at], &after[at + wanted.len()..]);
+        lead.len() + trail.len() <= before.len() && before.starts_with(lead) && before.ends_with(trail)
+    })
 }
 
 /// The sentence `type_text` returns. `sent` is the requested character count;
@@ -65,6 +85,9 @@ pub fn describe_typed(sent: usize, target: &str, check: &TypedCheck) -> String {
         TypedCheck::Verified => format!("typed {sent} characters{into} (read back: the field holds them)"),
         TypedCheck::Unverified(why) => format!(
             "sent {sent} characters as keystrokes{into}; not read back ({why}), so check the field if it matters"
+        ),
+        TypedCheck::Completed { before, after, .. } => format!(
+            "typed {sent} characters{into}, but the field now holds {after} characters (had {before}): text that was              not typed was added around them, as an autocomplete does (a browser address bar or a search box completing              the entry). Return would act on the completed value. Look at the field first: press Delete to drop a              selected completion, or use set_value to put exactly this text in it."
         ),
         TypedCheck::Incomplete { before, after, .. } => format!(
             "INCOMPLETE: sent {sent} characters as keystrokes{into}, but the field does not hold them — it has {after} \
@@ -107,6 +130,25 @@ mod tests {
         assert!(message.starts_with("INCOMPLETE: sent 242 characters"), "{message}");
         assert!(message.contains("it has 165 characters (had 0)"), "{message}");
         assert!(!message.contains("Long multiline"), "the field's content must not reach the message: {message}");
+    }
+
+    // #69: Chrome's address bar completes a typed URL to one it has visited.
+    #[test]
+    fn text_an_autocomplete_added_is_reported() {
+        let url = "https://fathom.video/calls/48213";
+        let old = "https://example.com/inbox";
+        let check = check_typed(url, Some(old), Some("https://fathom.video/calls/482137790"));
+        assert_eq!(check, TypedCheck::Completed { before: 25, after: 36, sent: 32 });
+        let message = describe_typed(32, "\"Fathom\" (chrome)", &check);
+        assert!(message.starts_with("typed 32 characters into \"Fathom\" (chrome), but the field now holds 36"), "{message}");
+        assert!(!message.contains("fathom.video"), "the field's content must not reach the message: {message}");
+        // Typed over the whole selection, nothing added: verified.
+        assert_eq!(check_typed(url, Some(old), Some(url)), TypedCheck::Verified);
+        // Typed at a caret in the middle, or over part of the text: the rest was there.
+        assert_eq!(check_typed("big ", Some("a cat"), Some("a big cat")), TypedCheck::Verified);
+        assert_eq!(check_typed("dog", Some("a cat sat"), Some("a dog sat")), TypedCheck::Verified);
+        // A field that could not be read before cannot be judged.
+        assert_eq!(check_typed(url, None, Some("https://fathom.video/calls/482137790")), TypedCheck::Verified);
     }
 
     #[test]

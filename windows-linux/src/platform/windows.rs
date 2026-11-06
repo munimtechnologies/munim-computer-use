@@ -1631,7 +1631,17 @@ fn await_typed(field: Option<&UIElement>, text: &str, before: Option<&str>, sett
     loop {
         let check = typed::check_typed(text, before, last.as_deref());
         match check {
-            typed::TypedCheck::Verified => return check,
+            // An autocomplete fills in right after the keystroke that set it
+            // off: look once more before calling the field exactly typed (#69).
+            typed::TypedCheck::Verified => {
+                std::thread::sleep(Duration::from_millis(80));
+                let late = read_field(field).map(|now| typed::check_typed(text, before, Some(&now)));
+                return match late {
+                    Some(completed @ typed::TypedCheck::Completed { .. }) => completed,
+                    _ => check,
+                };
+            }
+            typed::TypedCheck::Completed { .. } => return check,
             // Nothing waiting can change (a Tab in the text, say).
             typed::TypedCheck::Unverified(_) => return unverified(check),
             typed::TypedCheck::Incomplete { .. } if start.elapsed() >= budget => return check,
