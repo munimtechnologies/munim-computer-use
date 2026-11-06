@@ -3155,7 +3155,7 @@ func describeSelectTab(_ tabId: Int, _ payload: [String: Any]) -> String {
     }
     return "tab \(tabId) was NOT brought to front: the user is on one of their own tabs in that window, "
         + "so it stays in the background (browser_list_tabs still shows their tab as active). "
-        + "browser_snapshot, browser_click, browser_type and browser_press_key work on it as it is; "
+        + "browser_snapshot, browser_click, browser_type, browser_fill and browser_press_key work on it as it is; "
         + "pass bring_to_front=true to show it anyway, for example before native keyboard input or a screenshot"
 }
 
@@ -3402,21 +3402,58 @@ func toolBrowserType(_ args: [String: Any]) -> String {
     }
 }
 
+func toolBrowserFill(_ args: [String: Any]) -> String {
+    guard let tabId = args["tab_id"] as? Int else { return "error: missing required argument 'tab_id'" }
+    guard let index = args["index"] as? Int else { return "error: missing required argument 'index'" }
+    guard let text = args["text"] as? String else { return "error: missing required argument 'text'" }
+    let params: [String: Any] = ["tabId": tabId, "index": index, "text": text]
+    return bridgeText(browserSessionCall("fill", withReturnState(params, args), args: args)) { payload in
+        withPageAfter(describeFill(payload, tabId: tabId, count: text.count), payload)
+    }
+}
+
+/// What browser_fill left in the field: exactly the text, or what the page
+/// made of it, so a mask, a length limit or a page that refused is visible.
+func describeFill(_ payload: [String: Any], tabId: Int, count: Int) -> String {
+    let target = payload["target"] as? String ?? "the field"
+    var line = count == 0
+        ? "cleared \(target) in tab \(tabId)"
+        : "filled \(target) in tab \(tabId) with \(count) characters, replacing its value"
+    if payload["matches"] as? Bool == false {
+        let actual = payload["actualLength"] as? Int ?? 0
+        line += " — but the field now holds \(actual) characters that differ from the text"
+        if let value = payload["value"] as? String { line += ": \"\(value)\"" }
+        line += " (the page changed or limited what was entered)"
+    }
+    if let note = payload["note"] as? String { line += " — \(note)" }
+    return line
+}
+
 func toolBrowserPressKey(_ args: [String: Any]) -> String {
     guard let tabId = args["tab_id"] as? Int else { return "error: missing required argument 'tab_id'" }
     guard let key = args["key"] as? String else { return "error: missing required argument 'key'" }
-    return bridgeText(browserSessionCall("press", withReturnState(["tabId": tabId, "key": key], args), args: args)) { payload in
-        var line = "pressed \(key) in tab \(tabId)"
-        // Tab says where focus went, so the next type is not a guess.
-        if payload["handledByPage"] as? Bool == true {
-            line += " — the page handled it itself"
-        } else if let focused = payload["focused"] as? String {
-            line += " — focus is now on \(focused)"
-        }
-        // Backspace says when it could not check, or had to edit itself.
-        if let note = payload["note"] as? String { line += " — \(note)" }
-        return withPageAfter(line, payload)
+    var params: [String: Any] = ["tabId": tabId, "key": key]
+    if let modifiers = args["modifiers"] { params["modifiers"] = modifiers }
+    return bridgeText(browserSessionCall("press", withReturnState(params, args), args: args)) { payload in
+        withPageAfter(describePress(payload, tabId: tabId, key: key), payload)
     }
+}
+
+func describePress(_ payload: [String: Any], tabId: Int, key: String) -> String {
+    var line = "pressed \(payload["pressed"] as? String ?? key) in tab \(tabId)"
+    // Tab says where focus went, so the next type is not a guess.
+    if payload["handledByPage"] as? Bool == true {
+        line += " — the page handled it itself"
+    } else if let focused = payload["focused"] as? String {
+        line += " — focus is now on \(focused)"
+        if let selected = payload["selected"] as? Int, selected > 0 {
+            line += " with \(selected) character\(selected == 1 ? "" : "s") selected"
+        }
+    }
+    // Backspace says when it could not check or had to edit itself, and a
+    // shortcut says when it was sent as this platform's version of it.
+    if let note = payload["note"] as? String { line += " — \(note)" }
+    return line
 }
 
 func toolBrowserCloseAllTabs(_ args: [String: Any]) -> String {
@@ -3643,7 +3680,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "type_text",
-        "description": "Type literal text as keystrokes into the field that currently has focus, optionally focusing element_id first. Use it for short entries and for fields that reject set_value; use set_value to replace a long value in one step, and press_key for shortcuts or keys such as return and tab. Text is inserted at the caret without clearing what is already there. It does not take over the user's keyboard: on macOS and Windows the text goes to the app you are working in, not the window the user is typing in, so do not call activate_app first. Typing into password fields is refused by default (see COMPUTER_USE_ALLOW_SECURE_FIELD_INPUT).",
+        "description": "Type literal text as keystrokes into the field that currently has focus, optionally focusing element_id first. Use it for short entries and for fields that reject set_value; use set_value to replace a long value in one step, and press_key for shortcuts or keys such as return and tab. Never use it for a Chrome tab the agent works in (it goes to whichever Chrome window is in front, which can be the user's); use browser_type or browser_fill there. Text is inserted at the caret without clearing what is already there. It does not take over the user's keyboard: on macOS and Windows the text goes to the app you are working in, not the window the user is typing in, so do not call activate_app first. Typing into password fields is refused by default (see COMPUTER_USE_ALLOW_SECURE_FIELD_INPUT).",
         "inputSchema": [
             "type": "object",
             "properties": [
@@ -3676,7 +3713,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "press_key",
-        "description": "Press one named key, optionally with modifiers held, e.g. key='s' modifiers=['cmd'] to save or key='return' to submit. Use it for shortcuts and navigation keys; use type_text for literal text and browser_press_key inside the agent's Chrome tabs. The key goes to the app you are working in (the one you last clicked or focused); on macOS and Windows the user can keep typing elsewhere meanwhile, so call activate_app only when nothing has targeted the app yet. Shortcuts can close windows or delete content, so confirm the target before pressing.",
+        "description": "Press one named key, optionally with modifiers held, e.g. key='s' modifiers=['cmd'] to save or key='return' to submit. Use it for shortcuts and navigation keys; use type_text for literal text. Never use it for a Chrome tab the agent works in: it goes to whichever Chrome window is in front, which can be the user's; use browser_press_key, browser_type or browser_fill there. The key goes to the app you are working in (the one you last clicked or focused); on macOS and Windows the user can keep typing elsewhere meanwhile, so call activate_app only when nothing has targeted the app yet. Shortcuts can close windows or delete content, so confirm the target before pressing.",
         "inputSchema": [
             "type": "object",
             "properties": [
@@ -4333,7 +4370,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "browser_snapshot",
-        "description": "List the interactive elements (links, buttons, inputs) on the page in one of the agent's tabs, with the index each one has for browser_click, plus the page title and URL. Inputs show their type, such as input[password]. Works on a background tab, so the user can be looking at something else. Use it before every browser_click, because indices change when the page changes; use browser_read for the page's text. Read-only. Automatically scopes to the topmost visible dialog when one is open, excluding hidden/inert controls but retaining reachable offscreen controls. Results report scope, total and truncation. Continue with offset and limit on the same tab/session; indices stay global across pages of an unchanged UI. Snapshot again after UI changes.",
+        "description": "List the interactive elements (links, buttons, inputs, tabs, checkboxes, table and grid rows listed as row with their cell text, and other clickable elements) on the page in one of the agent's tabs, with the index each one has for browser_click, plus the page title and URL. Inputs show their type, such as input[password]. Works on a background tab, so the user can be looking at something else. Use it before every browser_click, because indices change when the page changes; use browser_read for the page's text. Read-only. Automatically scopes to the topmost visible dialog when one is open, excluding hidden/inert controls but retaining reachable offscreen controls. Results report scope, total and truncation. Continue with offset and limit on the same tab/session; indices stay global across pages of an unchanged UI. Snapshot again after UI changes.",
         "inputSchema": [
             "type": "object",
             "properties": [
@@ -4427,7 +4464,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "browser_click",
-        "description": "Click in one of the agent's tabs, either an element by its index from browser_snapshot (preferred) or a point given in page coordinates. Pass index or x and y, not both. Works on a background tab. A tab the click opens (a target=_blank link or a popup) becomes one of the agent's tabs; find it with browser_list_tabs. Use click for native app windows. A click can submit forms or follow links, so snapshot first.",
+        "description": "Click in one of the agent's tabs, either an element by its index from browser_snapshot (preferred) or a point given in page coordinates. Pass index or x and y, not both. Works on a background tab with real (trusted) mouse input, without selecting the tab or raising its window. A tab the click opens (a target=_blank link or a popup) becomes one of the agent's tabs; find it with browser_list_tabs. Use click for native app windows. A click can submit forms or follow links, so snapshot first.",
         "inputSchema": [
             "type": "object",
             "properties": [
@@ -4482,7 +4519,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "browser_type",
-        "description": "Type text into the field that currently has focus in one of the agent's tabs; browser_click the field first. Text is inserted at the caret without clearing existing content. Use browser_press_key for Enter, Tab, Escape or Backspace, and type_text for native apps.",
+        "description": "Type text into the field that currently has focus in one of the agent's tabs; browser_click the field first. Text is inserted at the caret without clearing existing content: to replace a field's whole value use browser_fill. Use browser_press_key for Enter, Tab, Backspace, arrows and shortcuts such as Cmd+A, and type_text for native apps. Never use the desktop press_key or type_text for a Chrome tab: those go to whichever Chrome window is in front, which can be the user's.",
         "inputSchema": [
             "type": "object",
             "properties": [
@@ -4524,6 +4561,57 @@ let toolDefs: [[String: Any]] = [
             "readOnlyHint": false,
             "destructiveHint": true,
             "idempotentHint": false,
+            "openWorldHint": false,
+        ],
+    ],
+    [
+        "name": "browser_fill",
+        "description": "Replace the whole value of a text field in one of the agent's tabs: focuses the element by its browser_snapshot index, selects everything in it and puts the text in through Chrome's own text input, so the page sees the same trusted input events as typing. Works on input, textarea and contenteditable fields, including inside web components (open shadow roots), in a background tab without selecting it or raising its window. Pass an empty string to clear the field. The reply says whether the field now holds exactly the text, and what it holds when the page changed or limited it (not for password fields). Use browser_type to add at the caret instead, and browser_request_credentials for passwords and codes. Never use the desktop press_key or type_text for a Chrome tab: those go to whichever Chrome window is in front, which can be the user's.",
+        "inputSchema": [
+            "type": "object",
+            "properties": [
+                "session_id": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session.",
+                ],
+                "tab_id": [
+                    "type": "integer",
+                    "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs",
+                ],
+                "index": [
+                    "type": "integer",
+                    "description": "Element index of the field from the latest browser_snapshot of this tab. An index naming a wrapper that holds exactly one field fills that field.",
+                ],
+                "text": [
+                    "type": "string",
+                    "description": "The field's new value, replacing everything in it. Empty clears the field.",
+                ],
+                "return_state": [
+                    "type": "boolean",
+                    "description": "Append a current snapshot and readiness status after acting. Without wait_for_selector, only a short pause and bounded navigation wait are used; SPA readiness is not guaranteed. Snapshot indices replace earlier ones. A timeout does not mean the action failed: re-observe with browser_snapshot before repeating it.",
+                ],
+                "wait_for_selector": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2000,
+                    "description": "Wait for any visible element matching this CSS selector in the page, including open shadow roots (web components); child frames are not searched, and a timeout says how many were visible. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI.",
+                ],
+                "wait_timeout_ms": [
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 10000,
+                    "description": "Bound for wait_for_selector in milliseconds (default 8000, maximum 10000; 0 checks once). Requires wait_for_selector. Timeout preserves action success and returns current state. Use browser_snapshot with the same wait to re-observe without repeating an action.",
+                ],
+            ],
+            "required": ["tab_id", "index", "text"],
+        ],
+        "annotations": [
+            "title": "Fill field in browser",
+            "readOnlyHint": false,
+            "destructiveHint": true,
+            "idempotentHint": true,
             "openWorldHint": false,
         ],
     ],
@@ -4583,7 +4671,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "browser_press_key",
-        "description": "Press Enter, Tab, Escape or Backspace in one of the agent's tabs, for example Enter to submit a form after browser_type. Only these four keys are supported; use browser_type for characters. Tab moves focus to the next field and says which element has it; it fails rather than leave focus where it was. Backspace checks the focused field changed and fails if it did not. Enter can submit forms and Backspace deletes, so check the page state with browser_snapshot first.",
+        "description": "Press a key in one of the agent's tabs, optionally with modifiers held: Enter to submit, Tab to move to the next field, Escape, Backspace, Delete, arrows, Home/End, PageUp/PageDown, F1-F12, a character, or a shortcut such as key='a' modifiers=['cmd'] to select all in the focused field. Works in a background tab: the key goes to that tab's page only, never to the user's windows, and browser shortcuts (close tab, quit) never reach Chrome itself. Editing shortcuts (select all, copy, cut, paste, undo) work with cmd or ctrl on every platform. The reply says where focus is and how many characters are selected. Tab fails rather than leave focus where it was, and Backspace checks the focused field changed. Use browser_type for text and browser_fill to replace a field's value. Never use the desktop press_key or type_text for a Chrome tab: those go to whichever Chrome window is in front, which can be the user's. Enter can submit forms and Backspace deletes, so check the page state with browser_snapshot first.",
         "inputSchema": [
             "type": "object",
             "properties": [
@@ -4599,8 +4687,18 @@ let toolDefs: [[String: Any]] = [
                 ],
                 "key": [
                     "type": "string",
-                    "enum": ["Enter", "Tab", "Escape", "Backspace"],
-                    "description": "Key to press",
+                    "minLength": 1,
+                    "maxLength": 40,
+                    "description": "Key to press: Enter, Tab, Escape, Backspace, Delete, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, Space, F1-F12 or a single character. A combination such as 'cmd+a' is accepted too.",
+                ],
+                "modifiers": [
+                    "type": "array",
+                    "items": [
+                        "type": "string",
+                        "enum": ["cmd", "ctrl", "alt", "shift"],
+                    ],
+                    "maxItems": 4,
+                    "description": "Modifier keys held during the press. cmd is Command on macOS and the Windows key elsewhere; for editing shortcuts cmd and ctrl mean the same on every platform.",
                 ],
                 "return_state": [
                     "type": "boolean",
@@ -4730,7 +4828,7 @@ func negotiatedProtocolVersion(_ params: [String: Any]) -> String {
 }
 
 /// Returned in the `initialize` result; identical in the Rust server.
-let serverInstructions = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Pass return_state on an action to get current state back in the same call. Use run_steps for several actions you already know, like click, type, press return: one call, stopping at the first that fails. For delayed browser UI, use wait_for_selector with return_state and inspect readiness; a loaded tab is not SPA readiness. A timeout does not undo the action: re-observe with browser_snapshot and the same wait before repeating a non-idempotent action. Use browser_read to read a page's text. Never ask for, or type, a password or code yourself: browser_request_credentials lets the user enter it without you seeing it. The user's Computer Use policy can block apps and sites or require their approval; when a call says so, do not work around it. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf."
+let serverInstructions = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. In a Chrome tab the agent works in, use browser_click, browser_type, browser_fill (to replace a field's value) and browser_press_key (keys and shortcuts such as cmd+a); they act on that tab in the background without bringing Chrome forward. Never use the desktop click, press_key or type_text on a Chrome tab: they go to whichever Chrome window is in front, which can be the user's. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Pass return_state on an action to get current state back in the same call. Use run_steps for several actions you already know, like click, type, press return: one call, stopping at the first that fails. For delayed browser UI, use wait_for_selector with return_state and inspect readiness; a loaded tab is not SPA readiness. A timeout does not undo the action: re-observe with browser_snapshot and the same wait before repeating a non-idempotent action. Use browser_read to read a page's text. Never ask for, or type, a password or code yourself: browser_request_credentials lets the user enter it without you seeing it. The user's Computer Use policy can block apps and sites or require their approval; when a call says so, do not work around it. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf."
 
 // MARK: - Clipboard
 
@@ -4838,6 +4936,7 @@ func dispatchTool(_ name: String, _ args: [String: Any]) -> String {
     case "browser_read": return toolBrowserRead(args)
     case "browser_click": return toolBrowserClick(args)
     case "browser_type": return toolBrowserType(args)
+    case "browser_fill": return toolBrowserFill(args)
     case "browser_request_credentials": return toolBrowserRequestCredentials(args)
     case "browser_press_key": return toolBrowserPressKey(args)
     case "browser_navigate": return toolBrowserNavigate(args)

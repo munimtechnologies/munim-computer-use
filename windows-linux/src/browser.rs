@@ -1039,7 +1039,7 @@ fn normalise(_command: &str, args: &Value) -> Value {
     if let Some(session) = args.get("session_id").filter(|v| !v.is_null()) {
         map.insert("sessionId".into(), session.clone());
     }
-    for key in ["url", "text", "key", "index", "x", "y", "all", "query", "offset", "limit", "fields", "reason"] {
+    for key in ["url", "text", "key", "modifiers", "index", "x", "y", "all", "query", "offset", "limit", "fields", "reason"] {
         if let Some(value) = args.get(key) {
             map.insert(key.into(), value.clone());
         }
@@ -1077,7 +1077,7 @@ fn describe_select(tab: i64, result: &Value) -> String {
         Some(false) => format!(
             "tab {tab} was NOT brought to front: the user is on one of their own tabs in that window, \
              so it stays in the background (browser_list_tabs still shows their tab as active). \
-             browser_snapshot, browser_click, browser_type and browser_press_key work on it as it is; \
+             browser_snapshot, browser_click, browser_type, browser_fill and browser_press_key work on it as it is; \
              pass bring_to_front=true to show it anyway, for example before native keyboard input or a screenshot"
         ),
         // An extension older than 0.9.3 does not report the outcome.
@@ -1186,18 +1186,30 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
                     "typed {} characters into tab {tab}",
                     args.get("text").and_then(Value::as_str).unwrap_or("").chars().count()
                 ),
+                "fill" => describe_fill(tab, result, args),
                 "press" => {
                     let mut line = format!(
                         "pressed {} in tab {tab}",
-                        args.get("key").and_then(Value::as_str).unwrap_or("?")
+                        result
+                            .get("pressed")
+                            .and_then(Value::as_str)
+                            .or_else(|| args.get("key").and_then(Value::as_str))
+                            .unwrap_or("?")
                     );
                     // Tab says where focus went, so the next type is not a guess.
                     if result.get("handledByPage").and_then(Value::as_bool) == Some(true) {
                         line.push_str(" — the page handled it itself");
                     } else if let Some(focused) = result.get("focused").and_then(Value::as_str) {
                         line.push_str(&format!(" — focus is now on {focused}"));
+                        if let Some(selected) = result.get("selected").and_then(Value::as_i64).filter(|n| *n > 0) {
+                            line.push_str(&format!(
+                                " with {selected} character{} selected",
+                                if selected == 1 { "" } else { "s" }
+                            ));
+                        }
                     }
-                    // Backspace says when it could not check, or had to edit itself.
+                    // Backspace says when it could not check or had to edit itself, and a
+                    // shortcut says when it was sent as this platform's version of it.
                     if let Some(note) = result.get("note").and_then(Value::as_str) {
                         line.push_str(&format!(" — {note}"));
                     }
@@ -1226,6 +1238,31 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
             }
         }
     }
+}
+
+/// What browser_fill left in the field: exactly the text, or what the page
+/// made of it, so a mask, a length limit or a page that refused is visible.
+/// Worded as the macOS server words it.
+fn describe_fill(tab: i64, result: &Value, args: &Value) -> String {
+    let target = result.get("target").and_then(Value::as_str).unwrap_or("the field");
+    let count = args.get("text").and_then(Value::as_str).unwrap_or("").chars().count();
+    let mut line = if count == 0 {
+        format!("cleared {target} in tab {tab}")
+    } else {
+        format!("filled {target} in tab {tab} with {count} characters, replacing its value")
+    };
+    if result.get("matches").and_then(Value::as_bool) == Some(false) {
+        let actual = result.get("actualLength").and_then(Value::as_i64).unwrap_or(0);
+        line.push_str(&format!(" — but the field now holds {actual} characters that differ from the text"));
+        if let Some(value) = result.get("value").and_then(Value::as_str) {
+            line.push_str(&format!(": \"{value}\""));
+        }
+        line.push_str(" (the page changed or limited what was entered)");
+    }
+    if let Some(note) = result.get("note").and_then(Value::as_str) {
+        line.push_str(&format!(" — {note}"));
+    }
+    line
 }
 
 /// Which element an indexed click pressed and how, so a click the page ignored
@@ -1909,6 +1946,36 @@ mod tests {
         assert!(rendered.contains("https://example.com"), "{rendered}");
         assert!(rendered.contains("tab_id=42"), "{rendered}");
         assert!(!rendered.contains("[]"), "empty url pair leaked: {rendered}");
+    }
+
+    #[test]
+    fn fill_and_key_presses_say_what_the_field_holds_and_what_was_sent() {
+        let args = json!({ "tab_id": 9, "index": 4, "text": "New words" });
+        assert_eq!(
+            describe("fill", &json!({ "target": "[4] textarea \"About\"", "matches": true }), &args),
+            "filled [4] textarea \"About\" in tab 9 with 9 characters, replacing its value"
+        );
+        let limited = describe(
+            "fill",
+            &json!({ "target": "[4] input", "matches": false, "actualLength": 3, "value": "New" }),
+            &args,
+        );
+        assert!(limited.contains("but the field now holds 3 characters that differ from the text: \"New\""), "{limited}");
+        assert_eq!(
+            describe("fill", &json!({ "target": "[4] input", "matches": true }), &json!({ "tab_id": 9, "text": "" })),
+            "cleared [4] input in tab 9"
+        );
+        let pressed = describe(
+            "press",
+            &json!({ "pressed": "Ctrl+A", "focused": "[4] textarea", "selected": 1612, "note": "sent Cmd+A as Ctrl+A" }),
+            &json!({ "tab_id": 9, "key": "a", "modifiers": ["cmd"] }),
+        );
+        assert_eq!(
+            pressed,
+            "pressed Ctrl+A in tab 9 — focus is now on [4] textarea with 1612 characters selected — sent Cmd+A as Ctrl+A"
+        );
+        let params = normalise("press", &json!({ "tab_id": 9, "key": "a", "modifiers": ["cmd"] }));
+        assert_eq!(params["modifiers"], json!(["cmd"]));
     }
 
     #[test]

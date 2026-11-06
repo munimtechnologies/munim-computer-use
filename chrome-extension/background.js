@@ -629,6 +629,23 @@ async function attach(tabId) {
   if (attached.has(tabId)) return;
   await chrome.debugger.attach({ tabId }, "1.3");
   attached.add(tabId);
+  // A tab Chrome is not showing gets no frames, and Chrome holds or drops the
+  // real input sent to it: a mouse press never lands, and keys reach the page
+  // without their editing action (select all, delete, caret moves). Focus
+  // emulation makes Chrome treat the tab as shown and focused for as long as
+  // this debugger session lasts, the way it renders a tab that is being
+  // captured. It does not select the tab, raise its window or take focus from
+  // the user's own tab; detaching (release, close, the user cancelling the
+  // debugging bar) ends it. A Chrome that refuses it still works through the
+  // page-event fallbacks.
+  try {
+    await withDeadline(
+      chrome.debugger.sendCommand({ tabId }, "Emulation.setFocusEmulationEnabled", { enabled: true }),
+      "Emulation.setFocusEmulationEnabled",
+    );
+  } catch {
+    // Older Chrome, or a session Chrome ended at once.
+  }
 }
 
 // Chrome ends a session on its own when the user cancels the "is debugging
@@ -806,7 +823,44 @@ const SNAPSHOT_JS = `((options = {}) => {
   const offset = options.offset ?? 0;
   const limit = options.limit ?? 250;
   const out = [];
-  const sel = 'a,button,input,textarea,select,cfc-select,mat-option,[role=button],[role=link],[role=textbox],[role=combobox],[role=listbox],[role=option],[role=menu],[role=menuitem],[aria-haspopup],[contenteditable=true],summary';
+  const sel = 'a,button,input,textarea,select,cfc-select,mat-option,[role=button],[role=link],[role=textbox],[role=combobox],[role=listbox],[role=option],[role=menu],[role=menuitem],[aria-haspopup],[contenteditable=true],summary,' +
+    '[role=tab],[role=checkbox],[role=radio],[role=switch],[role=treeitem],[role=menuitemcheckbox],[role=menuitemradio]';
+  // Table and grid rows are listed too, so a row in a list of users or orders
+  // can be found by its text and clicked. Rows built from custom elements
+  // (Angular Material, Play Console) carry role=row, plain tables have tr.
+  const rowSel = 'tr,[role=row]';
+  // A cell is listed only when it is a click target of its own: in an ARIA
+  // grid every cell has role=gridcell, and listing them all would bury the
+  // page's controls.
+  const cellSel = 'td,th,[role=gridcell],[role=cell],[role=rowheader],[role=columnheader]';
+  // Pages also make plain elements clickable with a handler and a pointer
+  // cursor: a custom-element row, a card, a list entry. The outermost element
+  // showing the pointer is the target (the cursor is inherited by everything
+  // inside it), and only when it has text to be found by.
+  const pointer = (el) => {
+    if (getComputedStyle(el).cursor !== 'pointer') return false;
+    const up = dom.parent(el);
+    return !(up instanceof Element) || getComputedStyle(up).cursor !== 'pointer';
+  };
+  // Something inside a listed control (the label span of a button) is that
+  // control's target already.
+  const inControl = (el) => {
+    for (let at = dom.parent(el); at instanceof Element; at = dom.parent(at)) if (at.matches(sel)) return true;
+    return false;
+  };
+  const plainTarget = (el) => (el.hasAttribute('onclick') || pointer(el)) && !inControl(el);
+  const listed = (el) => {
+    if (el.matches(sel + ',' + rowSel + ',iframe,frame')) return true;
+    if (el === document.body || el === document.documentElement) return false;
+    if (el.matches(cellSel)) return (el.tabIndex >= 0 && el.hasAttribute('tabindex')) || plainTarget(el);
+    return plainTarget(el);
+  };
+  const kindOf = (el) => {
+    if (el.matches(sel + ',iframe,frame')) return null;
+    if (el.matches(rowSel)) return 'row';
+    if (el.matches(cellSel)) return 'cell';
+    return 'clickable';
+  };
   let i = 0;
   const dom = (${pageDomInPage.toString()})();
   // Clear the previous snapshot's indices first. An element hidden since then
@@ -874,7 +928,7 @@ const SNAPSHOT_JS = `((options = {}) => {
   const floating = [];
   if (modal) {
     for (const owner of dom.queryAll(modal, '[aria-controls],[aria-owns]')) {
-      const ids = ((owner.getAttribute('aria-controls') || '') + ' ' + (owner.getAttribute('aria-owns') || '')).split(/\s+/);
+      const ids = ((owner.getAttribute('aria-controls') || '') + ' ' + (owner.getAttribute('aria-owns') || '')).split(/\\s+/);
       for (const id of ids) {
         const root = id && dom.byId(owner, id);
         if (root && !dom.contains(modal, root)) floating.push(root);
@@ -898,8 +952,15 @@ const SNAPSHOT_JS = `((options = {}) => {
     return !!hit && (hit === el || dom.contains(el, hit));
   };
   let frames = 0;
-  for (const el of dom.queryAll(document, sel + ',iframe,frame')) {
-    if (!inScope(el) || !visible(el)) continue;
+  // Rows and cells are labelled cell by cell, so "Ana | Admin | Active" reads
+  // as one row rather than run-together text.
+  const cellText = (el) => (el.innerText || '').split(/[\\t\\n]+/).map((part) => part.replace(/\\s+/g, ' ').trim()).filter(Boolean).join(' | ');
+  for (const el of dom.queryAll(document, '*')) {
+    if (!listed(el) || !inScope(el) || !visible(el)) continue;
+    const kind = kindOf(el);
+    // Rows, cells and plain click targets are only worth listing by their
+    // text: an empty spacer row or an icon-only wrapper is noise.
+    if (kind && !(el.getAttribute('aria-label') || '').trim() && !(el.innerText || '').trim()) continue;
     // A frame's controls are its own document's, which this does not search.
     // Count the ones big enough to hold a form, not tracking pixels or ads.
     if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
@@ -916,13 +977,15 @@ const SNAPSHOT_JS = `((options = {}) => {
     // A password field's value is the secret itself: never let it reach the
     // model as a label (browser_request_credentials fills these instead).
     const secret = el.tagName === 'INPUT' && el.type === 'password';
-    const label = (el.getAttribute('aria-label') || el.innerText || (secret ? '' : el.value) ||
-                   el.getAttribute('title') || el.getAttribute('placeholder') || '')
-                  .replace(/\\s+/g, ' ').trim().slice(0, 90);
-    const kind = el.tagName === 'INPUT' && el.type && el.type !== 'text' ? '[' + el.type + ']' : '';
+    const label = kind === 'row' || kind === 'cell'
+      ? (el.getAttribute('aria-label') || cellText(el)).replace(/\\s+/g, ' ').trim().slice(0, 160)
+      : (el.getAttribute('aria-label') || el.innerText || (secret ? '' : el.value) ||
+         el.getAttribute('title') || el.getAttribute('placeholder') || '')
+        .replace(/\\s+/g, ' ').trim().slice(0, 90);
+    const type = el.tagName === 'INPUT' && el.type && el.type !== 'text' ? '[' + el.type + ']' : '';
     out.push({
       i: index,
-      tag: el.tagName.toLowerCase() + kind,
+      tag: kind === 'row' || kind === 'cell' ? kind : el.tagName.toLowerCase() + (kind === 'clickable' ? '[clickable]' : type),
       label,
       x: Math.round(r.left + r.width / 2),
       y: Math.round(r.top + r.height / 2),
@@ -1314,13 +1377,15 @@ async function evaluateValue(tabId, expression, failure) {
 
 /// Click a snapshotted element.
 ///
-/// In a tab Chrome is showing, this is a real press through the DevTools input
-/// pipeline: trusted events, exactly as a person's mouse makes them. A
-/// background tab is not composited, so Chrome drops real input sent to it;
-/// there the press is played as page events on the node itself instead, which
-/// works whether or not the tab is rendered, the whole point of working in a
-/// tab the user is not looking at. `route` says which one ran, and `target`
-/// which element it was, so an ignored click can be told from a stale index.
+/// This is a real press through the DevTools input pipeline: trusted events,
+/// exactly as a person's mouse makes them. It works in a background tab too,
+/// because the debugger session emulates focus (see attach), which keeps the
+/// tab rendering without selecting it or raising its window; frameworks that
+/// ignore untrusted events (Angular Material buttons) respond to it. Only when
+/// real input cannot reach the element (Chrome would not emulate focus, or
+/// another element covers it) is the press played as page events on the node
+/// itself. `route` says which one ran, and `target` which element it was, so
+/// an ignored click can be told from a stale index.
 async function clickElement(tabId, index) {
   // The index is spliced into the scripts that run in the page, so only a
   // plain snapshot index may reach them: anything else would run as page script.
@@ -1523,21 +1588,262 @@ const EDIT_FINISH_JS = `(() => {
   return { checked: true, edited: false };
 })()`;
 
-async function pressKey(tabId, key) {
-  const map = {
-    Enter: { windowsVirtualKeyCode: 13, code: "Enter", key: "Enter", text: "\r" },
-    Tab: { windowsVirtualKeyCode: 9, code: "Tab", key: "Tab" },
-    Escape: { windowsVirtualKeyCode: 27, code: "Escape", key: "Escape" },
-    Backspace: { windowsVirtualKeyCode: 8, code: "Backspace", key: "Backspace" },
+// ── keys ────────────────────────────────────────────────────────────────────
+//
+// A key goes to the tab's own page through the DevTools input pipeline, never
+// to the OS: a desktop keystroke lands in whichever Chrome window is in front,
+// which can be the user's. Chrome keeps these events to the page (Cmd+W does
+// not close the tab, Cmd+Q does not quit), and focus emulation (see attach)
+// lets their editing action run in a tab the user is not looking at.
+
+const MODIFIER_BITS = { Alt: 1, Control: 2, Meta: 4, Shift: 8 };
+const MODIFIER_NAMES = {
+  alt: "Alt", option: "Alt", opt: "Alt",
+  ctrl: "Control", control: "Control",
+  cmd: "Meta", command: "Meta", meta: "Meta", super: "Meta", win: "Meta", windows: "Meta",
+  shift: "Shift",
+};
+/** Named keys: [windowsVirtualKeyCode, code, text]. */
+const NAMED_KEYS = {
+  Enter: [13, "Enter", "\r"], Tab: [9, "Tab"], Escape: [27, "Escape"], Backspace: [8, "Backspace"],
+  Delete: [46, "Delete"], Insert: [45, "Insert"], Home: [36, "Home"], End: [35, "End"],
+  PageUp: [33, "PageUp"], PageDown: [34, "PageDown"],
+  ArrowUp: [38, "ArrowUp"], ArrowDown: [40, "ArrowDown"], ArrowLeft: [37, "ArrowLeft"], ArrowRight: [39, "ArrowRight"],
+  " ": [32, "Space", " "],
+  ...Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`F${i + 1}`, [112 + i, `F${i + 1}`]])),
+};
+const KEY_ALIASES = {
+  return: "Enter", enter: "Enter", esc: "Escape", escape: "Escape", tab: "Tab", backspace: "Backspace",
+  delete: "Delete", del: "Delete", forwarddelete: "Delete", insert: "Insert", ins: "Insert",
+  home: "Home", end: "End", pageup: "PageUp", pgup: "PageUp", pagedown: "PageDown", pgdn: "PageDown",
+  up: "ArrowUp", down: "ArrowDown", left: "ArrowLeft", right: "ArrowRight",
+  arrowup: "ArrowUp", arrowdown: "ArrowDown", arrowleft: "ArrowLeft", arrowright: "ArrowRight",
+  space: " ", spacebar: " ",
+};
+/** US-layout punctuation: [windowsVirtualKeyCode, code]. */
+const PUNCTUATION = {
+  ";": [186, "Semicolon"], "=": [187, "Equal"], ",": [188, "Comma"], "-": [189, "Minus"], ".": [190, "Period"],
+  "/": [191, "Slash"], "`": [192, "Backquote"], "[": [219, "BracketLeft"], "\\": [220, "Backslash"],
+  "]": [221, "BracketRight"], "'": [222, "Quote"],
+};
+/** Shifted characters and the key they are typed on. */
+const SHIFTED = {
+  "!": "1", "@": "2", "#": "3", $: "4", "%": "5", "^": "6", "&": "7", "*": "8", "(": "9", ")": "0",
+  _: "-", "+": "=", "{": "[", "}": "]", "|": "\\", ":": ";", '"': "'", "<": ",", ">": ".", "?": "/", "~": "`",
+};
+/**
+ * On macOS a key's editing action comes from the Cocoa key bindings, which
+ * events sent through DevTools skip; without these commands Cmd+A selects
+ * nothing. Elsewhere Blink maps the keys itself. Home and End move within the
+ * line here, as they do on Windows and Linux, not scroll the page.
+ */
+const MAC_EDIT_COMMANDS = {
+  Backspace: "deleteBackward", "Shift+Backspace": "deleteBackward",
+  "Alt+Backspace": "deleteWordBackward", "Meta+Backspace": "deleteToBeginningOfLine",
+  Delete: "deleteForward", "Alt+Delete": "deleteWordForward", "Meta+Delete": "deleteToEndOfLine",
+  ArrowUp: "moveUp", ArrowDown: "moveDown", ArrowLeft: "moveLeft", ArrowRight: "moveRight",
+  "Shift+ArrowUp": "moveUpAndModifySelection", "Shift+ArrowDown": "moveDownAndModifySelection",
+  "Shift+ArrowLeft": "moveLeftAndModifySelection", "Shift+ArrowRight": "moveRightAndModifySelection",
+  "Alt+ArrowLeft": "moveWordLeft", "Alt+ArrowRight": "moveWordRight",
+  "Shift+Alt+ArrowLeft": "moveWordLeftAndModifySelection", "Shift+Alt+ArrowRight": "moveWordRightAndModifySelection",
+  "Meta+ArrowLeft": "moveToBeginningOfLine", "Meta+ArrowRight": "moveToEndOfLine",
+  "Shift+Meta+ArrowLeft": "moveToBeginningOfLineAndModifySelection",
+  "Shift+Meta+ArrowRight": "moveToEndOfLineAndModifySelection",
+  "Meta+ArrowUp": "moveToBeginningOfDocument", "Meta+ArrowDown": "moveToEndOfDocument",
+  "Shift+Meta+ArrowUp": "moveToBeginningOfDocumentAndModifySelection",
+  "Shift+Meta+ArrowDown": "moveToEndOfDocumentAndModifySelection",
+  Home: "moveToBeginningOfLine", End: "moveToEndOfLine",
+  "Shift+Home": "moveToBeginningOfLineAndModifySelection", "Shift+End": "moveToEndOfLineAndModifySelection",
+  "Meta+Home": "moveToBeginningOfDocument", "Meta+End": "moveToEndOfDocument",
+  "Shift+Meta+Home": "moveToBeginningOfDocumentAndModifySelection",
+  "Shift+Meta+End": "moveToEndOfDocumentAndModifySelection",
+  "Meta+KeyA": "selectAll", "Meta+KeyC": "copy", "Meta+KeyX": "cut", "Meta+KeyV": "paste",
+  "Meta+KeyZ": "undo", "Shift+Meta+KeyZ": "redo",
+};
+/** Shortcuts that use Cmd on macOS and Ctrl elsewhere. */
+const PRIMARY_SHORTCUT_KEYS = new Set(["KeyA", "KeyC", "KeyX", "KeyV", "KeyZ", "KeyY", "Home", "End"]);
+
+let macPlatform = null;
+async function isMacPlatform() {
+  if (macPlatform === null) {
+    try {
+      macPlatform = (await chrome.runtime.getPlatformInfo()).os === "mac";
+    } catch {
+      macPlatform = /mac/i.test(globalThis.navigator?.platform ?? "");
+    }
+  }
+  return macPlatform;
+}
+
+/**
+ * Work out the events for one key press: `key` is a key name ("Enter", "a",
+ * "ArrowLeft") or a combination ("cmd+a"), `modifiers` names held keys.
+ * Editing shortcuts are made to mean the same on every platform: Ctrl+A on a
+ * Mac and Cmd+A on Windows both select all, and the reply says so.
+ */
+function resolveKeyPress(rawKey, rawModifiers, mac) {
+  if (typeof rawKey !== "string" || !rawKey || rawKey.length > 40) {
+    throw new Error("key must be a key name such as Enter, a, ArrowLeft or Delete");
+  }
+  if (rawModifiers !== undefined && (!Array.isArray(rawModifiers) || rawModifiers.length > 4)) {
+    throw new Error("modifiers must be a list of up to four of cmd, ctrl, alt, shift");
+  }
+  const names = [...(rawModifiers ?? [])];
+  let keyName = rawKey;
+  // "cmd+a", "Ctrl+Shift+Z": the last part is the key ("cmd++" is Cmd with +).
+  if (rawKey.length > 1 && rawKey.includes("+")) {
+    const parts = rawKey.endsWith("++") ? [...rawKey.slice(0, -2).split("+"), "+"] : rawKey.split("+");
+    keyName = parts.pop();
+    names.push(...parts);
+  }
+  let bits = 0;
+  for (const name of names) {
+    const modifier = typeof name === "string" ? MODIFIER_NAMES[name.trim().toLowerCase()] : undefined;
+    if (!modifier) throw new Error(`unknown modifier ${JSON.stringify(name)} — use cmd, ctrl, alt or shift`);
+    bits |= MODIFIER_BITS[modifier];
+  }
+  let key;
+  let code;
+  let vk;
+  let text;
+  const named = NAMED_KEYS[keyName] ? keyName : KEY_ALIASES[keyName.toLowerCase()];
+  if (named !== undefined) {
+    key = named;
+    [vk, code, text] = NAMED_KEYS[named];
+  } else if ([...keyName].length === 1) {
+    const char = keyName;
+    const base = SHIFTED[char];
+    if (base) bits |= MODIFIER_BITS.Shift;
+    const plain = base ?? char;
+    if (/^[a-z]$/i.test(plain)) {
+      code = `Key${plain.toUpperCase()}`;
+      vk = plain.toUpperCase().charCodeAt(0);
+      // A capital letter is typed with Shift; a Shift press types a capital.
+      if (plain !== plain.toLowerCase()) bits |= MODIFIER_BITS.Shift;
+      key = bits & MODIFIER_BITS.Shift ? plain.toUpperCase() : plain.toLowerCase();
+    } else if (/^[0-9]$/.test(plain)) {
+      code = `Digit${plain}`;
+      vk = plain.charCodeAt(0);
+      key = char;
+    } else if (PUNCTUATION[plain]) {
+      [vk, code] = PUNCTUATION[plain];
+      key = char;
+    } else {
+      key = char;
+      vk = 0;
+      code = "";
+    }
+    text = key;
+  } else {
+    throw new Error(
+      `unknown key ${JSON.stringify(keyName)} — use a single character or one of Enter, Tab, Escape, Backspace, ` +
+        "Delete, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, Insert, Space, F1-F12",
+    );
+  }
+  const notes = [];
+  // The same editing shortcut on every platform.
+  if (PRIMARY_SHORTCUT_KEYS.has(code) && !(bits & MODIFIER_BITS.Alt)) {
+    const has = (name) => (bits & MODIFIER_BITS[name]) !== 0;
+    const label = (b) => comboLabel(b, key, code);
+    const asked = bits;
+    if (mac && has("Control") && !has("Meta")) {
+      bits = (bits & ~MODIFIER_BITS.Control) | MODIFIER_BITS.Meta;
+      // Redo is Cmd+Shift+Z on a Mac.
+      if (code === "KeyY") {
+        code = "KeyZ";
+        vk = 90;
+        bits |= MODIFIER_BITS.Shift;
+        key = "Z";
+      }
+    } else if (!mac && has("Meta") && !has("Control")) {
+      bits = (bits & ~MODIFIER_BITS.Meta) | MODIFIER_BITS.Control;
+    }
+    if (bits !== asked) notes.push(`sent ${label(asked)} as ${label(bits)}, the same shortcut on this ${mac ? "Mac" : "computer"}`);
+  }
+  // Ctrl, Cmd and Alt combinations type nothing; Shift does.
+  if (bits & (MODIFIER_BITS.Control | MODIFIER_BITS.Meta | MODIFIER_BITS.Alt)) text = undefined;
+  const lookup = [
+    bits & MODIFIER_BITS.Shift ? "Shift+" : "",
+    bits & MODIFIER_BITS.Alt ? "Alt+" : "",
+    bits & MODIFIER_BITS.Control ? "Control+" : "",
+    bits & MODIFIER_BITS.Meta ? "Meta+" : "",
+    code?.startsWith("Key") ? code : key,
+  ].join("");
+  const command = mac ? MAC_EDIT_COMMANDS[lookup] : undefined;
+  return {
+    key, code, vk, text, modifiers: bits,
+    commands: command ? [command] : [],
+    label: comboLabel(bits, key, code),
+    note: notes.join("; ") || null,
   };
-  const spec = map[key];
-  if (!spec) throw new Error(`unsupported key: ${key}`);
-  if (key === "Tab") await send(tabId, "Runtime.evaluate", { expression: TAB_PROBE_JS, returnByValue: true });
-  if (key === "Backspace") await send(tabId, "Runtime.evaluate", { expression: EDIT_PROBE_JS, returnByValue: true });
-  await send(tabId, "Input.dispatchKeyEvent", { type: "keyDown", ...spec });
-  await send(tabId, "Input.dispatchKeyEvent", { type: "keyUp", ...spec });
-  if (key === "Backspace") return finishBackspace(tabId);
-  if (key !== "Tab") return { pressed: key };
+}
+
+function comboLabel(bits, key, code) {
+  const parts = [];
+  if (bits & MODIFIER_BITS.Control) parts.push("Ctrl");
+  if (bits & MODIFIER_BITS.Alt) parts.push("Alt");
+  if (bits & MODIFIER_BITS.Shift) parts.push("Shift");
+  if (bits & MODIFIER_BITS.Meta) parts.push("Cmd");
+  const name = key === " " ? "Space" : code?.startsWith("Key") ? code.slice(3) : key;
+  return [...parts, name].join("+");
+}
+
+/// Send one resolved key press: down (with its text and editing command),
+/// then up.
+async function dispatchKey(tabId, press) {
+  const base = {
+    key: press.key, code: press.code, windowsVirtualKeyCode: press.vk, nativeVirtualKeyCode: press.vk,
+    modifiers: press.modifiers,
+  };
+  await send(tabId, "Input.dispatchKeyEvent", {
+    type: press.text ? "keyDown" : "rawKeyDown",
+    ...base,
+    ...(press.text ? { text: press.text, unmodifiedText: press.text } : {}),
+    ...(press.commands.length ? { commands: press.commands } : {}),
+  });
+  await send(tabId, "Input.dispatchKeyEvent", { type: "keyUp", ...base });
+}
+
+/// Where focus is after a key, and how much text is selected there: lengths
+/// only, never the text.
+const KEY_RESULT_JS = `(() => {
+  let el = document.activeElement;
+  while (el?.shadowRoot?.activeElement) el = el.shadowRoot.activeElement;
+  if (!el || el === document.body || el === document.documentElement) return { focused: null };
+  const label = el.getAttribute('aria-label') || el.labels?.[0]?.innerText || el.getAttribute('placeholder') ||
+    el.getAttribute('name') || el.getAttribute('title') ||
+    (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' ? '' : el.innerText) || el.id || '';
+  const index = el.getAttribute('data-cu-idx');
+  const focused = (index !== null ? '[' + index + '] ' : '') + el.tagName.toLowerCase() +
+    (label ? ' "' + String(label).trim().replace(/\\s+/g, ' ').slice(0, 60) + '"' : '');
+  let selected = null;
+  try {
+    if (typeof el.selectionStart === 'number') selected = Math.abs(el.selectionEnd - el.selectionStart);
+  } catch {}
+  if (selected === null && el.isContentEditable) {
+    const sel = (el.getRootNode().getSelection?.() || getSelection());
+    selected = sel ? sel.toString().length : null;
+  }
+  return { focused, selected };
+})()`;
+
+async function pressKey(tabId, rawKey, rawModifiers) {
+  const press = resolveKeyPress(rawKey, rawModifiers, await isMacPlatform());
+  const tab = press.key === "Tab" && press.modifiers === 0;
+  const backspace = press.key === "Backspace" && press.modifiers === 0;
+  if (tab) await send(tabId, "Runtime.evaluate", { expression: TAB_PROBE_JS, returnByValue: true });
+  if (backspace) await send(tabId, "Runtime.evaluate", { expression: EDIT_PROBE_JS, returnByValue: true });
+  await dispatchKey(tabId, press);
+  const pressed = { pressed: press.label, ...(press.note ? { note: press.note } : {}) };
+  if (backspace) return { ...(await finishBackspace(tabId)), pressed: press.label };
+  if (!tab) {
+    const after = await evaluateValue(tabId, KEY_RESULT_JS, "key press failed").catch(() => ({}));
+    return {
+      ...pressed,
+      ...(after.focused ? { focused: after.focused } : {}),
+      ...(Number.isInteger(after.selected) && after.selected > 0 ? { selected: after.selected } : {}),
+    };
+  }
   const res = await send(tabId, "Runtime.evaluate", { expression: TAB_FINISH_JS, returnByValue: true });
   const focus = res?.result?.value || {};
   // Reporting success when focus stayed put sent the next type into the wrong
@@ -1548,7 +1854,156 @@ async function pressKey(tabId, key) {
         "click the field you want with browser_click instead",
     );
   }
-  return { pressed: key, focused: focus.focused ?? null, handledByPage: focus.handled === true };
+  return { ...pressed, focused: focus.focused ?? null, handledByPage: focus.handled === true };
+}
+
+// ── replacing a field's value ───────────────────────────────────────────────
+
+/**
+ * The text field a snapshot index names, inside the page. A snapshot can list
+ * the wrapper around a field (a form-field component, a label) rather than
+ * the field itself; a wrapper holding exactly one field stands for it.
+ */
+function fillTargetInPage(index, dom) {
+  const found = dom.byIndex(index);
+  if (!found) return { reason: `element ${index} is no longer on the page — call browser_snapshot again` };
+  const textInput = (node) => node.tagName === "TEXTAREA" || (node.tagName === "INPUT" &&
+    !/^(button|checkbox|color|file|hidden|image|radio|range|reset|submit)$/.test(node.type));
+  const editable = (node) => textInput(node) || node.isContentEditable;
+  let el = found;
+  if (!editable(el)) {
+    const inner = dom.queryAll(el, "input,textarea,[contenteditable]").filter(editable)
+      .filter((node, _, all) => !all.some((other) => other !== node && other.contains(node)));
+    if (inner.length !== 1) {
+      return {
+        reason: `element ${index} is not a text field` +
+          (inner.length > 1 ? ` (it holds ${inner.length}; pass the index of one of them)` : ""),
+      };
+    }
+    el = inner[0];
+  }
+  // A contenteditable's editing host is its outermost editable ancestor.
+  let host = el;
+  if (!textInput(el)) {
+    for (let up = dom.parent(el); up instanceof Element && up.isContentEditable; up = dom.parent(up)) host = up;
+  }
+  return { el: host, field: textInput(host) };
+}
+
+/// Focus the field and select everything in it, so the text that follows
+/// replaces it. Remembers the old value on the element to tell, afterwards,
+/// whether anything reached it.
+const FILL_PREPARE_JS = (index) => `(() => {
+  const dom = (${pageDomInPage.toString()})();
+  const target = (${fillTargetInPage.toString()})(${index}, dom);
+  if (!target.el) return { ok: false, reason: target.reason };
+  const { el, field } = target;
+  if (el.disabled) return { ok: false, reason: 'element ${index} is disabled' };
+  if (field && el.readOnly) return { ok: false, reason: 'element ${index} is read-only' };
+  el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+  el.focus({ preventScroll: true });
+  let active = document.activeElement;
+  while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
+  if (active !== el && !(el.contains(active))) return { ok: false, reason: 'element ${index} would not take focus' };
+  const value = () => field ? el.value : el.innerText;
+  el.__cuFillBefore = value();
+  // Whether Chrome's input reaches the field at all. A page that receives it
+  // and refuses or reshapes it has decided; one it never reached has not.
+  el.__cuFillSeen?.done();
+  const seen = { reached: false };
+  const listener = (e) => { if (e.isTrusted && e.composedPath().includes(el)) seen.reached = true; };
+  addEventListener('beforeinput', listener, true);
+  seen.done = () => removeEventListener('beforeinput', listener, true);
+  el.__cuFillSeen = seen;
+  if (field) {
+    el.select();
+  } else {
+    const selection = el.getRootNode().getSelection?.() || getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+  const label = (el.getAttribute('aria-label') || el.labels?.[0]?.innerText || el.getAttribute('placeholder') ||
+    el.getAttribute('name') || '').replace(/\\s+/g, ' ').trim().slice(0, 60);
+  return {
+    ok: true,
+    tag: el.tagName.toLowerCase() + (el.tagName === 'INPUT' && el.type !== 'text' ? '[' + el.type + ']' : ''),
+    label,
+    secret: el.tagName === 'INPUT' && el.type === 'password',
+  };
+})()`;
+
+/// After the text went in: whether the field now holds exactly it. With
+/// `force`, a field Chrome's input never reached (no beforeinput at all) is
+/// set directly, with the input event a framework listens for; a page that
+/// got the input and refused or reshaped it is left as it decided. Only a non-secret value comes back, and only
+/// when it differs from what was asked for.
+const FILL_CHECK_JS = (index, expected, force) => `(() => {
+  const dom = (${pageDomInPage.toString()})();
+  const target = (${fillTargetInPage.toString()})(${index}, dom);
+  if (!target.el) return { ok: false, reason: target.reason };
+  const { el, field } = target;
+  const expected = ${JSON.stringify(expected)};
+  const value = () => field ? el.value : el.innerText;
+  // innerText renders block breaks and trailing newlines its own way.
+  const norm = (text) => field ? text : text.replace(/\\s+/g, ' ').trim();
+  const before = el.__cuFillBefore;
+  const reached = el.__cuFillSeen?.reached === true;
+  el.__cuFillSeen?.done();
+  delete el.__cuFillSeen;
+  delete el.__cuFillBefore;
+  let fallback = false;
+  if (${force} && norm(value()) !== norm(expected) && value() === before && !reached) {
+    if (field) {
+      const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value')?.set;
+      if (setter) setter.call(el, expected); else el.value = expected;
+    } else {
+      el.textContent = expected;
+    }
+    el.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertReplacementText', data: expected }));
+    fallback = true;
+  }
+  const now = value();
+  const matches = norm(now) === norm(expected);
+  const secret = el.tagName === 'INPUT' && el.type === 'password';
+  return {
+    ok: true, matches, fallback, unchanged: now === before && !reached, length: now.length,
+    ...(matches || secret ? {} : { value: now.slice(0, 300) }),
+  };
+})()`;
+
+/// Replace a field's whole value: focus it by its snapshot index, select all
+/// of it, then put the new text in through Chrome's own text input, so the
+/// page sees the beforeinput/input events of a person typing (trusted, like a
+/// paste over a selection). Works on input, textarea and contenteditable,
+/// including inside open shadow roots, in a background tab.
+async function fillElement(tabId, index, text) {
+  if (!Number.isInteger(index) || index < 0) {
+    throw new Error("index must be an element index from browser_snapshot");
+  }
+  if (typeof text !== "string") throw new Error("text is required (pass an empty string to clear the field)");
+  const found = await evaluateValue(tabId, FILL_PREPARE_JS(index), "fill failed");
+  if (!found.ok) throw new Error(found.reason || "fill failed");
+  if (text === "") {
+    // Nothing to insert: delete the selection the way a person would.
+    await dispatchKey(tabId, resolveKeyPress("Backspace", [], await isMacPlatform()));
+  } else {
+    await send(tabId, "Input.insertText", { text });
+  }
+  // When Chrome's input never reached the field (a Chrome that would not
+  // emulate focus, say), the check sets the value directly, once.
+  const check = await evaluateValue(tabId, FILL_CHECK_JS(index, text, true), "fill failed");
+  if (!check.ok) throw new Error(check.reason || "fill failed");
+  await markTab(tabId);
+  return {
+    filled: true,
+    target: describeTarget(index, found),
+    length: [...text].length,
+    matches: check.matches,
+    ...(check.fallback ? { note: "Chrome's text input did not reach the field, so the extension set its value directly" } : {}),
+    ...(check.matches ? {} : { actualLength: check.length, ...(typeof check.value === "string" ? { value: check.value } : {}) }),
+  };
 }
 
 async function finishBackspace(tabId) {
@@ -2334,7 +2789,15 @@ const handlers = {
     assertOwned(clientId, p.tabId);
     await checkTab(clientId, p.tabId, p.sites, "press keys in");
     noteAgentInput(clientId, p.tabId);
-    return withState(p, await pressKey(p.tabId, p.key));
+    return withState(p, await pressKey(p.tabId, p.key, p.modifiers));
+  },
+  fill: async (p) => {
+    validateReadiness(p, true);
+    const clientId = requireClientId(p);
+    assertOwned(clientId, p.tabId);
+    await checkTab(clientId, p.tabId, p.sites, "type in");
+    noteAgentInput(clientId, p.tabId);
+    return withState(p, await fillElement(p.tabId, p.index, p.text));
   },
   screenshot: async (p) => {
     const clientId = requireClientId(p);
