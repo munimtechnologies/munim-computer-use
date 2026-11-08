@@ -21,6 +21,7 @@
 //! the socket and owns the extension; later servers share it through the
 //! owner's `.rpc` endpoint, each with its own client id and tabs.
 
+use base64::Engine as _;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::path::PathBuf;
@@ -605,6 +606,29 @@ impl BrowserBridge {
 
     /// Dispatch a `browser_*` call. `command` has the `browser_` prefix stripped.
     pub fn call(&mut self, command: &str, args: &Value) -> Result<String, String> {
+        let command = if command == "press_key" { "press" } else { command };
+        let result = self.call_value(command, args)?;
+        Ok(describe(command, &result, args))
+    }
+
+    /// browser_screenshot: the tab as Chrome renders it, without selecting it,
+    /// raising its window or capturing the screen. The image's bytes, its MIME
+    /// type, and the caption (how an image pixel becomes a browser_click point).
+    pub fn screenshot(&mut self, args: &Value) -> Result<(Vec<u8>, String, String), String> {
+        let result = self.call_value("screenshot", args)?;
+        let tab = args.get("tab_id").and_then(Value::as_i64).unwrap_or(-1);
+        let bytes = result
+            .get("data")
+            .and_then(Value::as_str)
+            .filter(|data| !data.is_empty())
+            .and_then(|data| base64::engine::general_purpose::STANDARD.decode(data).ok())
+            .ok_or_else(|| format!("Chrome returned no image for tab {tab}"))?;
+        let mime = result.get("mimeType").and_then(Value::as_str).unwrap_or("image/png").to_string();
+        Ok((bytes, mime, describe_browser_screenshot(tab, &result)))
+    }
+
+    /// Send a `browser_*` call to the extension and return its raw reply.
+    fn call_value(&mut self, command: &str, args: &Value) -> Result<Value, String> {
         if let Some(session) = args.get("session_id") {
             if !session.as_str().is_some_and(|id| !id.trim().is_empty() && id.encode_utf16().count() <= 128) {
                 return Err("session_id must be a nonblank string of at most 128 characters".into());
@@ -619,7 +643,6 @@ impl BrowserBridge {
             return Err(self.hub.explain(command, args, CallError::Link(Link::NoHost)));
         }
 
-        let command = if command == "press_key" { "press" } else { command };
         let mut params = self.params_for(command, args)?;
         // The extension enforces the user's site rules, because only it knows
         // which page a tab is on at the moment of the action.
@@ -639,10 +662,8 @@ impl BrowserBridge {
                 .map_err(|error| error.to_string())?;
         }
         let timeout = call_timeout(command, args, policy.sites_ask());
-        let result = self
-            .dispatch_with_timeout(command, params, timeout)
-            .map_err(|error| self.hub.explain(command, args, error))?;
-        Ok(describe(command, &result, args))
+        self.dispatch_with_timeout(command, params, timeout)
+            .map_err(|error| self.hub.explain(command, args, error))
     }
 
     /// Build extension params, resolving 1-based `index` to an owned `tabId`
@@ -1044,7 +1065,7 @@ fn normalise(_command: &str, args: &Value) -> Value {
     if let Some(session) = args.get("session_id").filter(|v| !v.is_null()) {
         map.insert("sessionId".into(), session.clone());
     }
-    for key in ["url", "text", "key", "modifiers", "index", "x", "y", "all", "query", "offset", "limit", "fields", "reason", "paths", "action"] {
+    for key in ["url", "text", "key", "modifiers", "index", "x", "y", "all", "query", "offset", "limit", "fields", "reason", "paths", "action", "format", "quality"] {
         if let Some(value) = args.get(key) {
             map.insert(key.into(), value.clone());
         }
@@ -1058,6 +1079,7 @@ fn normalise(_command: &str, args: &Value) -> Value {
         ("bring_to_front", "bringToFront"),
         ("prompt_text", "promptText"),
         ("dialog_id", "dialogId"),
+        ("max_width", "maxWidth"),
     ] {
         if let Some(value) = args.get(from) {
             map.insert(to.into(), value.clone());
@@ -1084,8 +1106,9 @@ fn describe_select(tab: i64, result: &Value) -> String {
         Some(false) => format!(
             "tab {tab} was NOT brought to front: the user is on one of their own tabs in that window, \
              so it stays in the background (browser_list_tabs still shows their tab as active). \
-             browser_snapshot, browser_click, browser_type, browser_fill and browser_press_key work on it as it is; \
-             pass bring_to_front=true to show it anyway, for example before native keyboard input or a screenshot"
+             browser_snapshot, browser_read, browser_screenshot, browser_click, browser_type, browser_fill and browser_press_key \
+             work on it as it is, so leave the user on their tab; bring_to_front=true interrupts them and is only for native \
+             keyboard input that cannot work any other way"
         ),
         // An extension older than 0.9.3 does not report the outcome.
         None => format!(
@@ -1398,6 +1421,9 @@ fn describe_readiness(result: &Value) -> String {
     if let Some(selector) = readiness.get("selector").and_then(Value::as_str) {
         line.push_str(&format!(" selector={selector}"));
     }
+    if let Some(frame) = readiness.get("frame").and_then(Value::as_str) {
+        line.push_str(&format!(" in frame \"{frame}\""));
+    }
     if let Some(error) = readiness.get("error").and_then(Value::as_str) {
         line.push_str(&format!(" — {error}"));
     }
@@ -1417,8 +1443,42 @@ fn frames_phrase(frames: u64) -> String {
     if frames == 1 { "1 embedded frame".to_string() } else { format!("{frames} embedded frames") }
 }
 
-fn frames_note(frames: u64) -> String {
-    format!("note: {} on the page {} not searched — controls inside a frame are not listed here; take a screenshot to see them", frames_phrase(frames), if frames == 1 { "was" } else { "were" })
+/// Frames a snapshot could not search: Chrome would not reach them, or the
+/// user's site rules do not allow them (`blocked` of them). An extension older
+/// than this server searched no frame at all. Worded as the macOS server words it.
+fn frames_note(frames: u64, blocked: u64) -> String {
+    let rules = if blocked > 0 { format!(" ({blocked} of them not allowed by the user's site rules)") } else { String::new() };
+    format!(
+        "note: {} on the page {} not searched{rules} — controls inside {} not listed here; browser_screenshot shows the tab, frames included, without bringing it to front",
+        frames_phrase(frames),
+        if frames == 1 { "was" } else { "were" },
+        if frames == 1 { "it are" } else { "them are" }
+    )
+}
+
+/// browser_screenshot's caption: what was captured and how an image pixel
+/// becomes a browser_click point. Worded as the macOS server words it.
+fn describe_browser_screenshot(tab: i64, result: &Value) -> String {
+    let number = |key: &str| result.get(key).and_then(Value::as_f64);
+    let mut line = format!("tab {tab} as Chrome shows it, captured in the background");
+    match (number("width"), number("height"), number("cssWidth"), number("cssHeight")) {
+        (Some(width), Some(height), Some(css_width), Some(css_height)) if css_width > 0.0 => {
+            let ratio = format!("{:.3}", width / css_width);
+            line.push_str(&format!(
+                ": page {}×{} CSS px; image {}×{} px ({ratio} px per CSS px). To click something seen at image pixel (px, py): \
+                 browser_click x = px / {ratio}, y = py / {ratio}. Prefer an index from browser_snapshot when the target is listed there.",
+                css_width.round() as i64,
+                css_height.round() as i64,
+                width.round() as i64,
+                height.round() as i64
+            ));
+        }
+        _ => line.push_str(" (the Chrome extension is older than this server, so the image's scale is not reported — update it and reload it at chrome://extensions)."),
+    }
+    if let Some(note) = result.get("note").and_then(Value::as_str) {
+        line.push_str(&format!("\nnote: {note}"));
+    }
+    line
 }
 
 /// browser_read: the page text, and where to continue if it was cut off.
@@ -1443,6 +1503,12 @@ fn describe_read(result: &Value) -> String {
     // Why an empty page is empty: not drawn, or text hidden by CSS (#63).
     if let Some(note) = result.get("note").and_then(Value::as_str) {
         out.push_str(&format!("\nnote: {note}"));
+    }
+    if let Some(frames) = result.get("frames").and_then(Value::as_u64).filter(|&n| n > 0) {
+        out.push_str(&format!(
+            "\nnote: {} on the page could not be read (gone, or not allowed by the user's site rules) — browser_screenshot shows the tab, frames included, without bringing it to front",
+            frames_phrase(frames)
+        ));
     }
     if offset > 0 || end < total {
         out.push_str(&format!("\n\n… showing characters {offset}–{end} of {total}"));
@@ -1699,7 +1765,7 @@ fn describe_snapshot(result: &Value) -> String {
             }
         }
         if let Some(frames) = result.get("frames").and_then(Value::as_u64).filter(|&n| n > 0) {
-            lines.push(frames_note(frames));
+            lines.push(frames_note(frames, result.get("framesBlocked").and_then(Value::as_u64).unwrap_or(0)));
         }
         if let Some(empty) = result.get("empty").and_then(Value::as_str) {
             lines.push(format!("note: {empty}"));
@@ -1719,8 +1785,15 @@ fn describe_snapshot(result: &Value) -> String {
             .filter(|state| !state.is_empty())
             .map(|state| format!(" ({state})"))
             .unwrap_or_default();
+        // An element inside a frame says which one, so a chat's Send is not
+        // taken for the page's own.
+        let frame = element
+            .get("frame")
+            .and_then(Value::as_str)
+            .map(|frame| format!(" (in frame \"{frame}\")"))
+            .unwrap_or_default();
         lines.push(format!(
-            "  [{}] {}{}{state}{}",
+            "  [{}] {}{}{state}{frame}{}",
             element.get("i").and_then(Value::as_i64).unwrap_or(-1),
             element.get("tag").and_then(Value::as_str).unwrap_or("?"),
             if label.is_empty() {
@@ -1806,7 +1879,7 @@ pub fn run_native_host() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BrowserBridge, CallError, Hub, Link, call_timeout, check_upload_paths, describe, describe_snapshot, describe_tabs, drop_connection, normalise, route};
+    use super::{BrowserBridge, CallError, Hub, Link, call_timeout, check_upload_paths, describe, describe_browser_screenshot, describe_snapshot, describe_tabs, drop_connection, normalise, route};
     use std::time::Instant;
     use serde_json::json;
     use std::time::Duration;
@@ -2142,10 +2215,54 @@ mod tests {
     fn frames_the_extension_could_not_search_are_named() {
         let snapshot = describe("snapshot", &json!({ "title": "Profile", "elements": [], "total": 0, "frames": 2, "readiness": {
             "status": "timeout", "condition": "visible_selector", "selector": "[role=dialog]", "elapsedMs": 3000, "frames": 1 } }), &json!({}));
-        assert!(snapshot.contains("note: 2 embedded frames on the page were not searched"), "{snapshot}");
+        assert!(snapshot.contains("note: 2 embedded frames on the page were not searched — controls inside them are not listed here; browser_screenshot shows the tab"), "{snapshot}");
+        assert!(!snapshot.contains("take a screenshot"), "{snapshot}");
         assert!(snapshot.contains("selector=[role=dialog] — not searched: 1 embedded frame;"), "{snapshot}");
         let plain = describe("snapshot", &json!({ "title": "Profile", "elements": [], "total": 0, "frames": 0 }), &json!({}));
         assert!(!plain.contains("embedded frame"), "{plain}");
+    }
+
+    #[test]
+    fn elements_inside_frames_say_which_frame() {
+        let snapshot = describe(
+            "snapshot",
+            &json!({ "title": "Support", "url": "https://support.example/", "total": 2, "frames": 1, "framesBlocked": 1, "framesSearched": 1,
+                "elements": [
+                    { "i": 0, "tag": "button", "label": "Contact", "inView": true },
+                    { "i": 1, "tag": "button", "label": "Send", "frame": "Support Widget", "inView": true }
+                ],
+                "readiness": { "status": "met", "condition": "visible_selector", "selector": ".reply", "elapsedMs": 40, "frame": "Support Widget" } }),
+            &json!({}),
+        );
+        assert!(snapshot.contains("  [0] button \"Contact\"\n"), "{snapshot}");
+        assert!(snapshot.ends_with("  [1] button \"Send\" (in frame \"Support Widget\")"), "{snapshot}");
+        assert!(snapshot.contains("selector=.reply in frame \"Support Widget\";"), "{snapshot}");
+        assert!(snapshot.contains("1 embedded frame on the page was not searched (1 of them not allowed by the user's site rules)"), "{snapshot}");
+        let read = describe("read", &json!({ "title": "Support", "url": "u", "text": "Hi\n\n[frame \"Support Widget\"]\nHello", "total": 34, "frames": 2 }), &json!({}));
+        assert!(read.contains("[frame \"Support Widget\"]\nHello"), "{read}");
+        assert!(read.contains("note: 2 embedded frames on the page could not be read"), "{read}");
+    }
+
+    #[test]
+    fn a_browser_screenshot_says_how_to_click_what_it_shows() {
+        let caption = describe_browser_screenshot(
+            7,
+            &json!({ "width": 700, "height": 450, "cssWidth": 1400, "cssHeight": 900, "mimeType": "image/jpeg" }),
+        );
+        assert_eq!(
+            caption,
+            "tab 7 as Chrome shows it, captured in the background: page 1400×900 CSS px; image 700×450 px (0.500 px per CSS px). \
+             To click something seen at image pixel (px, py): browser_click x = px / 0.500, y = py / 0.500. \
+             Prefer an index from browser_snapshot when the target is listed there."
+        );
+        let old = describe_browser_screenshot(7, &json!({ "data": "aGk=" }));
+        assert!(old.contains("older than this server"), "{old}");
+    }
+
+    #[test]
+    fn screenshot_options_reach_the_extension_under_its_names() {
+        let params = normalise("screenshot", &json!({ "tab_id": 3, "format": "jpeg", "quality": 70, "max_width": 800, "session_id": "s" }));
+        assert_eq!(params, json!({ "tabId": 3, "format": "jpeg", "quality": 70, "maxWidth": 800, "sessionId": "s" }));
     }
 
     #[test]
@@ -2269,7 +2386,8 @@ mod tests {
         );
         let background = describe("select_tab", &json!({ "tabId": 9, "activated": false }), &tab);
         assert!(background.starts_with("tab 9 was NOT brought to front"), "{background}");
-        assert!(background.contains("bring_to_front=true"), "{background}");
+        assert!(background.contains("bring_to_front=true interrupts them"), "{background}");
+        assert!(background.contains("browser_screenshot"), "{background}");
         assert_eq!(
             describe("select_tab", &json!({ "tabId": 9, "activated": true, "windowFocused": true }), &tab),
             "tab 9 is reported active by Chrome and its window was brought to front; page rendering is not verified"

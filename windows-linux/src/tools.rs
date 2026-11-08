@@ -24,7 +24,7 @@ pub fn browser_control_enabled() -> bool {
 }
 
 /// Returned in the `initialize` result; identical in the Swift server.
-pub const SERVER_INSTRUCTIONS: &str = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. In a Chrome tab the agent works in, use browser_click, browser_type, browser_fill (to replace a field's value) and browser_press_key (keys and shortcuts such as cmd+a); they act on that tab in the background without bringing Chrome forward. Never use the desktop click, press_key or type_text on a Chrome tab: they go to whichever Chrome window is in front, which can be the user's. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Pass return_state on an action to get current state back in the same call. Use run_steps for several actions you already know, like click, type, press return: one call, stopping at the first that fails. For delayed browser UI, use wait_for_selector with return_state and inspect readiness; a loaded tab is not SPA readiness. A timeout does not undo the action: re-observe with browser_snapshot and the same wait before repeating a non-idempotent action. Use browser_read to read a page's text. When a page opens a JavaScript alert, confirm or prompt, browser_snapshot shows it and browser_handle_dialog answers it; browser_page_errors lists a page's exceptions, console errors and failed requests. Never ask for, or type, a password or code yourself: browser_request_credentials lets the user enter it without you seeing it. The user's Computer Use policy can block apps and sites or require their approval; when a call says so, do not work around it. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf.";
+pub const SERVER_INSTRUCTIONS: &str = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. In a Chrome tab the agent works in, use browser_click, browser_type, browser_fill (to replace a field's value) and browser_press_key (keys and shortcuts such as cmd+a); they act on that tab in the background without bringing Chrome forward. Never use the desktop click, press_key or type_text on a Chrome tab: they go to whichever Chrome window is in front, which can be the user's. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Pass return_state on an action to get current state back in the same call. Use run_steps for several actions you already know, like click, type, press return: one call, stopping at the first that fails. For delayed browser UI, use wait_for_selector with return_state and inspect readiness; a loaded tab is not SPA readiness. A timeout does not undo the action: re-observe with browser_snapshot and the same wait before repeating a non-idempotent action. Use browser_read to read a page's text and browser_screenshot to see an agent tab; both work while the tab stays in the background and include frames, so never bring a tab to front to look at it. When a page opens a JavaScript alert, confirm or prompt, browser_snapshot shows it and browser_handle_dialog answers it; browser_page_errors lists a page's exceptions, console errors and failed requests. Never ask for, or type, a password or code yourself: browser_request_credentials lets the user enter it without you seeing it. The user's Computer Use policy can block apps and sites or require their approval; when a call says so, do not work around it. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf.";
 
 pub fn tool_defs() -> Value {
     let Value::Array(defs) = all_tool_defs() else {
@@ -293,7 +293,7 @@ fn all_tool_defs() -> Value {
         },
         {
             "name": "screenshot",
-            "description": "Capture an app's largest window, or a whole display, as an image. The result text states the capture's screen origin and pixels-per-point so an image pixel can be converted into click or hover coordinates. Prefer get_app_state for interaction, which is cheaper and returns clickable element ids; use screenshot to verify an outcome or to see content the accessibility tree cannot describe (canvas, video, custom drawing), and zoom to read small text. Read-only; the captured window is not raised or focused.",
+            "description": "Capture an app's largest window, or a whole display, as an image. The result text states the capture's screen origin and pixels-per-point so an image pixel can be converted into click or hover coordinates. Prefer get_app_state for interaction, which is cheaper and returns clickable element ids; for a Chrome tab the agent works in, use browser_screenshot instead, which sees the tab without bringing it to front. Use screenshot to verify an outcome or to see content the accessibility tree cannot describe (canvas, video, custom drawing), and zoom to read small text. Read-only; the captured window is not raised or focused.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -784,7 +784,7 @@ fn all_tool_defs() -> Value {
         },
         {
             "name": "browser_select_tab",
-            "description": "Make one of the agent's tabs the visible one in its window, for example before native keyboard input or a screenshot. browser_snapshot, browser_click, browser_type and browser_press_key work on background tabs, so most tasks never need this. The agent's tabs live in the user's Chrome window, so by default the tab is only shown when the user is already looking at one of the agent's tabs; otherwise it stays in the background, the user keeps their tab, and the reply says it was not brought to front. Pass bring_to_front=true to show it and raise its window regardless; that takes the window from the user, so use it sparingly. The user's own tabs are never selected.",
+            "description": "Make one of the agent's tabs the visible one in its window. Rarely needed: browser_snapshot, browser_read, browser_screenshot, browser_click, browser_type, browser_fill and browser_press_key all work on a background tab, frames included, so the user can keep using their own tab. By default the tab is only shown when the user is already looking at one of the agent's tabs; otherwise it stays in the background, the user keeps their tab, and the reply says it was not brought to front. bring_to_front=true switches the user's window to this tab and raises it over whatever they are doing, which interrupts them: it is a last resort, only for native keyboard input or a desktop capture that cannot work any other way, never to look at a page (use browser_screenshot). The user's own tabs are never selected.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -800,7 +800,7 @@ fn all_tool_defs() -> Value {
                     },
                     "bring_to_front": {
                         "type": "boolean",
-                        "description": "Show the tab and raise its Chrome window even when the user is on one of their own tabs. Default false: the tab is only shown when the user is already on an agent tab."
+                        "description": "Show the tab and raise its Chrome window even when the user is on one of their own tabs. This interrupts the user; last resort only, never to look at the page (browser_screenshot does that in the background). Default false: the tab is only shown when the user is already on an agent tab."
                     },
                     "index": {
                         "type": "integer",
@@ -848,7 +848,7 @@ fn all_tool_defs() -> Value {
         },
         {
             "name": "browser_snapshot",
-            "description": "List the interactive elements (links, buttons, inputs, tabs, checkboxes, table and grid rows listed as row with their cell text, and other clickable elements) on the page in one of the agent's tabs, with the index each one has for browser_click, plus the page title and URL. Inputs show their type, such as input[password], and text the page lets you edit in place shows as [editable], such as span[editable] (click it, or browser_fill it); checkboxes, radios and switches are named by their label and show their state, such as (checked) or (unchecked, disabled). Works on a background tab, so the user can be looking at something else. Use it before every browser_click, because indices change when the page changes; use browser_read for the page's text. Read-only. Automatically scopes to the topmost visible dialog when one is open, naming it on a dialog: line, excluding hidden/inert controls but retaining reachable offscreen controls. Results report scope, total and truncation. Continue with offset and limit on the same tab/session; indices stay global across pages of an unchanged UI. Snapshot again after UI changes. While the page has a JavaScript dialog open (alert, confirm, prompt), the snapshot shows the dialog's type, message and dialog_id instead, for browser_handle_dialog.",
+            "description": "List the interactive elements (links, buttons, inputs, tabs, checkboxes, table and grid rows listed as row with their cell text, and other clickable elements) on the page in one of the agent's tabs, with the index each one has for browser_click, plus the page title and URL. Inputs show their type, such as input[password], and text the page lets you edit in place shows as [editable], such as span[editable] (click it, or browser_fill it); checkboxes, radios and switches are named by their label and show their state, such as (checked) or (unchecked, disabled). Controls inside frames (iframes), such as an embedded support chat, payment form or sign-in box, are listed after the page's own, each marked with the frame it is in; their indices work with browser_click, browser_fill and browser_upload_file like any other. Works on a background tab, so the user can be looking at something else. Use it before every browser_click, because indices change when the page changes; use browser_read for the page's text. Read-only. Automatically scopes to the topmost visible dialog when one is open, naming it on a dialog: line, excluding hidden/inert controls but retaining reachable offscreen controls. Results report scope, total and truncation. Continue with offset and limit on the same tab/session; indices stay global across pages of an unchanged UI. Snapshot again after UI changes. While the page has a JavaScript dialog open (alert, confirm, prompt), the snapshot shows the dialog's type, message and dialog_id instead, for browser_handle_dialog.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -878,7 +878,7 @@ fn all_tool_defs() -> Value {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 2000,
-                        "description": "Wait for any visible element matching this CSS selector in the page, including open shadow roots (web components); child frames are not searched, and a timeout says how many were visible. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
+                        "description": "Wait for any visible element matching this CSS selector in the page or any of its frames (iframes), including open shadow roots (web components); a timeout says how many frames could not be searched. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
                     },
                     "wait_timeout_ms": {
                         "type": "integer",
@@ -899,7 +899,7 @@ fn all_tool_defs() -> Value {
         },
         {
             "name": "browser_read",
-            "description": "Read the text of the page in one of the agent's tabs: headings marked with #, then paragraphs, lists and table text in reading order, including content scrolled out of view. Use it to read an article, results or documentation; use browser_snapshot to find something to click. Works on a background tab. Long pages come back in chunks: the result says where it stopped, and offset continues from there. Read-only.",
+            "description": "Read the text of the page in one of the agent's tabs: headings marked with #, then paragraphs, lists and table text in reading order, including content scrolled out of view. Text inside frames (an embedded chat, a form from another site) follows the page's, each under a [frame \"name\"] line. Use it to read an article, results or documentation; use browser_snapshot to find something to click. Works on a background tab. Long pages come back in chunks: the result says where it stopped, and offset continues from there. Read-only.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -941,6 +941,48 @@ fn all_tool_defs() -> Value {
             }
         },
         {
+            "name": "browser_screenshot",
+            "description": "See one of the agent's tabs as an image while it stays in the background: the visible part of the page as Chrome renders it for that tab alone, frames included (an embedded chat, a payment form, a canvas or video). The tab is not selected, its window is not raised and the screen is not captured, so the user keeps working in their own tab; never bring a tab to front to look at it. Use it to check a result or to see what browser_snapshot and browser_read cannot describe. The result text gives the page's size in CSS pixels and how to turn an image pixel into browser_click x and y. Read-only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session."
+                    },
+                    "tab_id": {
+                        "type": "integer",
+                        "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs"
+                    },
+                    "max_width": {
+                        "type": "integer",
+                        "description": "Downscale the image to this width in pixels (default 1400). Lower it to save tokens."
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["png", "jpeg"],
+                        "description": "Image encoding (default png). jpeg is smaller."
+                    },
+                    "quality": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "description": "JPEG quality from 1 to 100 (default 55). Ignored for png. Raise it when small text must stay sharp."
+                    }
+                },
+                "required": ["tab_id"]
+            },
+            "annotations": {
+                "title": "Screenshot browser tab",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true
+            }
+        },
+        {
             "name": "browser_page_errors",
             "description": "List the problems the page in one of the agent's tabs has reported: uncaught JavaScript exceptions and console errors the page has logged since it loaded (Chrome keeps a limited number), and requests that failed since the agent attached to the tab (network errors and HTTP status 400 or above), oldest first, with how long ago each happened. Use it when a page is empty, broken or ignores an action, before navigating again or assuming a sign-in problem. The reply says when watching for failed requests began; ones Chrome still held from before are marked as earlier. Exceptions and console errors are read from what Chrome keeps for the page during this call only, so the page is not watched for them in between. The latest 50 are listed. URLs are shown without query strings, fragments or credentials, and request headers, cookies and bodies are never read. Read-only: it does not reload, navigate or show the tab.",
             "inputSchema": {
@@ -969,7 +1011,7 @@ fn all_tool_defs() -> Value {
         },
         {
             "name": "browser_click",
-            "description": "Click in one of the agent's tabs, either an element by its index from browser_snapshot (preferred) or a point given in page coordinates. Pass index or x and y, not both. Works on a background tab with real (trusted) mouse input, without selecting the tab or raising its window. An element out of view is scrolled into view first; when something else covers it (a banner, a dialog, another control) nothing is pressed and the call fails, naming what is in front. A checkbox, radio or switch reports what it is now. A tab the click opens (a target=_blank link or a popup) becomes one of the agent's tabs; find it with browser_list_tabs. Use click for native app windows. A click can submit forms or follow links, so snapshot first.",
+            "description": "Click in one of the agent's tabs, either an element by its index from browser_snapshot (preferred) or a point given in page coordinates. Pass index or x and y, not both; an index can name an element inside a frame, which is pressed at its place on the page. Works on a background tab with real (trusted) mouse input, without selecting the tab or raising its window. An element out of view is scrolled into view first; when something else covers it (a banner, a dialog, another control) nothing is pressed and the call fails, naming what is in front. A checkbox, radio or switch reports what it is now. A tab the click opens (a target=_blank link or a popup) becomes one of the agent's tabs; find it with browser_list_tabs. Use click for native app windows. A click can submit forms or follow links, so snapshot first.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1003,7 +1045,7 @@ fn all_tool_defs() -> Value {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 2000,
-                        "description": "Wait for any visible element matching this CSS selector in the page, including open shadow roots (web components); child frames are not searched, and a timeout says how many were visible. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
+                        "description": "Wait for any visible element matching this CSS selector in the page or any of its frames (iframes), including open shadow roots (web components); a timeout says how many frames could not be searched. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
                     },
                     "wait_timeout_ms": {
                         "type": "integer",
@@ -1050,7 +1092,7 @@ fn all_tool_defs() -> Value {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 2000,
-                        "description": "Wait for any visible element matching this CSS selector in the page, including open shadow roots (web components); child frames are not searched, and a timeout says how many were visible. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
+                        "description": "Wait for any visible element matching this CSS selector in the page or any of its frames (iframes), including open shadow roots (web components); a timeout says how many frames could not be searched. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
                     },
                     "wait_timeout_ms": {
                         "type": "integer",
@@ -1101,7 +1143,7 @@ fn all_tool_defs() -> Value {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 2000,
-                        "description": "Wait for any visible element matching this CSS selector in the page, including open shadow roots (web components); child frames are not searched, and a timeout says how many were visible. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
+                        "description": "Wait for any visible element matching this CSS selector in the page or any of its frames (iframes), including open shadow roots (web components); a timeout says how many frames could not be searched. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
                     },
                     "wait_timeout_ms": {
                         "type": "integer",
@@ -1157,7 +1199,7 @@ fn all_tool_defs() -> Value {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 2000,
-                        "description": "Wait for any visible element matching this CSS selector in the page, including open shadow roots (web components); child frames are not searched, and a timeout says how many were visible. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
+                        "description": "Wait for any visible element matching this CSS selector in the page or any of its frames (iframes), including open shadow roots (web components); a timeout says how many frames could not be searched. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
                     },
                     "wait_timeout_ms": {
                         "type": "integer",
@@ -1269,7 +1311,7 @@ fn all_tool_defs() -> Value {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 2000,
-                        "description": "Wait for any visible element matching this CSS selector in the page, including open shadow roots (web components); child frames are not searched, and a timeout says how many were visible. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
+                        "description": "Wait for any visible element matching this CSS selector in the page or any of its frames (iframes), including open shadow roots (web components); a timeout says how many frames could not be searched. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
                     },
                     "wait_timeout_ms": {
                         "type": "integer",
@@ -1378,7 +1420,7 @@ fn all_tool_defs() -> Value {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 2000,
-                        "description": "Wait for any visible element matching this CSS selector in the page, including open shadow roots (web components); child frames are not searched, and a timeout says how many were visible. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
+                        "description": "Wait for any visible element matching this CSS selector in the page or any of its frames (iframes), including open shadow roots (web components); a timeout says how many frames could not be searched. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
                     },
                     "wait_timeout_ms": {
                         "type": "integer",
@@ -1404,7 +1446,7 @@ fn all_tool_defs() -> Value {
 mod tests {
     use super::{all_tool_defs, tool_defs};
 
-    /// The macOS server advertises exactly these 37 tools. Drifting apart would
+    /// The macOS server advertises exactly these 38 tools. Drifting apart would
     /// silently give a model different capabilities per platform.
     #[test]
     fn advertises_the_macos_tool_surface() {
@@ -1416,7 +1458,7 @@ mod tests {
             .map(|tool| tool["name"].as_str().expect("tool has a name"))
             .collect();
 
-        assert_eq!(names.len(), 37, "tool count drifted from the macOS server");
+        assert_eq!(names.len(), 38, "tool count drifted from the macOS server");
         for expected in [
             "list_apps",
             "get_app_state",
@@ -1445,6 +1487,7 @@ mod tests {
             "browser_close_tab",
             "browser_snapshot",
             "browser_read",
+            "browser_screenshot",
             "browser_page_errors",
             "browser_click",
             "browser_type",
@@ -1458,6 +1501,45 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
+    }
+
+    /// An agent that cannot see a background tab brings it to front, taking
+    /// the user's window. Seeing and reading a tab must never need that.
+    #[test]
+    fn looking_at_a_tab_never_needs_it_in_front() {
+        let defs = all_tool_defs();
+        let tool = |name: &str| {
+            defs.as_array()
+                .expect("tool defs are an array")
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("no tool {name}"))
+                .clone()
+        };
+        let shot = tool("browser_screenshot");
+        assert_eq!(shot["annotations"]["readOnlyHint"], true);
+        assert_eq!(shot["inputSchema"]["required"], serde_json::json!(["tab_id"]));
+        for key in ["tab_id", "session_id", "max_width", "format", "quality"] {
+            assert!(shot["inputSchema"]["properties"][key].is_object(), "browser_screenshot has no {key}");
+        }
+        let description = shot["description"].as_str().unwrap_or_default();
+        assert!(description.contains("frames included") && description.contains("not selected"), "{description}");
+        let select = tool("browser_select_tab");
+        let description = select["description"].as_str().unwrap_or_default();
+        assert!(description.contains("last resort") && description.contains("browser_screenshot"), "{description}");
+        let bring = select["inputSchema"]["properties"]["bring_to_front"]["description"].as_str().unwrap_or_default();
+        assert!(bring.contains("interrupts the user"), "{bring}");
+        for name in ["browser_snapshot", "browser_read"] {
+            let description = tool(name)["description"].as_str().unwrap_or_default().to_string();
+            assert!(description.contains("frame"), "{name}: {description}");
+        }
+        let wait = tool("browser_click")["inputSchema"]["properties"]["wait_for_selector"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(!wait.contains("child frames are not searched"), "{wait}");
+        assert!(!super::SERVER_INSTRUCTIONS.contains("take a screenshot"));
+        assert!(super::SERVER_INSTRUCTIONS.contains("never bring a tab to front to look at it"));
     }
 
     #[test]
