@@ -495,6 +495,11 @@ try {
         try { return { result: { value: await evaluate(params.expression) } }; }
         catch (error) { return { exceptionDetails: { text: error.message } }; }
       },
+      // This page has no frames: everything is evaluated in the page itself,
+      // and no frame session exists (the frame helpers live outside the slice).
+      evaluateIn: (tabId, _frame, params) => context.send(tabId, "Runtime.evaluate", params),
+      childSessions: new Map(),
+      frameIndexes: new Map(),
     });
     vm.runInContext(
       between(start, "async function clickAt") +
