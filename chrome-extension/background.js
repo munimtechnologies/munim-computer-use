@@ -648,6 +648,7 @@ async function attach(tabId) {
   } catch {
     // Older Chrome, or a session Chrome ended at once.
   }
+  await watchFrames(tabId);
   await watchPage(tabId);
   // A page that loaded while Chrome was not drawing it has done no frame work
   // yet. Web-component apps (Stencil, which Fathom uses) keep every component
@@ -705,9 +706,321 @@ async function redraw(tabId) {
 // Forget it, so the next command attaches again instead of failing forever.
 chrome.debugger.onDetach.addListener((source) => {
   if (source.tabId === undefined) return;
+  if (source.sessionId) {
+    childSessions.get(source.tabId)?.delete(source.sessionId);
+    return;
+  }
   attached.delete(source.tabId);
   forgetPage(source.tabId);
+  forgetFrames(source.tabId);
 });
+
+// ── frames ──────────────────────────────────────────────────────────────────
+//
+// A page's controls and text can live in frames: a support chat, a payment
+// form or a sign-in box embedded from another site. Each frame is its own
+// document, so nothing evaluated in the page reaches into it. Two kinds:
+//
+//   - A frame from the same site runs in the page's renderer. It is in the
+//     tab's own Page.getFrameTree, and Page.createIsolatedWorld gives an
+//     execution context in it without turning Runtime on (see the note on
+//     Runtime under "JavaScript dialogs and page problems"). The world is
+//     named, so Chrome hands back the same one every time.
+//   - A frame from another site runs in a renderer of its own (an out-of-
+//     process iframe). Target.setAutoAttach with flatten gives the debugger a
+//     session for each, addressed as { tabId, sessionId }; it evaluates in that
+//     frame's document by default, and frames nested in it from its own site
+//     are reached through isolated worlds in that session again.
+//
+// Input never goes to a frame's session. Mouse events are sent to the tab at
+// page coordinates and Chrome routes them by hit test, keys and text go to
+// whichever frame has focus, the same way a person's input does. So an
+// element's position in a frame is its position in the frame's document plus
+// the frame's own place in its parent, all the way up.
+//
+// Indices stay plain numbers. A snapshot numbers the page's elements first,
+// then each frame's in document order, and remembers which frame holds which
+// range, so browser_click, browser_fill and browser_upload_file act in the
+// right document.
+
+/** tabId → sessionId → { targetId, parent: the session holding its parent frame (undefined = the tab), url }. */
+const childSessions = new Map();
+/** tabId → Set of promises for child sessions still being set up. */
+const childSetups = new Map();
+/** tabId → [{ start, end, frame }]: which frame holds which snapshot indices. */
+const frameIndexes = new Map();
+/** Isolated world the extension's scripts run in inside same-site frames. */
+const FRAME_WORLD = "munim-computer-use";
+/** Most frames one call searches; pages with dozens of ad frames stop here. */
+const FRAME_LIMIT = 40;
+
+function debuggee(tabId, session) {
+  return session ? { tabId, sessionId: session } : { tabId };
+}
+
+/// Ask Chrome for a session per out-of-process frame, now and as frames come.
+/// Only iframes: workers and the like are not pages the agent reads. A Chrome
+/// that refuses still works on the page itself and its same-site frames.
+async function watchFrames(tabId) {
+  childSessions.set(tabId, new Map());
+  // chrome.debugger addresses a child session from Chrome 125 on. An older
+  // Chrome would ignore the sessionId and run a frame's scripts in the page.
+  if (chromeMajor() < 125) return;
+  try {
+    await withDeadline(
+      chrome.debugger.sendCommand({ tabId }, "Target.setAutoAttach", {
+        autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe" }],
+      }),
+      "Target.setAutoAttach",
+      WATCH_TIMEOUT_MS,
+    );
+  } catch {
+    // Older Chrome: frames from other sites stay out of reach.
+  }
+}
+
+function chromeMajor() {
+  const match = /Chrom(?:e|ium)\/(\d+)/.exec(globalThis.navigator?.userAgent ?? "");
+  return match ? Number(match[1]) : 0;
+}
+
+function forgetFrames(tabId) {
+  childSessions.delete(tabId);
+  childSetups.delete(tabId);
+  frameIndexes.delete(tabId);
+}
+
+/// A frame from another site got its own session. Set it up the way the tab
+/// is: treated as shown and focused, and watching for frames nested in it.
+function adoptChildSession(tabId, parent, params) {
+  const sessions = childSessions.get(tabId);
+  if (!sessions || params?.targetInfo?.type !== "iframe") return;
+  const session = params.sessionId;
+  sessions.set(session, { targetId: params.targetInfo.targetId, parent, url: params.targetInfo.url || "" });
+  const target = { tabId, sessionId: session };
+  const setup = Promise.all([
+    withDeadline(chrome.debugger.sendCommand(target, "Emulation.setFocusEmulationEnabled", { enabled: true }),
+      "Emulation.setFocusEmulationEnabled", WATCH_TIMEOUT_MS).catch(() => {}),
+    withDeadline(chrome.debugger.sendCommand(target, "Target.setAutoAttach", {
+      autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe" }],
+    }), "Target.setAutoAttach", WATCH_TIMEOUT_MS).catch(() => {}),
+  ]);
+  if (!childSetups.has(tabId)) childSetups.set(tabId, new Set());
+  const pending = childSetups.get(tabId);
+  pending.add(setup);
+  void setup.finally(() => pending.delete(setup));
+}
+
+function onTargetEvent(source, method, params) {
+  const sessions = childSessions.get(source.tabId);
+  if (!sessions) return;
+  if (method === "Target.attachedToTarget") {
+    adoptChildSession(source.tabId, source.sessionId, params);
+  } else if (method === "Target.detachedFromTarget") {
+    sessions.delete(params?.sessionId);
+  } else if (method === "Target.targetInfoChanged") {
+    for (const info of sessions.values()) {
+      if (info.targetId === params?.targetInfo?.targetId) info.url = params.targetInfo.url || info.url;
+    }
+  }
+}
+
+/**
+ * Every document in the tab, the page first, then its frames depth first in
+ * document order: { id, session, world, parentId, parentSession, depth }. A
+ * same-site frame is evaluated in the isolated world (`world`), an out-of-
+ * process one in its session's own document. Frames whose documents cannot be
+ * listed (a session Chrome is tearing down) are left out.
+ */
+async function tabFrames(tabId) {
+  await withDeadline(attach(tabId), "attaching to the tab");
+  await Promise.allSettled([...(childSetups.get(tabId) ?? [])]);
+  const byId = new Map();
+  const children = new Map();
+  const add = (node, session, isRoot) => {
+    const frame = node.frame;
+    byId.set(frame.id, {
+      id: frame.id, session, world: !isRoot, parentId: frame.parentId ?? null,
+      // A same-site frame's parent is in the same session; the root of an
+      // out-of-process frame's session has its parent in the session above.
+      parentSession: isRoot ? childSessions.get(tabId)?.get(session)?.parent : session,
+      url: frame.url || "",
+    });
+    if (frame.parentId) {
+      if (!children.has(frame.parentId)) children.set(frame.parentId, []);
+      children.get(frame.parentId).push(frame.id);
+    }
+    for (const child of node.childFrames || []) add(child, session, false);
+  };
+  const main = await send(tabId, "Page.getFrameTree");
+  add(main.frameTree, undefined, true);
+  byId.get(main.frameTree.frame.id).main = true;
+  const trees = await Promise.all([...(childSessions.get(tabId)?.keys() ?? [])].map((session) =>
+    send(tabId, "Page.getFrameTree", {}, session).then((tree) => [session, tree]).catch(() => null)));
+  for (const entry of trees) {
+    if (!entry) continue;
+    const [session, tree] = entry;
+    // The page's own tree can list an out-of-process frame too; its session
+    // is the one that can evaluate in it.
+    const known = byId.get(tree.frameTree.frame.id);
+    if (known) {
+      const siblings = children.get(known.parentId);
+      if (siblings) siblings.splice(siblings.indexOf(known.id), 1);
+    }
+    add(tree.frameTree, session, true);
+  }
+  const out = [];
+  const visit = (id, depth) => {
+    const frame = byId.get(id);
+    if (!frame || out.length > FRAME_LIMIT) return;
+    out.push({ ...frame, depth });
+    for (const child of children.get(id) || []) visit(child, depth + 1);
+  };
+  visit(main.frameTree.frame.id, 0);
+  return out;
+}
+
+/// Evaluate in one of the tab's documents. `frame` is undefined (or the main
+/// frame) for the page itself.
+async function evaluateIn(tabId, frame, params) {
+  if (!frame || frame.main) return send(tabId, "Runtime.evaluate", params);
+  if (!frame.world) return send(tabId, "Runtime.evaluate", params, frame.session);
+  const world = await send(tabId, "Page.createIsolatedWorld",
+    { frameId: frame.id, worldName: FRAME_WORLD, grantUniveralAccess: false }, frame.session);
+  return send(tabId, "Runtime.evaluate", { ...params, contextId: world.executionContextId }, frame.session);
+}
+
+/**
+ * Called on a frame's owner element (<iframe>, <frame>): where its document
+ * starts in the owner's own viewport (inside the border and padding), its
+ * size, a name a person would know it by, whether it is shown, and whether
+ * the parent's last snapshot listed it as in scope (not behind a dialog).
+ */
+function frameOwnerInPage(visible) {
+  const r = this.getBoundingClientRect();
+  const style = getComputedStyle(this);
+  const px = (value) => parseFloat(value) || 0;
+  const left = r.left + px(style.borderLeftWidth) + px(style.paddingLeft);
+  const top = r.top + px(style.borderTopWidth) + px(style.paddingTop);
+  const right = r.right - px(style.borderRightWidth) - px(style.paddingRight);
+  const bottom = r.bottom - px(style.borderBottomWidth) - px(style.paddingBottom);
+  const name = (this.getAttribute("title") || this.getAttribute("aria-label") || this.getAttribute("name") || "")
+    .replace(/\s+/g, " ").trim().slice(0, 60);
+  return {
+    left, top, width: Math.max(0, right - left), height: Math.max(0, bottom - top), name,
+    outer: { width: r.width, height: r.height },
+    shown: visible(this) === true, listed: this.hasAttribute("data-cu-frame"),
+    view: { width: innerWidth, height: innerHeight },
+  };
+}
+
+/// Where a frame sits: its owner element's box in the parent's viewport, or
+/// null when Chrome no longer knows the frame.
+async function frameOwner(tabId, frame) {
+  try {
+    const owner = await send(tabId, "DOM.getFrameOwner", { frameId: frame.id }, frame.parentSession);
+    const resolved = await send(tabId, "DOM.resolveNode", { backendNodeId: owner.backendNodeId }, frame.parentSession);
+    const objectId = resolved?.object?.objectId;
+    if (!objectId) return null;
+    try {
+      // Functions cannot be passed as arguments, so the visibility check goes
+      // in as source.
+      const res = await send(tabId, "Runtime.callFunctionOn", {
+        objectId, returnByValue: true,
+        functionDeclaration: `function () { return (${frameOwnerInPage.toString()}).call(this, ${isElementVisibleInPage.toString()}); }`,
+      }, frame.parentSession);
+      return res?.result?.value ?? null;
+    } finally {
+      send(tabId, "Runtime.releaseObject", { objectId }, frame.parentSession).catch(() => {});
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The tab's frames with where each one is on the page: `offset` adds a point
+ * in the frame's document to page coordinates, `clip` is the part of the page
+ * the frame shows (clipped by every frame around it), `label` names it, and
+ * `reachable` says whether it is shown at all. With `scoped`, a frame its
+ * parent's snapshot left out (hidden, or behind that page's dialog) is not
+ * reachable either. The page itself comes first.
+ */
+async function placedFrames(tabId, { scoped = false } = {}) {
+  const frames = await tabFrames(tabId);
+  const placed = new Map();
+  const out = [];
+  for (const frame of frames) {
+    if (frame.main) {
+      const entry = { ...frame, offset: { x: 0, y: 0 }, clip: null, reachable: true, label: "" };
+      placed.set(frame.id, entry);
+      out.push(entry);
+      continue;
+    }
+    const parent = placed.get(frame.parentId);
+    if (!parent) continue;
+    const owner = parent.reachable ? await frameOwner(tabId, frame) : null;
+    const offset = owner ? { x: parent.offset.x + owner.left, y: parent.offset.y + owner.top } : parent.offset;
+    let clip = owner ? { left: offset.x, top: offset.y, right: offset.x + owner.width, bottom: offset.y + owner.height } : null;
+    // The parent's own viewport clips the frame too.
+    if (clip && owner?.view) {
+      const viewport = { left: parent.offset.x, top: parent.offset.y,
+        right: parent.offset.x + owner.view.width, bottom: parent.offset.y + owner.view.height };
+      const outer = parent.clip ?? viewport;
+      clip = {
+        left: Math.max(clip.left, outer.left, viewport.left), top: Math.max(clip.top, outer.top, viewport.top),
+        right: Math.min(clip.right, outer.right, viewport.right), bottom: Math.min(clip.bottom, outer.bottom, viewport.bottom),
+      };
+    }
+    const reachable = !!owner && owner.shown && owner.width >= 2 && owner.height >= 2 && (!scoped || owner.listed);
+    const entry = {
+      ...frame, offset, clip, reachable,
+      // Shown parent, but Chrome would not say where the frame is: it could
+      // not be searched, which is not the same as hidden.
+      unknown: !owner && parent.reachable,
+      label: owner?.name || "",
+      outer: owner?.outer ?? null,
+    };
+    placed.set(frame.id, entry);
+    out.push(entry);
+  }
+  return out;
+}
+
+/// What the agent is told a frame is: its owner's name, else its document's
+/// title, else its site.
+function frameName(frame, title) {
+  if (frame.label) return frame.label;
+  if (title && String(title).trim()) return String(title).replace(/\s+/g, " ").trim().slice(0, 60);
+  try {
+    return new URL(frame.url).host || "frame";
+  } catch {
+    return "frame";
+  }
+}
+
+/// A frame's name as a snapshot gives it, for a frame from tabFrames (which
+/// does not look at owners): its owner's name, else its title, else its site.
+async function nameOfFrame(tabId, frame) {
+  const owner = await frameOwner(tabId, frame);
+  const title = await evaluateIn(tabId, frame, { expression: "document.title", returnByValue: true }).catch(() => null);
+  return frameName({ ...frame, label: owner?.name || "" }, title?.result?.value);
+}
+
+/// The frame holding a snapshot index, or undefined for the page itself.
+function frameForIndex(tabId, index) {
+  const ranges = frameIndexes.get(tabId);
+  const hit = ranges?.find((range) => index >= range.start && index < range.end);
+  return hit?.frame?.main ? undefined : hit?.frame;
+}
+
+/// A frame's current offset on the page, after a script in it may have
+/// scrolled. Null when the frame is gone or no longer shown.
+async function currentPlacement(tabId, frame) {
+  const frames = await placedFrames(tabId);
+  const now = frames.find((entry) => entry.id === frame.id && entry.session === frame.session);
+  return now?.reachable ? now : null;
+}
 
 // ── JavaScript dialogs and page problems ────────────────────────────────────
 //
@@ -1007,6 +1320,9 @@ async function pageProblems(tabId, fresh) {
 chrome.debugger.onEvent.addListener((source, method, params) => {
   const tabId = source.tabId;
   if (tabId === undefined || !attached.has(tabId)) return;
+  if (method.startsWith("Target.")) return onTargetEvent(source, method, params);
+  // A frame's own session reports nothing else the extension listens for.
+  if (source.sessionId) return;
   if (method === "Page.javascriptDialogOpening") {
     const message = String(params?.message ?? "");
     const dialog = {
@@ -1098,6 +1414,7 @@ async function handleDialog(tabId, { action, promptText, dialogId }) {
 /// browser" banner. Safe to call for a tab that was never attached.
 async function detachTab(tabId) {
   forgetPage(tabId);
+  forgetFrames(tabId);
   if (!attached.has(tabId)) return;
   attached.delete(tabId);
   try {
@@ -1125,7 +1442,9 @@ function withDeadline(promise, what, ms = DEBUGGER_TIMEOUT_MS) {
   return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
 }
 
-async function send(tabId, method, params = {}) {
+/// One DevTools command for a tab, or with `session` for one of its frames
+/// from another site (see "frames").
+async function send(tabId, method, params = {}, session = undefined) {
   try {
     await withDeadline(attach(tabId), "attaching to the tab");
     // A page paused behind a dialog answers nothing; say so at once instead of
@@ -1133,7 +1452,7 @@ async function send(tabId, method, params = {}) {
     const pending = dialogs.get(tabId);
     if (pending) throw dialogPendingError(tabId, pending);
     const bounded = method === "Runtime.evaluate" ? { timeout: EVALUATE_TIMEOUT_MS, ...params } : params;
-    return await withDeadline(whileNoDialog(tabId, chrome.debugger.sendCommand({ tabId }, method, bounded)), method);
+    return await withDeadline(whileNoDialog(tabId, chrome.debugger.sendCommand(debuggee(tabId, session), method, bounded)), method);
   } catch (error) {
     if (error?.dialog) throw error;
     const message = error?.message || "";
@@ -1342,6 +1661,9 @@ function hiddenFileInputInPage(el, dom, visible) {
 const SNAPSHOT_JS = `((options = {}) => {
   const offset = options.offset ?? 0;
   const limit = options.limit ?? 250;
+  // A frame's elements are numbered after the page's (and earlier frames'),
+  // so every index in one snapshot names one element.
+  const base = options.base ?? 0;
   const out = [];
   // Every spelling that makes an element editable (contenteditable="",
   // "true", "plaintext-only"), not just "true": an inline title editor that
@@ -1394,6 +1716,7 @@ const SNAPSHOT_JS = `((options = {}) => {
   // would otherwise keep its old number, and querySelector, which returns the
   // first match, could send a click or a credential fill to it instead.
   for (const old of dom.queryAll(document, '[data-cu-idx]')) old.removeAttribute('data-cu-idx');
+  for (const old of dom.queryAll(document, '[data-cu-frame]')) old.removeAttribute('data-cu-frame');
   // Accessibility-hidden/inert ancestors are not actionable. Do not use viewport
   // intersection here: indexed click scrolls reachable offscreen controls into view.
   const visible = ${isElementVisibleInPage.toString()};
@@ -1496,6 +1819,7 @@ const SNAPSHOT_JS = `((options = {}) => {
     return !!hit && (hit === el || dom.contains(el, hit));
   };
   let frames = 0;
+  let framed = 0;
   // Rows and cells are labelled cell by cell, so "Ana | Admin | Active" reads
   // as one row rather than run-together text.
   const cellText = (el) => (el.innerText || '').split(/[\\t\\n]+/).map((part) => part.replace(/\\s+/g, ' ').trim()).filter(Boolean).join(' | ');
@@ -1505,14 +1829,18 @@ const SNAPSHOT_JS = `((options = {}) => {
     // Rows, cells and plain click targets are only worth listing by their
     // text: an empty spacer row or an icon-only wrapper is noise.
     if (kind && !(el.getAttribute('aria-label') || '').trim() && !(el.innerText || '').trim()) continue;
-    // A frame's controls are its own document's, which this does not search.
-    // Count the ones big enough to hold a form, not tracking pixels or ads.
+    // A frame's controls are its own document's, searched separately. Mark
+    // the frames in scope so that search knows which to enter (one behind
+    // this page's dialog is not), and count the ones big enough to hold a
+    // form, not tracking pixels or ads.
     if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
+      el.setAttribute('data-cu-frame', '');
+      framed++;
       const r = el.getBoundingClientRect();
       if (r.width >= 100 && r.height >= 40) frames++;
       continue;
     }
-    const index = i++;
+    const index = base + i++;
     // Tag the full selected scope so indices stay global and earlier pages remain
     // actionable when paging an unchanged UI. Only label/serialize this page.
     el.setAttribute('data-cu-idx', String(index));
@@ -1566,36 +1894,126 @@ const SNAPSHOT_JS = `((options = {}) => {
         'rest of the page from assistive tech, can do this: wait_for_selector, snapshot again, or use browser_read for its text';
     }
   }
-  const end = Math.min(i, offset + out.length);
+  const end = Math.min(base + i, offset + out.length);
   return { title: document.title, url: location.href, elements: out, ...(empty ? { empty } : {}),
     shown: document.visibilityState === 'visible',
-    scope: modal ? 'modal' : 'page', ...(dialogName ? { dialog: dialogName } : {}), total: i, offset, limit, frames,
+    scope: modal ? 'modal' : 'page', ...(dialogName ? { dialog: dialogName } : {}), total: i, offset, limit, frames, framed,
     truncated: end < i, nextOffset: end < i ? end : null };
 })()`;
 
-async function snapshot(tabId, { offset = 0, limit = 250 } = {}) {
+async function snapshot(tabId, { offset = 0, limit = 250, access } = {}) {
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > 2147483647) throw new Error("offset must be an integer from 0 to 2147483647");
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 250) throw new Error("limit must be an integer from 1 to 250");
-  const take = async () => {
-    const res = await send(tabId, "Runtime.evaluate", {
-      expression: SNAPSHOT_JS.slice(0, -2) + `(${JSON.stringify({ offset, limit })})`,
+  const take = async (frame, base) => {
+    const res = await evaluateIn(tabId, frame, {
+      expression: SNAPSHOT_JS.slice(0, -2) + `(${JSON.stringify({ offset, limit, base })})`,
       returnByValue: true,
     });
     if (res?.exceptionDetails) throw new Error(res.exceptionDetails.text || "evaluate failed");
     return res.result.value;
   };
   try {
-    let value = await take();
+    let value = await take(undefined, 0);
     // Nothing listed on a page Chrome is not drawing: ask once more for it to
     // be shown and look again, and if it still is not, say so (#63).
     if (value?.shown === false && value.total === 0) {
-      if (await redraw(tabId)) value = await take();
+      if (await redraw(tabId)) value = await take(undefined, 0);
       if (value?.shown === false && value.total === 0) value.empty = NOT_DRAWN_NOTE;
     }
-    return value;
+    return await withFrames(tabId, value, take, offset, limit, access);
   } catch (error) {
     if (!error?.dialog) throw error;
     return dialogSnapshot(tabId, error.dialog, offset, limit);
+  }
+}
+
+/**
+ * Add the page's frames to its snapshot: each shown, in-scope frame's
+ * elements, numbered after everything before it, placed at page coordinates
+ * and tagged with the frame's name. `frames` becomes the number of frames
+ * that could not be searched, and `framesSearched` the number that were.
+ */
+async function withFrames(tabId, page, take, offset, limit, access) {
+  const ranges = [{ start: 0, end: page.total, frame: { main: true } }];
+  frameIndexes.set(tabId, ranges);
+  // `framed` counts the shown frames the page marked; none means nothing to search.
+  if (!page.framed) {
+    delete page.framed;
+    return page;
+  }
+  let frames;
+  try {
+    frames = await placedFrames(tabId, { scoped: true });
+  } catch {
+    return page;
+  }
+  let total = page.total;
+  let searched = 0;
+  let blocked = 0;
+  // `page.frames` counts the page's own big frames; each of those searched
+  // comes off it, and any other frame that could not be read is added.
+  let unsearched = page.frames || 0;
+  const big = (frame) => frame.depth === 1 && frame.outer && frame.outer.width >= 100 && frame.outer.height >= 40;
+  const elements = [...page.elements];
+  for (const frame of frames) {
+    if (frame.main || (!frame.reachable && !frame.unknown)) continue;
+    // The user's site rules hold inside frames too.
+    if (!frameAllowed(access, frame.url)) {
+      blocked++;
+      if (!big(frame)) unsearched++;
+      continue;
+    }
+    let value = null;
+    if (frame.reachable) {
+      try {
+        value = await take(frame, total);
+      } catch {
+        value = null;
+      }
+    }
+    if (!value) {
+      if (!big(frame)) unsearched++;
+      continue;
+    }
+    searched++;
+    if (big(frame)) unsearched = Math.max(0, unsearched - 1);
+    const name = frameName(frame, value.title);
+    frame.name = name;
+    ranges.push({ start: total, end: total + value.total, frame });
+    total += value.total;
+    for (const element of value.elements) {
+      const x = element.x + frame.offset.x;
+      const y = element.y + frame.offset.y;
+      const clip = frame.clip;
+      const inClip = !clip || (x >= clip.left && x < clip.right && y >= clip.top && y < clip.bottom);
+      elements.push({ ...element, x: Math.round(x), y: Math.round(y), inView: element.inView && inClip, frame: name });
+    }
+  }
+  const end = Math.min(total, offset + elements.length);
+  delete page.framed;
+  const merged = {
+    ...page,
+    elements,
+    total,
+    truncated: end < total,
+    nextOffset: end < total ? end : null,
+    frames: unsearched,
+    ...(searched ? { framesSearched: searched } : {}),
+    ...(blocked ? { framesBlocked: blocked } : {}),
+  };
+  // "Nothing is listed" was about the page alone; a frame listed something.
+  if (total > 0) delete merged.empty;
+  return merged;
+}
+
+/// Whether the tab has any frame at all, without placing them.
+async function hasChildFrames(tabId) {
+  if (childSessions.get(tabId)?.size) return true;
+  try {
+    const tree = await send(tabId, "Page.getFrameTree");
+    return (tree?.frameTree?.childFrames?.length ?? 0) > 0;
+  } catch {
+    return false;
   }
 }
 
@@ -2018,10 +2436,44 @@ const CLICK_EVENTS_JS = (index) => `(() => {
   return { ok: true };
 })()`;
 
-async function evaluateValue(tabId, expression, failure) {
-  const res = await send(tabId, "Runtime.evaluate", { expression, returnByValue: true, userGesture: true });
+async function evaluateValue(tabId, expression, failure, frame = undefined) {
+  const res = await evaluateIn(tabId, frame, { expression, returnByValue: true, userGesture: true });
   if (res?.exceptionDetails) throw new Error(res.exceptionDetails.text || failure);
   return res?.result?.value || {};
+}
+
+/// The frame a snapshot index is in, checked to still be there. Undefined for
+/// the page itself. A frame that went away (it navigated, or its site's
+/// process ended) takes its indices with it.
+async function liveFrameForIndex(tabId, index, access) {
+  const frame = frameForIndex(tabId, index);
+  if (!frame) return undefined;
+  const sessions = childSessions.get(tabId);
+  if (frame.session && !sessions?.has(frame.session)) {
+    throw new Error(`element ${index} was in frame "${frame.name || "frame"}", which is no longer on the page — call browser_snapshot again`);
+  }
+  // The frame may have navigated since the snapshot; its session knows where it is now.
+  const url = (frame.world ? null : sessions?.get(frame.session)?.url) || frame.url;
+  if (!frameAllowed(access, url)) {
+    throw new Error(`element ${index} is in a frame from ${originOf(url)}, which the user's Computer Use policy does not allow here`);
+  }
+  return frame;
+}
+
+/// Turn a point in a frame's document into page coordinates, re-measured now
+/// (scrolling the element into view can move the frame too). Says why not
+/// when the point is outside what the frame shows.
+async function pointInPage(tabId, frame, x, y) {
+  if (!frame) return { x, y };
+  const now = await currentPlacement(tabId, frame);
+  if (!now) return { why: `its frame "${frame.name || "frame"}" is no longer shown on the page` };
+  const px = x + now.offset.x;
+  const py = y + now.offset.y;
+  const clip = now.clip;
+  if (clip && !(px >= clip.left && px < clip.right && py >= clip.top && py < clip.bottom)) {
+    return { x: px, y: py, why: `it is outside the part of frame "${frame.name || "frame"}" that the page shows` };
+  }
+  return { x: px, y: py };
 }
 
 /// Click a snapshotted element.
@@ -2035,24 +2487,32 @@ async function evaluateValue(tabId, expression, failure) {
 /// another element covers it) is the press played as page events on the node
 /// itself. `route` says which one ran, and `target` which element it was, so
 /// an ignored click can be told from a stale index.
-async function clickElement(tabId, index) {
+async function clickElement(tabId, index, access) {
   // The index is spliced into the scripts that run in the page, so only a
   // plain snapshot index may reach them: anything else would run as page script.
   if (!Number.isInteger(index) || index < 0) {
     throw new Error("index must be an element index from browser_snapshot");
   }
-  const found = await evaluateValue(tabId, CLICK_TARGET_JS(index), "click failed");
+  const frame = await liveFrameForIndex(tabId, index, access);
+  const found = await evaluateValue(tabId, CLICK_TARGET_JS(index), "click failed", frame);
   if (!found.ok) throw new Error(found.reason || "click failed");
-  const target = describeTarget(index, found);
+  const target = describeTarget(index, found) + (frame ? ` in frame "${frame.name || "frame"}"` : "");
+  // A point in a frame's document is pressed at its place on the page.
+  const point = await pointInPage(tabId, frame, found.x, found.y);
+  if (point.why && !found.covered) {
+    found.covered = true;
+    found.why = point.why;
+  }
   // Covered or outside the page: a press at that point would land on
   // whatever is there, so nothing is pressed at all.
   if (found.covered) {
+    await evaluateValue(tabId, CLICK_PROBE_JS(true), "click failed", frame).catch(() => {});
     throw new Error(
       `not clicked: ${target} cannot be reached — ${found.why}. Nothing was pressed. ` +
         "Close or scroll away what is in front of it, then browser_snapshot again",
     );
   }
-  const { x, y } = found;
+  const { x, y } = point;
   let route = "page-events";
   let why = found.why;
   if (found.reachable) {
@@ -2060,7 +2520,7 @@ async function clickElement(tabId, index) {
       // Hover first and check it reached the element: a press at a point the
       // page reads differently (zoom, a layout shift) would hit something else.
       await send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none", buttons: 0, pointerType: "mouse" });
-      if ((await evaluateValue(tabId, CLICK_PROBE_JS(false), "click failed")).hover) {
+      if ((await evaluateValue(tabId, CLICK_PROBE_JS(false), "click failed", frame)).hover) {
         const press = { x, y, button: "left", clickCount: 1, pointerType: "mouse" };
         try {
           await send(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...press, buttons: 1 });
@@ -2072,7 +2532,7 @@ async function clickElement(tabId, index) {
         // A press that navigated took the probe (or the whole context) with
         // it. Otherwise not pressed means not delivered, so the page events
         // below are not a second click.
-        const seen = await evaluateValue(tabId, CLICK_PROBE_JS(true), "click failed").catch(() => ({ gone: true }));
+        const seen = await evaluateValue(tabId, CLICK_PROBE_JS(true), "click failed", frame).catch(() => ({ gone: true }));
         if (seen.press || seen.click || seen.gone) route = "input";
         else why = "real input did not reach it";
       } else {
@@ -2084,13 +2544,13 @@ async function clickElement(tabId, index) {
         );
       }
     } finally {
-      await evaluateValue(tabId, CLICK_PROBE_JS(true), "click failed").catch(() => {});
+      await evaluateValue(tabId, CLICK_PROBE_JS(true), "click failed", frame).catch(() => {});
     }
   }
   if (route !== "input") {
     let fired;
     try {
-      fired = await evaluateValue(tabId, CLICK_EVENTS_JS(index), "click failed");
+      fired = await evaluateValue(tabId, CLICK_EVENTS_JS(index), "click failed", frame);
     } catch (error) {
       if (!error?.opened) throw error;
       return openedDialog(error.dialog, { ok: true, tag: found.tag, x, y, route, why, target });
@@ -2101,7 +2561,7 @@ async function clickElement(tabId, index) {
   let state;
   let note;
   if (found.toggle) {
-    const after = await evaluateValue(tabId, CLICK_STATE_JS(index), "click failed").catch(() => ({}));
+    const after = await evaluateValue(tabId, CLICK_STATE_JS(index), "click failed", frame).catch(() => ({}));
     if (typeof after.state === "string") {
       state = after.state;
       if (after.state === found.before) note = `its state did not change (still ${after.state || "the same"})`;
@@ -2514,12 +2974,35 @@ const KEY_RESULT_JS = `(() => {
   return { focused, selected };
 })()`;
 
+/// The frame keys go to now: the deepest one that has focus, or undefined
+/// when focus is in the page itself. Keys are sent to the tab and Chrome
+/// routes them there, so the checks that follow a key must look there too.
+async function focusedFrame(tabId) {
+  const res = await send(tabId, "Runtime.evaluate", {
+    expression: `(() => {
+      let el = document.activeElement;
+      while (el?.shadowRoot?.activeElement) el = el.shadowRoot.activeElement;
+      return !!el && (el.tagName === 'IFRAME' || el.tagName === 'FRAME');
+    })()`,
+    returnByValue: true,
+  });
+  if (res?.result?.value !== true) return undefined;
+  let best;
+  for (const frame of await tabFrames(tabId)) {
+    if (frame.main) continue;
+    const focus = await evaluateIn(tabId, frame, { expression: "document.hasFocus()", returnByValue: true }).catch(() => null);
+    if (focus?.result?.value === true && (!best || frame.depth > best.depth)) best = frame;
+  }
+  return best;
+}
+
 async function pressKey(tabId, rawKey, rawModifiers) {
   const press = resolveKeyPress(rawKey, rawModifiers, await isMacPlatform());
   const tab = press.key === "Tab" && press.modifiers === 0;
   const backspace = press.key === "Backspace" && press.modifiers === 0;
-  if (tab) await send(tabId, "Runtime.evaluate", { expression: TAB_PROBE_JS, returnByValue: true });
-  if (backspace) await send(tabId, "Runtime.evaluate", { expression: EDIT_PROBE_JS, returnByValue: true });
+  const frame = await focusedFrame(tabId).catch(() => undefined);
+  if (tab) await evaluateIn(tabId, frame, { expression: TAB_PROBE_JS, returnByValue: true });
+  if (backspace) await evaluateIn(tabId, frame, { expression: EDIT_PROBE_JS, returnByValue: true });
   const pressed = { pressed: press.label, ...(press.note ? { note: press.note } : {}) };
   try {
     await dispatchKey(tabId, press);
@@ -2528,16 +3011,17 @@ async function pressKey(tabId, rawKey, rawModifiers) {
     if (!error?.opened) throw error;
     return openedDialog(error.dialog, pressed);
   }
-  if (backspace) return { ...(await finishBackspace(tabId)), pressed: press.label };
+  if (backspace) return { ...(await finishBackspace(tabId, frame)), pressed: press.label };
   if (!tab) {
-    const after = await evaluateValue(tabId, KEY_RESULT_JS, "key press failed").catch(() => ({}));
+    const after = await evaluateValue(tabId, KEY_RESULT_JS, "key press failed", frame).catch(() => ({}));
+    const where = frame && after.focused ? ` in frame "${await nameOfFrame(tabId, frame)}"` : "";
     return {
       ...pressed,
-      ...(after.focused ? { focused: after.focused } : {}),
+      ...(after.focused ? { focused: after.focused + where } : {}),
       ...(Number.isInteger(after.selected) && after.selected > 0 ? { selected: after.selected } : {}),
     };
   }
-  const res = await send(tabId, "Runtime.evaluate", { expression: TAB_FINISH_JS, returnByValue: true });
+  const res = await evaluateIn(tabId, frame, { expression: TAB_FINISH_JS, returnByValue: true });
   const focus = res?.result?.value || {};
   // Reporting success when focus stayed put sent the next type into the wrong
   // field, so an unmoved Tab is an error the agent can act on.
@@ -2671,13 +3155,16 @@ const FILL_CHECK_JS = (index, expected, force) => `(() => {
 /// page sees the beforeinput/input events of a person typing (trusted, like a
 /// paste over a selection). Works on input, textarea and contenteditable,
 /// including inside open shadow roots, in a background tab.
-async function fillElement(tabId, index, text) {
+async function fillElement(tabId, index, text, access) {
   if (!Number.isInteger(index) || index < 0) {
     throw new Error("index must be an element index from browser_snapshot");
   }
   if (typeof text !== "string") throw new Error("text is required (pass an empty string to clear the field)");
-  const found = await evaluateValue(tabId, FILL_PREPARE_JS(index), "fill failed");
+  const frame = await liveFrameForIndex(tabId, index, access);
+  const found = await evaluateValue(tabId, FILL_PREPARE_JS(index), "fill failed", frame);
   if (!found.ok) throw new Error(found.reason || "fill failed");
+  // Chrome's text and key input goes to the focused frame, which focusing the
+  // field made this one.
   if (text === "") {
     // Nothing to insert: delete the selection the way a person would.
     await dispatchKey(tabId, resolveKeyPress("Backspace", [], await isMacPlatform()));
@@ -2686,12 +3173,12 @@ async function fillElement(tabId, index, text) {
   }
   // When Chrome's input never reached the field (a Chrome that would not
   // emulate focus, say), the check sets the value directly, once.
-  const check = await evaluateValue(tabId, FILL_CHECK_JS(index, text, true), "fill failed");
+  const check = await evaluateValue(tabId, FILL_CHECK_JS(index, text, true), "fill failed", frame);
   if (!check.ok) throw new Error(check.reason || "fill failed");
   await markTab(tabId);
   return {
     filled: true,
-    target: describeTarget(index, found),
+    target: describeTarget(index, found) + (frame ? ` in frame "${frame.name || "frame"}"` : ""),
     length: [...text].length,
     matches: check.matches,
     ...(check.fallback ? { note: "Chrome's text input did not reach the field, so the extension set its value directly" } : {}),
@@ -2699,8 +3186,8 @@ async function fillElement(tabId, index, text) {
   };
 }
 
-async function finishBackspace(tabId) {
-  const res = await send(tabId, "Runtime.evaluate", { expression: EDIT_FINISH_JS, returnByValue: true, userGesture: true });
+async function finishBackspace(tabId, frame = undefined) {
+  const res = await evaluateIn(tabId, frame, { expression: EDIT_FINISH_JS, returnByValue: true, userGesture: true });
   const edit = res?.result?.value || {};
   if (!edit.checked) return { pressed: "Backspace", note: "no text field has focus, so nothing was checked" };
   if (edit.handled) return { pressed: "Backspace", handledByPage: true };
@@ -2720,10 +3207,55 @@ async function finishBackspace(tabId) {
   );
 }
 
-async function screenshot(tabId) {
-  // Page.captureScreenshot works on a background tab; captureVisibleTab does not.
-  const res = await send(tabId, "Page.captureScreenshot", { format: "png" });
-  return { data: res.data };
+const SCREENSHOT_MAX_WIDTH = 1400;
+const SCREENSHOT_QUALITY = 55;
+
+/**
+ * The part of the page the tab shows, as the user would see it if they
+ * switched to it, frames included: Page.captureScreenshot renders the tab's
+ * own compositor frame, so it works on a background tab, and never selects
+ * the tab, raises its window or captures the screen (captureVisibleTab only
+ * sees the tab in front). Focus emulation (see attach) keeps Chrome drawing
+ * the tab. `maxWidth` scales the image down (0 keeps every pixel); the reply
+ * gives the page's size in CSS pixels, the space browser_click's x and y use.
+ */
+async function screenshot(tabId, { format = "png", quality, maxWidth } = {}) {
+  if (format !== "png" && format !== "jpeg") throw new Error("format must be png or jpeg");
+  if (quality !== undefined && (!Number.isInteger(quality) || quality < 1 || quality > 100)) {
+    throw new Error("quality must be an integer from 1 to 100");
+  }
+  if (maxWidth !== undefined && (!Number.isInteger(maxWidth) || maxWidth < 0)) {
+    throw new Error("max_width must be a whole number of pixels (0 keeps full resolution)");
+  }
+  const limit = Math.min(maxWidth ?? SCREENSHOT_MAX_WIDTH, 8000);
+  const view = (await evaluateValue(tabId,
+    "({ width: innerWidth, height: innerHeight, x: scrollX, y: scrollY, dpr: devicePixelRatio, shown: document.visibilityState === 'visible' })",
+    "could not measure the page"));
+  if (!(view.width > 0 && view.height > 0)) throw new Error("the page has no size to capture");
+  // Chrome captures device pixels; scale so the image is at most `limit` wide.
+  const deviceWidth = view.width * (view.dpr || 1);
+  const scale = limit > 0 && deviceWidth > limit ? limit / deviceWidth : 1;
+  const params = {
+    format,
+    ...(format === "jpeg" ? { quality: quality ?? SCREENSHOT_QUALITY } : {}),
+    ...(scale < 1 ? { clip: { x: view.x, y: view.y, width: view.width, height: view.height, scale } } : {}),
+  };
+  let res = await send(tabId, "Page.captureScreenshot", params);
+  // A tab Chrome is not drawing hands back its last frame, or none; ask once
+  // more for it to be shown (#63) and capture again.
+  if (!res?.data && await redraw(tabId)) res = await send(tabId, "Page.captureScreenshot", params);
+  if (!res?.data) throw new Error(`Chrome returned no image for tab ${tabId}. ${NOT_DRAWN_NOTE}`);
+  return {
+    data: res.data,
+    mimeType: format === "jpeg" ? "image/jpeg" : "image/png",
+    width: Math.round(deviceWidth * scale),
+    height: Math.round(view.height * (view.dpr || 1) * scale),
+    cssWidth: view.width,
+    cssHeight: view.height,
+    scrollX: Math.round(view.x),
+    scrollY: Math.round(view.y),
+    ...(view.shown ? {} : { note: NOT_DRAWN_NOTE }),
+  };
 }
 
 // ── attaching files ─────────────────────────────────────────────────────────
@@ -2814,7 +3346,7 @@ function fileInputFilesInPage() {
 /// selected and no OS input is sent, and the form is never submitted: the
 /// files are only staged in the input. The paths are on the machine running
 /// Chrome; the server checked they are regular files before sending them.
-async function uploadFiles(tabId, index, paths) {
+async function uploadFiles(tabId, index, paths, access) {
   // The index is spliced into the script that runs in the page, so only a
   // plain snapshot index may reach it.
   if (!Number.isInteger(index) || index < 0) {
@@ -2824,8 +3356,12 @@ async function uploadFiles(tabId, index, paths) {
       paths.some((path) => typeof path !== "string" || !path)) {
     throw new Error(`paths must list 1 to ${UPLOAD_MAX_FILES} absolute file paths`);
   }
+  const frame = await liveFrameForIndex(tabId, index, access);
+  // A frame from another site has its own session, and the input's handle
+  // belongs to it.
+  const session = frame?.session;
   try {
-    const found = await send(tabId, "Runtime.evaluate", {
+    const found = await evaluateIn(tabId, frame, {
       expression: UPLOAD_TARGET_JS(index), returnByValue: false, objectGroup: UPLOAD_GROUP,
     });
     if (found?.exceptionDetails) throw new Error(found.exceptionDetails.text || "upload failed");
@@ -2835,14 +3371,15 @@ async function uploadFiles(tabId, index, paths) {
     const call = async (fn) => {
       const res = await send(tabId, "Runtime.callFunctionOn", {
         objectId: handle.objectId, functionDeclaration: fn.toString(), returnByValue: true,
-      });
+      }, session);
       if (res?.exceptionDetails) throw new Error(res.exceptionDetails.text || "upload failed");
       return res?.result?.value || {};
     };
     const info = await call(fileInputInfoInPage);
-    const target = info.via === "label"
+    const inFrame = frame ? ` in frame "${frame.name || "frame"}"` : "";
+    const target = (info.via === "label"
       ? `the file input of [${index}] label${info.label ? ` "${info.label}"` : ""}`
-      : describeTarget(index, { tag: "input[file]", label: info.label });
+      : describeTarget(index, { tag: "input[file]", label: info.label })) + inFrame;
     const refusal = info.disabled ? "is disabled"
       : info.folder ? "picks a folder (webkitdirectory), not files"
       : paths.length > 1 && !info.multiple
@@ -2852,7 +3389,7 @@ async function uploadFiles(tabId, index, paths) {
       await call(fileInputFilesInPage).catch(() => {});
       throw new Error(`not attached: ${target} ${refusal}. Nothing was changed`);
     }
-    await send(tabId, "DOM.setFileInputFiles", { files: paths, objectId: handle.objectId });
+    await send(tabId, "DOM.setFileInputFiles", { files: paths, objectId: handle.objectId }, session);
     const after = await call(fileInputFilesInPage);
     await markTab(tabId);
     return {
@@ -2864,7 +3401,7 @@ async function uploadFiles(tabId, index, paths) {
     };
   } finally {
     try {
-      await send(tabId, "Runtime.releaseObjectGroup", { objectGroup: UPLOAD_GROUP });
+      await send(tabId, "Runtime.releaseObjectGroup", { objectGroup: UPLOAD_GROUP }, session);
     } catch {
       // The page navigated or closed; its objects went with it.
     }
@@ -3100,6 +3637,35 @@ function visibleSelectorInPage(selector, visible, dom) {
   return { met: false, frames, shown };
 }
 
+/**
+ * The selector in the tab's frames: met in the first frame showing a match
+ * (with its name), else how many frames could not be searched (gone, or not
+ * allowed by the user's site rules).
+ */
+async function selectorInFrames(p) {
+  if (!(await hasChildFrames(p.tabId))) return { met: false, unread: 0 };
+  let unread = 0;
+  for (const frame of await tabFrames(p.tabId)) {
+    if (frame.main) continue;
+    if (!frameAllowed(p, frame.url)) {
+      unread++;
+      continue;
+    }
+    try {
+      const res = await evaluateIn(p.tabId, frame, {
+        expression: `(${visibleSelectorInPage.toString()})(${JSON.stringify(p.waitForSelector)}, ${isElementVisibleInPage.toString()}, (${pageDomInPage.toString()})())`,
+        returnByValue: true,
+      });
+      const value = res?.result?.value;
+      if (value?.met === true) return { met: true, frame: await nameOfFrame(p.tabId, frame) };
+    } catch (error) {
+      if (error?.dialog) throw error;
+      unread++;
+    }
+  }
+  return { met: false, unread };
+}
+
 /** Poll an explicit condition, including delayed same-document rendering. */
 async function waitForReadiness(p) {
   validateReadiness(p);
@@ -3137,6 +3703,19 @@ async function waitForReadiness(p) {
     const value = res?.result?.value;
     if (value?.error) return outcome("error", { error: value.error });
     if (value?.met === true) return outcome("met");
+    // Not on the page itself: a support chat or an embedded form renders in
+    // a frame, which is its own document.
+    let inFrames = { met: false, unread: 0 };
+    if (!value?.error) {
+      try {
+        inFrames = await selectorInFrames(p);
+      } catch (error) {
+        if (error?.dialog) {
+          return outcome("error", { error: `the page is paused behind JavaScript ${error.dialog.type} dialog ${error.dialog.id}` });
+        }
+      }
+    }
+    if (inFrames.met) return outcome("met", { frame: inFrames.frame });
     // Nothing waiting for a frame runs on a page Chrome is not drawing; ask
     // once more for it to be shown, then keep polling (#63).
     if (value?.shown === false && !redrawn && Date.now() < deadline) {
@@ -3146,7 +3725,7 @@ async function waitForReadiness(p) {
     }
     if (Date.now() >= deadline) {
       return outcome("timeout", {
-        ...(value?.frames ? { frames: value.frames } : {}),
+        ...(inFrames.unread ? { frames: inFrames.unread } : {}),
         ...(value?.shown === false ? { note: NOT_DRAWN_NOTE } : {}),
       });
     }
@@ -3175,7 +3754,7 @@ async function withState(p, result) {
   if (p.returnState !== true) return result;
   const readiness = p.waitForSelector !== undefined ? await waitForReadiness(p) : await settle(p.tabId);
   await checkTab(requireClientId(p), p.tabId, p.sites, "read");
-  return { ...result, readiness, snapshot: await snapshot(p.tabId) };
+  return { ...result, readiness, snapshot: await snapshot(p.tabId, { access: p }) };
 }
 
 /**
@@ -3274,7 +3853,43 @@ function focusText(text, query) {
 const READ_DEFAULT_CHARS = 20000;
 const READ_MAX_CHARS = 200000;
 
-async function readPage(tabId, { query, maxChars, offset, includeLinks } = {}) {
+/**
+ * The text of each shown frame the user's site rules allow, in document
+ * order, read the way the page is. `unread` counts the shown frames that
+ * could not be read (gone mid-read, or not allowed).
+ */
+async function frameTexts(tabId, includeLinks, access) {
+  if (!(await hasChildFrames(tabId))) return { sections: [], unread: 0 };
+  let frames;
+  try {
+    frames = await placedFrames(tabId);
+  } catch {
+    return { sections: [], unread: 0 };
+  }
+  const sections = [];
+  let unread = 0;
+  for (const frame of frames) {
+    if (frame.main || (!frame.reachable && !frame.unknown)) continue;
+    if (!frame.reachable || !frameAllowed(access, frame.url)) {
+      unread++;
+      continue;
+    }
+    try {
+      const res = await evaluateIn(tabId, frame, {
+        expression: `(${readPageInPage.toString()})(${includeLinks === true}, (${pageDomInPage.toString()})())`,
+        returnByValue: true,
+      });
+      if (res?.exceptionDetails) throw new Error("unreadable");
+      const value = res?.result?.value || {};
+      if (value.text) sections.push({ name: frameName(frame, value.title), text: value.text, links: value.links || [] });
+    } catch {
+      unread++;
+    }
+  }
+  return { sections, unread };
+}
+
+async function readPage(tabId, { query, maxChars, offset, includeLinks, access } = {}) {
   const take = async () => {
     const res = await send(tabId, "Runtime.evaluate", {
       expression: `(${readPageInPage.toString()})(${includeLinks === true}, (${pageDomInPage.toString()})())`,
@@ -3287,6 +3902,22 @@ async function readPage(tabId, { query, maxChars, offset, includeLinks } = {}) {
   // No text on a page Chrome is not drawing: ask once more for it to be
   // shown and read again (#63).
   if (!page.text && page.shown === false && await redraw(tabId)) page = await take();
+  // Text in frames (a support chat, an embedded form) follows the page's,
+  // each under a line naming its frame.
+  const { sections, unread } = await frameTexts(tabId, includeLinks, access);
+  for (const section of sections) {
+    const heading = `[frame "${section.name}"]`;
+    page.text = page.text ? `${page.text}\n\n${heading}\n${section.text}` : `${heading}\n${section.text}`;
+    if (includeLinks === true) {
+      const seen = new Set((page.links || []).map((link) => link.href));
+      for (const link of section.links) {
+        if ((page.links || []).length >= 150) break;
+        if (seen.has(link.href)) continue;
+        seen.add(link.href);
+        (page.links ||= []).push(link);
+      }
+    }
+  }
   let note;
   if (!page.text) {
     if (page.shown === false) note = NOT_DRAWN_NOTE;
@@ -3313,6 +3944,8 @@ async function readPage(tabId, { query, maxChars, offset, includeLinks } = {}) {
     ...(matches === undefined ? {} : { matches }),
     ...(includeLinks === true ? { links: page.links || [] } : {}),
     ...(note ? { note } : {}),
+    ...(sections.length ? { framesRead: sections.length } : {}),
+    ...(unread ? { frames: unread } : {}),
   };
 }
 
@@ -3374,6 +4007,18 @@ async function checkSite(clientId, url, rules, action) {
   }
   if (!approvedOrigins.has(clientId)) approvedOrigins.set(clientId, new Set());
   approvedOrigins.get(clientId).add(origin);
+}
+
+/**
+ * Whether the user's site rules let the agent into a frame on a page it may
+ * use: the frame's site is allowed, or it is under an "ask" rule this task was
+ * already approved for. A frame never puts a prompt in front of the user; one
+ * that would need it is left out, and a blocked one always is.
+ */
+function frameAllowed(access, url) {
+  const rule = siteRule(access?.sites, url);
+  if (rule === "allow") return true;
+  return rule === "ask" && approvedOrigins.get(access?.clientId)?.has(originOf(url)) === true;
 }
 
 /** Check the page a tab is showing right now, for commands that act on a tab. */
@@ -3517,6 +4162,16 @@ async function requestCredentials(clientId, p) {
     throw new Error("each field needs an index from browser_snapshot");
   }
   if (new Set(indices).size !== indices.length) throw new Error("each field index may appear once");
+  // The prompt names the tab's site, and the user decides on that. A field in
+  // an embedded frame can belong to another site, so it is never filled here.
+  const framed = indices.filter((index) => frameForIndex(p.tabId, index));
+  if (framed.length) {
+    throw new Error(
+      `element ${framed.join(", ")} is inside an embedded frame. browser_request_credentials fills only the ` +
+        "page's own fields, because its prompt names the page's site and a frame can be another site's; " +
+        "ask the user to sign in in that frame themselves",
+    );
+  }
   const tab = await chrome.tabs.get(p.tabId);
   const url = tab.url || "";
   const described = await send(p.tabId, "Runtime.evaluate", {
@@ -3650,14 +4305,14 @@ const handlers = {
     await checkTab(clientId, p.tabId, p.sites, "read");
     const readiness = p.waitForSelector !== undefined ? await waitForReadiness(p) : undefined;
     await checkTab(clientId, p.tabId, p.sites, "read");
-    const state = await snapshot(p.tabId, { offset: p.offset, limit: p.limit });
+    const state = await snapshot(p.tabId, { offset: p.offset, limit: p.limit, access: p });
     return readiness ? { ...state, readiness } : state;
   },
   read: async (p) => {
     const clientId = requireClientId(p);
     assertOwned(clientId, p.tabId);
     await checkTab(clientId, p.tabId, p.sites, "read");
-    return readPage(p.tabId, { query: p.query, maxChars: p.maxChars, offset: p.offset, includeLinks: p.includeLinks });
+    return readPage(p.tabId, { query: p.query, maxChars: p.maxChars, offset: p.offset, includeLinks: p.includeLinks, access: p });
   },
   click: async (p) => {
     validateReadiness(p, true);
@@ -3665,7 +4320,7 @@ const handlers = {
     assertOwned(clientId, p.tabId);
     await checkTab(clientId, p.tabId, p.sites, "click in");
     noteAgentInput(clientId, p.tabId);
-    const result = p.index !== undefined ? await clickElement(p.tabId, p.index) : await clickAt(p.tabId, p.x, p.y);
+    const result = p.index !== undefined ? await clickElement(p.tabId, p.index, p) : await clickAt(p.tabId, p.x, p.y);
     return withState(p, result);
   },
   type: async (p) => {
@@ -3689,7 +4344,7 @@ const handlers = {
     assertOwned(clientId, p.tabId);
     await checkTab(clientId, p.tabId, p.sites, "type in");
     noteAgentInput(clientId, p.tabId);
-    return withState(p, await fillElement(p.tabId, p.index, p.text));
+    return withState(p, await fillElement(p.tabId, p.index, p.text, p));
   },
   upload_file: async (p) => {
     validateReadiness(p, true);
@@ -3697,13 +4352,13 @@ const handlers = {
     assertOwned(clientId, p.tabId);
     await checkTab(clientId, p.tabId, p.sites, "upload files to");
     noteAgentInput(clientId, p.tabId);
-    return withState(p, await uploadFiles(p.tabId, p.index, p.paths));
+    return withState(p, await uploadFiles(p.tabId, p.index, p.paths, p));
   },
   screenshot: async (p) => {
     const clientId = requireClientId(p);
     assertOwned(clientId, p.tabId);
     await checkTab(clientId, p.tabId, p.sites, "look at");
-    return screenshot(p.tabId);
+    return screenshot(p.tabId, { format: p.format, quality: p.quality, maxWidth: p.maxWidth });
   },
   handle_dialog: async (p) => {
     const clientId = requireClientId(p);
@@ -3794,6 +4449,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   siteFavicons.delete(tabId);
   agentInputAt.delete(tabId);
   forgetPage(tabId);
+  forgetFrames(tabId);
   if (!tabOwner.has(tabId) && !attached.has(tabId)) return;
   const clientId = tabOwner.get(tabId);
   if (clientId) {

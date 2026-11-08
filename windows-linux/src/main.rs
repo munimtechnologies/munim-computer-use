@@ -389,6 +389,13 @@ fn call_tool(
                 true,
             );
         }
+        // An image, not text: the tab as Chrome renders it in the background.
+        if rest == "screenshot" {
+            return match browser.screenshot(&args) {
+                Ok((bytes, mime_type, caption)) => image_result(bytes, &mime_type, caption),
+                Err(error) => text_result(format!("error: {error}"), true),
+            };
+        }
         return match browser.call(rest, &args) {
             Ok(text) => text_result(text, false),
             Err(error) => text_result(format!("error: {error}"), true),

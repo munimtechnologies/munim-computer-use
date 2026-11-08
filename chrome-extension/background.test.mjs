@@ -159,7 +159,7 @@ const chrome = {
     detach: async () => {},
     onDetach: { addListener: (fn) => { debuggerDetachListener = fn; } },
     onEvent: { addListener: (fn) => { debuggerEventListener = fn; } },
-    sendCommand: async (target, method, params) => pageEval(method, params ?? {}, target.tabId),
+    sendCommand: async (target, method, params) => pageEval(method, params ?? {}, target.tabId, target.sessionId),
   },
   windows: {
     create: async (options) => {
@@ -192,7 +192,10 @@ async function fetch(url) {
 }
 
 // URL is not an enumerable global, so the spread below would leave it out.
-const extensionContext = vm.createContext({ ...globalThis, URL, AbortSignal, chrome, console, fetch });
+// The extension reads Chrome's version from the user agent (frame sessions
+// need Chrome 125); Node's own navigator is not enumerable either.
+const navigator = { userAgent: "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36" };
+const extensionContext = vm.createContext({ ...globalThis, URL, AbortSignal, chrome, console, fetch, navigator });
 vm.runInContext(source, extensionContext, {
   filename: "background.js",
 });
@@ -920,7 +923,7 @@ test("snapshot forwards bounded pagination and refuses malformed options before 
     return { result: { value: {} } };
   };
   await call("snapshot", { tabId: pageTab, offset: 250, limit: 20 });
-  assert.ok(expressions[0].endsWith('({"offset":250,"limit":20})'));
+  assert.ok(expressions[0].endsWith('({"offset":250,"limit":20,"base":0})'));
   const count = expressions.length;
   const malformed = [
     { offset: -1 }, { offset: "250" }, { offset: 1.5 },
@@ -932,10 +935,10 @@ test("snapshot forwards bounded pagination and refuses malformed options before 
   }
   assert.equal(expressions.length, count, "malformed pagination reached page script");
   await call("snapshot", { tabId: pageTab });
-  assert.ok(expressions.at(-1).endsWith('({"offset":0,"limit":250})'));
+  assert.ok(expressions.at(-1).endsWith('({"offset":0,"limit":250,"base":0})'));
   // A client that sends null for an unset optional argument gets the default.
   await call("snapshot", { tabId: pageTab, offset: null, limit: null, waitForSelector: null, waitTimeoutMs: null });
-  assert.ok(expressions.at(-1).endsWith('({"offset":0,"limit":250})'));
+  assert.ok(expressions.at(-1).endsWith('({"offset":0,"limit":250,"base":0})'));
   pageEval = () => ({ result: { value: {} } });
 });
 
@@ -2006,6 +2009,358 @@ test("page_errors on a tab not attached yet starts watching there and says so", 
   } finally {
     pageEval = () => ({ result: { value: {} } });
     await call("close_all_tabs", { sessionId: "probs3" });
+  }
+});
+
+// ── frames ──────────────────────────────────────────────────────────────────
+//
+// A page with a same-site frame (in the page's renderer, reached through an
+// isolated world) and a support chat from another site (its own renderer,
+// reached through a session from Target.setAutoAttach), the way Stripe's
+// support page embeds its widget.
+
+/**
+ * Play that page. The page lists 2 controls, the same-site frame 1, the chat
+ * 2. Returns what was sent, as [method, params, sessionId].
+ */
+function playFramedPage(tabId, { chatSite = "https://help.example/chat", chatGone = false } = {}) {
+  const sent = [];
+  const owners = {
+    SAME: { left: 10, top: 500, width: 300, height: 100, name: "", outer: { width: 300, height: 100 } },
+    CHAT: { left: 800, top: 200, width: 400, height: 500, name: "Support Widget", outer: { width: 410, height: 510 } },
+  };
+  pageEval = (method, params, tab, session) => {
+    sent.push([method, params, session]);
+    const expression = params.expression ?? "";
+    if (method === "Target.setAutoAttach" && !session) {
+      debuggerEventListener({ tabId }, "Target.attachedToTarget", {
+        sessionId: "S-CHAT", targetInfo: { type: "iframe", targetId: "CHAT", url: chatSite },
+      });
+      return {};
+    }
+    if (method === "Page.getFrameTree") {
+      if (session === "S-CHAT") {
+        if (chatGone) throw new Error("No session with given id");
+        return { frameTree: { frame: { id: "CHAT", parentId: "MAIN", url: chatSite } } };
+      }
+      return { frameTree: { frame: { id: "MAIN", url: "https://shop.example/support" },
+        childFrames: [{ frame: { id: "SAME", parentId: "MAIN", url: "https://shop.example/faq" } }] } };
+    }
+    if (method === "Page.createIsolatedWorld") return { executionContextId: params.frameId === "SAME" ? 7 : 9 };
+    if (method === "DOM.getFrameOwner") return { backendNodeId: params.frameId === "SAME" ? 11 : 12 };
+    if (method === "DOM.resolveNode") return { object: { objectId: params.backendNodeId === 11 ? "owner-SAME" : "owner-CHAT" } };
+    if (method === "Runtime.callFunctionOn" && /^owner-/.test(params.objectId)) {
+      const owner = owners[params.objectId.slice(6)];
+      return { result: { value: { ...owner, shown: true, listed: true, view: { width: 1280, height: 800 } } } };
+    }
+    if (method === "Runtime.evaluate" && expression.includes("const base = options.base")) {
+      const options = JSON.parse(expression.slice(expression.lastIndexOf("(") + 1, -1));
+      const where = session === "S-CHAT" ? "chat" : params.contextId === 7 ? "same" : "page";
+      const labels = { page: ["Top button", "Search"], same: ["FAQ"], chat: ["Message", "Send"] }[where];
+      const elements = labels.map((label, i) => ({ i: options.base + i, tag: "button", label, x: 20 + i * 10, y: 30, inView: true }))
+        .filter((element) => element.i >= options.offset && element.i < options.offset + options.limit);
+      return { result: { value: {
+        title: { page: "Support", same: "FAQ", chat: "Support Conversations Widget" }[where],
+        url: "x", elements, total: labels.length, offset: options.offset, limit: options.limit,
+        frames: where === "page" ? 2 : 0, framed: where === "page" ? 2 : 0, scope: "page", shown: true,
+        truncated: false, nextOffset: null,
+      } } };
+    }
+    if (method === "Runtime.evaluate" && expression.includes("const out = { title: document.title")) {
+      const where = session === "S-CHAT" ? "chat" : params.contextId === 7 ? "same" : "page";
+      const text = { page: "Contact support", same: "Questions and answers", chat: "Hello from the assistant\nHow can I help?" }[where];
+      return { result: { value: { title: where === "chat" ? "Support Conversations Widget" : "x", url: "x", text, links: [], shown: true } } };
+    }
+    return { result: { value: {} } };
+  };
+  return sent;
+}
+
+test("a snapshot lists controls inside frames, numbered after the page's and placed on the page", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/support", sessionId: "frames1" })).tabId;
+  const sent = playFramedPage(tab);
+  try {
+    const result = await callAndWait("snapshot", { tabId: tab, sessionId: "frames1" });
+    assert.equal(result.total, 5);
+    assert.deepEqual([...result.elements].map((element) => `${element.i} ${element.label} ${element.frame ?? "-"}`),
+      ["0 Top button -", "1 Search -", "2 FAQ FAQ", "3 Message Support Widget", "4 Send Support Widget"]);
+    const send = result.elements.find((element) => element.label === "Send");
+    assert.equal(send.x, 30 + 800, "a point in the chat is moved by the frame's place on the page");
+    assert.equal(send.y, 30 + 200);
+    assert.equal(result.frames, 0, "every frame was searched");
+    assert.equal(result.framesSearched, 2);
+    // The chat runs in its own session, the same-site frame in an isolated world, never in the page itself.
+    const snapshots = sent.filter(([method, params]) => method === "Runtime.evaluate" && params.expression.includes("const base = options.base"));
+    assert.deepEqual(snapshots.map(([, params, session]) => `${session ?? "tab"}:${params.contextId ?? "-"}`), ["tab:-", "tab:7", "S-CHAT:-"]);
+    const worlds = sent.filter(([method]) => method === "Page.createIsolatedWorld");
+    assert.ok(worlds.every(([, params]) => params.worldName === "munim-computer-use" && params.frameId === "SAME"));
+    assert.ok(!sent.some(([method]) => method === "Runtime.enable"), "Runtime was turned on");
+    assert.equal(tabs.get(tab).active, false, "the tab was activated");
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "frames1" });
+  }
+});
+
+test("a click on an element in a frame runs in that frame and presses at its place on the page", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/support", sessionId: "frames2" })).tabId;
+  const sent = playFramedPage(tab);
+  const played = pageEval;
+  pageEval = (method, params, tabId, session) => {
+    const expression = params.expression ?? "";
+    if (expression.includes("window.__cuClickProbe?.done()")) {
+      sent.push([method, params, session]);
+      return { result: { value: { ok: true, tag: "button", label: "Send", x: 30, y: 40, reachable: true, via: "own" } } };
+    }
+    if (expression.includes("const probe = window.__cuClickProbe")) {
+      sent.push([method, params, session]);
+      return { result: { value: { hover: true, press: true, click: true } } };
+    }
+    return played(method, params, tabId, session);
+  };
+  try {
+    await callAndWait("snapshot", { tabId: tab, sessionId: "frames2" });
+    const result = await callAndWait("click", { tabId: tab, index: 4, sessionId: "frames2" });
+    assert.equal(result.route, "input");
+    assert.equal(result.target, '[4] button "Send" in frame "Support Widget"');
+    const mouse = sent.filter(([method]) => method === "Input.dispatchMouseEvent");
+    assert.deepEqual(mouse.map(([, params, session]) => `${params.type}@${params.x},${params.y}:${session ?? "tab"}`),
+      ["mouseMoved@830,240:tab", "mousePressed@830,240:tab", "mouseReleased@830,240:tab"]);
+    const inFrame = sent.filter(([, params]) => (params.expression ?? "").includes("__cuClickProbe"));
+    assert.ok(inFrame.length >= 2 && inFrame.every(([, , session]) => session === "S-CHAT"), "the click scripts ran outside the frame");
+    assert.equal(tabs.get(tab).active, false);
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "frames2" });
+  }
+});
+
+test("a frame element outside what the frame shows is not pressed", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/support", sessionId: "frames3" })).tabId;
+  const sent = playFramedPage(tab);
+  const played = pageEval;
+  pageEval = (method, params, tabId, session) => {
+    if ((params.expression ?? "").includes("window.__cuClickProbe?.done()")) {
+      return { result: { value: { ok: true, tag: "button", label: "Send", x: 30, y: 900, reachable: true, via: "own" } } };
+    }
+    return played(method, params, tabId, session);
+  };
+  try {
+    await callAndWait("snapshot", { tabId: tab, sessionId: "frames3" });
+    const error = await refuses("click", { tabId: tab, index: 4, sessionId: "frames3" });
+    assert.match(error, /not clicked: \[4\] button "Send" in frame "Support Widget" cannot be reached — it is outside the part of frame "Support Widget"/);
+    assert.ok(!sent.some(([method]) => method === "Input.dispatchMouseEvent"), "something was pressed");
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "frames3" });
+  }
+});
+
+test("fill in a frame focuses and checks the field there, and the text goes in through the tab", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/support", sessionId: "frames4" })).tabId;
+  const sent = playFramedPage(tab);
+  const played = pageEval;
+  pageEval = (method, params, tabId, session) => {
+    const expression = params.expression ?? "";
+    if (expression.includes("__cuFillBefore = value()")) {
+      sent.push(["prepare", params, session]);
+      return { result: { value: { ok: true, tag: "textarea", label: "Message" } } };
+    }
+    if (expression.includes("const expected =")) {
+      sent.push(["check", params, session]);
+      return { result: { value: { ok: true, matches: true, length: 5 } } };
+    }
+    return played(method, params, tabId, session);
+  };
+  try {
+    await callAndWait("snapshot", { tabId: tab, sessionId: "frames4" });
+    const result = await callAndWait("fill", { tabId: tab, index: 3, text: "Hello", sessionId: "frames4" });
+    assert.equal(result.target, '[3] textarea "Message" in frame "Support Widget"');
+    const steps = sent.filter(([method]) => ["prepare", "check", "Input.insertText"].includes(method));
+    assert.deepEqual(steps.map(([method, , session]) => `${method}:${session ?? "tab"}`),
+      ["prepare:S-CHAT", "Input.insertText:tab", "check:S-CHAT"]);
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "frames4" });
+  }
+});
+
+test("an index in the page itself still acts on the page", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/support", sessionId: "frames5" })).tabId;
+  const sent = playFramedPage(tab);
+  const played = pageEval;
+  pageEval = (method, params, tabId, session) => {
+    if ((params.expression ?? "").includes("__cuFillBefore = value()")) {
+      sent.push(["prepare", params, session]);
+      return { result: { value: { ok: true, tag: "input", label: "Search" } } };
+    }
+    if ((params.expression ?? "").includes("const expected =")) return { result: { value: { ok: true, matches: true, length: 1 } } };
+    return played(method, params, tabId, session);
+  };
+  try {
+    await callAndWait("snapshot", { tabId: tab, sessionId: "frames5" });
+    const result = await callAndWait("fill", { tabId: tab, index: 1, text: "x", sessionId: "frames5" });
+    assert.equal(result.target, '[1] input "Search"');
+    const prepare = sent.find(([method]) => method === "prepare");
+    assert.equal(prepare[2], undefined);
+    assert.equal(prepare[1].contextId, undefined);
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "frames5" });
+  }
+});
+
+test("read follows the page's text with each frame's, under the frame's name", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/support", sessionId: "frames6" })).tabId;
+  playFramedPage(tab);
+  try {
+    const result = await callAndWait("read", { tabId: tab, sessionId: "frames6" });
+    assert.equal(result.text, 'Contact support\n\n[frame "x"]\nQuestions and answers\n\n[frame "Support Widget"]\nHello from the assistant\nHow can I help?');
+    assert.equal(result.framesRead, 2);
+    assert.equal(result.frames, undefined);
+    const focused = await callAndWait("read", { tabId: tab, query: "assistant", sessionId: "frames6" });
+    assert.equal(focused.matches, 1);
+    assert.match(focused.text, /\[frame "Support Widget"\]\nHello from the assistant/);
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "frames6" });
+  }
+});
+
+test("wait_for_selector is met by a match inside a frame", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/support", sessionId: "frames7" })).tabId;
+  const played = playFramedPage(tab) && pageEval;
+  pageEval = (method, params, tabId, session) => {
+    const expression = params.expression ?? "";
+    if (expression.includes("invalid CSS selector")) {
+      return { result: { value: session === "S-CHAT" ? { met: true } : { met: false, frames: 1, shown: true } } };
+    }
+    if (expression === "document.title") return { result: { value: "Support Conversations Widget" } };
+    return played(method, params, tabId, session);
+  };
+  try {
+    const result = await callAndWait("snapshot", { tabId: tab, waitForSelector: ".assistant-reply", waitTimeoutMs: 1000, sessionId: "frames7" });
+    assert.equal(result.readiness.status, "met");
+    assert.equal(result.readiness.frame, "Support Widget");
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "frames7" });
+  }
+});
+
+test("a frame the user's site rules block is neither searched nor acted in", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/support", sessionId: "frames8" })).tabId;
+  const sent = playFramedPage(tab);
+  const sites = [{ pattern: "help.example", rule: "block" }];
+  try {
+    const result = await callAndWait("snapshot", { tabId: tab, sites, sessionId: "frames8" });
+    assert.equal(result.total, 3, "the chat's controls were listed");
+    assert.equal(result.framesBlocked, 1);
+    assert.equal(result.frames, 1, "the blocked chat counts as not searched");
+    assert.ok(!sent.some(([method, , session]) => method === "Runtime.evaluate" && session === "S-CHAT"), "a script ran in the blocked frame");
+    const read = await callAndWait("read", { tabId: tab, sites, sessionId: "frames8" });
+    assert.doesNotMatch(read.text, /assistant/);
+    assert.equal(read.frames, 1);
+    // Indices from a snapshot taken before the rule: the frame is refused.
+    await callAndWait("snapshot", { tabId: tab, sessionId: "frames8" });
+    const error = await refuses("click", { tabId: tab, index: 4, sites, sessionId: "frames8" });
+    assert.match(error, /element 4 is in a frame from https:\/\/help\.example, which the user's Computer Use policy does not allow/);
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "frames8" });
+  }
+});
+
+test("credentials are never filled into a frame", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/support", sessionId: "frames9" })).tabId;
+  playFramedPage(tab);
+  const windowsBefore = openedWindows.length;
+  try {
+    await callAndWait("snapshot", { tabId: tab, sessionId: "frames9" });
+    const error = await refuses("request_credentials", { tabId: tab, fields: [{ index: 3, kind: "password" }], sessionId: "frames9" });
+    assert.match(error, /element 3 is inside an embedded frame/);
+    assert.equal(openedWindows.length, windowsBefore, "a prompt opened for a field in a frame");
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "frames9" });
+  }
+});
+
+test("an index in a frame that went away asks for a new snapshot", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/support", sessionId: "frames10" })).tabId;
+  playFramedPage(tab);
+  try {
+    await callAndWait("snapshot", { tabId: tab, sessionId: "frames10" });
+    debuggerEventListener({ tabId: tab }, "Target.detachedFromTarget", { sessionId: "S-CHAT" });
+    const error = await refuses("click", { tabId: tab, index: 3, sessionId: "frames10" });
+    assert.match(error, /element 3 was in frame "Support Widget", which is no longer on the page — call browser_snapshot again/);
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "frames10" });
+  }
+});
+
+test("a page with no frames costs no frame calls", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/plain", sessionId: "frames11" })).tabId;
+  const sent = [];
+  pageEval = (method, params) => {
+    sent.push(method);
+    if ((params.expression ?? "").includes("const base = options.base")) {
+      return { result: { value: { title: "Plain", url: "x", elements: [], total: 0, frames: 0, framed: 0, shown: true } } };
+    }
+    return { result: { value: {} } };
+  };
+  try {
+    const result = await callAndWait("snapshot", { tabId: tab, sessionId: "frames11" });
+    assert.equal(result.framed, undefined);
+    assert.ok(!sent.some((method) => /^(Page\.getFrameTree|DOM\.|Page\.createIsolatedWorld)/.test(method)), sent.join(","));
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "frames11" });
+  }
+});
+
+test("screenshot captures a background tab at the size asked for, without showing it", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/support", sessionId: "shot1" })).tabId;
+  const sent = [];
+  const updates = [];
+  const update = chrome.tabs.update;
+  const windowUpdate = chrome.windows.update;
+  chrome.tabs.update = async (id, props) => { updates.push(["tab", id, props]); return update(id, props); };
+  chrome.windows.update = async (id, props) => { updates.push(["window", id, props]); return {}; };
+  pageEval = (method, params) => {
+    sent.push([method, params]);
+    if ((params.expression ?? "").includes("devicePixelRatio")) {
+      return { result: { value: { width: 1400, height: 900, x: 0, y: 120, dpr: 2, shown: true } } };
+    }
+    if (method === "Page.captureScreenshot") return { data: "aW1hZ2U=" };
+    return { result: { value: {} } };
+  };
+  try {
+    const result = await callAndWait("screenshot", { tabId: tab, format: "jpeg", maxWidth: 700, sessionId: "shot1" });
+    assert.equal(result.data, "aW1hZ2U=");
+    assert.equal(result.mimeType, "image/jpeg");
+    assert.equal(result.width, 700);
+    assert.equal(result.height, 450);
+    assert.equal(result.cssWidth, 1400);
+    assert.equal(result.scrollY, 120);
+    const capture = sent.find(([method]) => method === "Page.captureScreenshot")[1];
+    assert.equal(capture.format, "jpeg");
+    assert.equal(capture.quality, 55);
+    assert.equal(capture.clip.scale, 0.25, "2800 device pixels down to 700");
+    assert.equal(capture.clip.y, 120);
+    const full = await callAndWait("screenshot", { tabId: tab, maxWidth: 0, sessionId: "shot1" });
+    assert.equal(full.width, 2800);
+    assert.equal(sent.filter(([method]) => method === "Page.captureScreenshot").at(-1)[1].clip, undefined);
+    assert.equal(updates.length, 0, "the tab or its window was brought forward");
+    assert.equal(tabs.get(tab).active, false);
+    assert.ok(!sent.some(([method]) => method === "Page.bringToFront"));
+    assert.match(await refuses("screenshot", { tabId: tab, format: "gif", sessionId: "shot1" }), /format must be png or jpeg/);
+  } finally {
+    chrome.tabs.update = update;
+    chrome.windows.update = windowUpdate;
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "shot1" });
   }
 });
 

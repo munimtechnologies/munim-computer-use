@@ -169,6 +169,32 @@ pages["/perms"] = `<title>Permissions</title>
     // The last permissions sit under the banner whatever the scroll.
     document.getElementById('list').style.height = '320px';
   </script>`;
+// A support page that embeds its chat from another site, the way Stripe's
+// support page embeds "Support Widget": the chat is a cross-origin frame
+// (localhost vs 127.0.0.1 are different sites, so Chrome runs it in its own
+// process), and the page also has a same-site frame.
+pages["/support"] = `<title>Support</title><h1>Contact support</h1><button>Top button</button>
+  <iframe title="Support Widget" src="OTHER/chat" style="width:520px;height:360px;margin:20px 0 0 60px;border:4px solid #888;padding:6px"></iframe>
+  <iframe src="/faq" style="width:300px;height:120px"></iframe>`;
+pages["/chat"] = `<title>Support Conversations Widget</title><div id="log"><p>Hello from the assistant. How can I help?</p></div>
+  <textarea id="msg" aria-label="Message"></textarea><button id="send">Send</button><script>
+  window.sends = [];
+  document.getElementById('send').addEventListener('click', (e) => {
+    const msg = document.getElementById('msg');
+    window.sends.push([e.isTrusted, msg.value]);
+    const mine = document.createElement('p');
+    mine.textContent = 'You: ' + msg.value;
+    document.getElementById('log').append(mine);
+    msg.value = '';
+    setTimeout(() => {
+      const reply = document.createElement('p');
+      reply.className = 'reply';
+      reply.textContent = 'Assistant: thanks, a specialist will follow up.';
+      document.getElementById('log').append(reply);
+    }, 400);
+  });
+</script>`;
+pages["/faq"] = "<title>FAQ</title><p>Questions and answers</p><button>Open FAQ</button>";
 pages["/user"] = "<title>User window</title><h1>The user's own page</h1><textarea id=\"mine\" aria-label=\"Mine\"></textarea>";
 // #67: file inputs as sites build them: plain ones, one taking several files,
 // one hidden behind a styled label and one hidden behind a button that opens
@@ -226,7 +252,7 @@ const site = http.createServer((req, res) => {
   // No icon, and no error for it: a clean page must have no failed requests.
   if (route === "/favicon.ico") return res.writeHead(204).end();
   if (route === "/api/fail") return res.writeHead(500, { "content-type": "text/plain" }).end("failed");
-  const body = pages[route];
+  const body = pages[route]?.replaceAll("OTHER/", `http://localhost:${site.address().port}/`);
   res.writeHead(body ? 200 : 404, { "content-type": "text/html; charset=utf-8" });
   res.end(body ? `<!doctype html><meta charset="utf-8">${body}` : "not found");
 });
@@ -487,7 +513,8 @@ let tab;
 check("tools/list advertises browser_read and browser_request_credentials", async () => {
   const reply = await rpc("tools/list");
   const names = reply.result.tools.map((entry) => entry.name);
-  assert.equal(names.length, 37);
+  assert.equal(names.length, 38);
+  assert.ok(names.includes("browser_screenshot"));
   assert.ok(names.includes("browser_read") && names.includes("browser_request_credentials"));
   assert.ok(names.includes("browser_handle_dialog") && names.includes("browser_page_errors"));
 });
@@ -1331,6 +1358,89 @@ check("the page cannot see Runtime enabled while the agent works in it", async (
 });
 
 let failed = 0;
+check("frames in a background tab: read, click, fill, wait and see them while the user keeps their tab", async () => {
+  // The user's own tab is the active one in the window the agent's tab opens in.
+  const userTab = await inWorker(`(async () => {
+    const win = (await chrome.windows.getLastFocused({ windowTypes: ["normal"] })).id;
+    const tab = await chrome.tabs.create({ windowId: win, url: ${JSON.stringify(`${base}/user`)}, active: true });
+    return tab.id;
+  })()`);
+  const supportTab = Number(/tab_id=(\d+)/.exec(await ok("browser_open_tab", { url: `${base}/support` }))[1]);
+  await sleep(1200);
+  const state = () => inWorker(`(async () => {
+    const tab = await chrome.tabs.get(${supportTab});
+    const [active] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
+    return { sameWindow: (await chrome.tabs.get(${userTab})).windowId === tab.windowId, agentActive: tab.active, activeId: active?.id };
+  })()`);
+  const start = await state();
+  const front = frontApp();
+  // Chrome's own record of window focus, from here on.
+  await inWorker(`(() => {
+    globalThis.__framesFocus = [];
+    chrome.windows.onFocusChanged.addListener((id) => __framesFocus.push(id));
+    return true;
+  })()`);
+  assert.equal(start.sameWindow, true, "the agent's tab opened in the user's window");
+  assert.equal(start.agentActive, false);
+  assert.equal(start.activeId, userTab, "the user's tab is not the active one");
+
+  const snapshot = await ok("browser_snapshot", { tab_id: supportTab });
+  assert.match(snapshot, /\] button "Top button"/);
+  assert.match(snapshot, /button "Open FAQ" \(in frame "FAQ"\)/);
+  const message = indexOf(snapshot, 'textarea "Message" \\(in frame "Support Widget"\\)');
+  const send = indexOf(snapshot, 'button "Send" \\(in frame "Support Widget"\\)');
+  assert.doesNotMatch(snapshot, /not searched/);
+
+  const read = await ok("browser_read", { tab_id: supportTab });
+  assert.match(read, /\[frame "Support Widget"\]\nHello from the assistant\. How can I help\?/);
+
+  const filled = await ok("browser_fill", { tab_id: supportTab, index: message, text: "Where is my payout?" });
+  assert.match(filled, /in frame "Support Widget"/);
+  assert.doesNotMatch(filled, /set its value directly|differ/);
+  const clicked = await ok("browser_click", {
+    tab_id: supportTab, index: send, return_state: true, wait_for_selector: ".reply", wait_timeout_ms: 5000,
+  });
+  assert.match(clicked, /with real mouse input/);
+  assert.match(clicked, /readiness: met \(visible_selector, \d+ ms\) selector=\.reply in frame "Support Widget"/);
+  const sends = await evaluateIn((url) => url.endsWith("/chat"), "JSON.stringify(window.sends)");
+  assert.equal(sends, JSON.stringify([[true, "Where is my payout?"]]), "the press was not a trusted click in the frame");
+  const after = await ok("browser_read", { tab_id: supportTab, query: "Assistant:" });
+  assert.match(after, /Assistant: thanks, a specialist will follow up\./);
+
+  // Click into the frame's field, then type and edit there, the keys going
+  // to the frame through the tab.
+  const field = indexOf(await ok("browser_snapshot", { tab_id: supportTab }), 'textarea "Message" \\(in frame "Support Widget"\\)');
+  await ok("browser_click", { tab_id: supportTab, index: field });
+  await ok("browser_type", { tab_id: supportTab, text: "Thanks!" });
+  const pressed = await ok("browser_press_key", { tab_id: supportTab, key: "Backspace" });
+  assert.doesNotMatch(pressed, /no text field has focus/, pressed);
+  const typed = await evaluateIn((url) => url.endsWith("/chat"), "document.getElementById('msg').value");
+  assert.equal(typed, "Thanks");
+  const key = await ok("browser_press_key", { tab_id: supportTab, key: "a", modifiers: ["shift"] });
+  assert.match(key, /textarea "Message" in frame "Support Widget"/, key);
+
+  const reply = await rpc("tools/call", { name: "browser_screenshot", arguments: { session_id: SESSION, tab_id: supportTab, format: "png", max_width: 0 } });
+  assert.notEqual(reply.result?.isError, true, JSON.stringify(reply).slice(0, 400));
+  const image = reply.result.content.find((item) => item.type === "image");
+  const caption = reply.result.content.find((item) => item.type === "text").text;
+  assert.match(caption, /^tab \d+ as Chrome shows it, captured in the background: page \d+×\d+ CSS px/);
+  const png = Buffer.from(image.data, "base64");
+  assert.equal(png.subarray(1, 4).toString(), "PNG");
+  const width = png.readUInt32BE(16);
+  assert.ok(width > 200, `image ${width} px wide`);
+  if (shotsDir) {
+    fs.mkdirSync(shotsDir, { recursive: true });
+    fs.writeFileSync(path.join(shotsDir, "frames-background.png"), png);
+  }
+  const end = await state();
+  assert.equal(end.agentActive, false, "the agent's tab became active");
+  assert.equal(end.activeId, userTab, "the user's tab stopped being the active one");
+  assert.equal(await inWorker("JSON.stringify(__framesFocus)"), "[]", "a Chrome window gained or lost focus");
+  assert.equal(frontApp(), front, "another app came to the front");
+  await inWorker(`chrome.tabs.remove(${userTab}).then(() => true)`);
+  await ok("browser_close_tab", { tab_id: supportTab });
+});
+
 for (const [name, body] of checks) {
   try {
     await body();
