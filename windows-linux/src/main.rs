@@ -46,7 +46,7 @@ use platform::{Desktop, DesktopError, Point, ScrollDirection, StateOptions};
 const SERVER_NAME: &str = "mt-desktop";
 const SERVER_TITLE: &str = "Munim Computer Use";
 const SERVER_WEBSITE: &str = "https://munimtech.com/munim-computer-use";
-const SERVER_VERSION: &str = "0.13.0";
+const SERVER_VERSION: &str = "0.14.0";
 
 /// Keeps the agent pointer up for the duration of a `tools/call`, then
 /// schedules a fade once Computer Use tools stop for the task.
