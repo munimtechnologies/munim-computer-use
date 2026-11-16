@@ -37,8 +37,8 @@ jobs:
         # Pinned to a release and checked against its published digest, so a
         # compromised or changed "latest" cannot run with the OIDC token.
         env:
-          MCP_PUBLISHER_VERSION: "1.8.1"
-          MCP_PUBLISHER_SHA256: "a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc"
+          MCP_PUBLISHER_VERSION: "1.8.9"
+          MCP_PUBLISHER_SHA256: "4d527ca8f1ced0394c962dc925c2a4a4addef441cbefd62501c875e9481823a8"
         run: |
           set -eu
           curl -fsSL -o mcp-publisher.tar.gz \
