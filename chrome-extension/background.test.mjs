@@ -1601,6 +1601,79 @@ test("fill refuses an index that is not a plain number before anything reaches t
   }
 });
 
+test("select_option chooses in the page without pressing anything, and lists the options when one is missing", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/checkout", sessionId: "pick" })).tabId;
+  const expressions = [];
+  const input = [];
+  let answer = { ok: true, tag: "select", label: "Size", changed: true, selected: ["Large"] };
+  pageEval = (method, params) => {
+    if (method === "Input.dispatchMouseEvent" || method === "Input.insertText") input.push(method);
+    const expression = params.expression ?? "";
+    if (expression.includes("not a native select")) {
+      expressions.push(expression);
+      return { result: { value: answer } };
+    }
+    return { result: { value: {} } };
+  };
+  try {
+    const chosen = await callAndWait("select_option", { tabId: tab, index: 7, values: ["Large"], sessionId: "pick" });
+    assert.deepEqual([[...chosen.selected], chosen.changed, chosen.target], [["Large"], true, '[7] select "Size"']);
+    assert.ok(expressions[0].includes('const wanted = ["Large"]'), "the value reaches the page as data");
+    assert.deepEqual(input, [], "no mouse or keyboard input is sent");
+
+    // A bare string is one value.
+    await callAndWait("select_option", { tabId: tab, index: 7, values: "Large", sessionId: "pick" });
+    assert.ok(expressions[1].includes('const wanted = ["Large"]'));
+
+    answer = { ok: false, missing: ["XXL"], options: [{ value: "s", label: "Small" }, { value: "Large", label: "Large", disabled: true }], more: 3 };
+    const missing = await refuses("select_option", { tabId: tab, index: 7, values: ["XXL"], sessionId: "pick" });
+    assert.match(missing, /nothing chosen: element 7 has no option "XXL"/);
+    assert.match(missing, /"Small" \(value "s"\), "Large" disabled, and 3 more/);
+
+    answer = { ok: false, reason: "element 7 is div[role=combobox], not a native select. A custom dropdown is opened with browser_click, then its option is clicked" };
+    assert.match(await refuses("select_option", { tabId: tab, index: 7, values: ["a"], sessionId: "pick" }), /custom dropdown is opened with browser_click/);
+
+    const before = expressions.length;
+    assert.match(await refuses("select_option", { tabId: tab, index: "7); alert(1", values: ["a"], sessionId: "pick" }), /index must be an element index/);
+    assert.match(await refuses("select_option", { tabId: tab, index: 7, values: [], sessionId: "pick" }), /values must list 1 to 100/);
+    assert.match(await refuses("select_option", { tabId: tab, index: 7, values: [3], sessionId: "pick" }), /as strings/);
+    assert.equal(expressions.length, before, "a refused call never reaches the page");
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "pick" });
+  }
+});
+
+test("hover moves a real pointer onto the element and presses nothing", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/menu", sessionId: "hover" })).tabId;
+  const mouse = [];
+  pageEval = (method, params) => {
+    if (method === "Input.dispatchMouseEvent") mouse.push(params.type);
+    const expression = params.expression ?? "";
+    if (expression.includes("el.scrollIntoView({ block: 'center'") && expression.includes("__cuClickProbe = {")) {
+      return { result: { value: { ok: true, tag: "a", label: "Products", x: 40, y: 12, reachable: true, via: "own" } } };
+    }
+    if (expression.includes("const probe = window.__cuClickProbe")) return { result: { value: { hover: true, press: false, click: false } } };
+    return { result: { value: {} } };
+  };
+  try {
+    const result = await callAndWait("hover", { tabId: tab, index: 3, sessionId: "hover" });
+    assert.equal(result.hovered, true);
+    assert.equal(result.route, "input");
+    assert.equal(result.target, '[3] a "Products"');
+    assert.deepEqual(mouse, ["mouseMoved"], "only a move: nothing is pressed");
+
+    mouse.length = 0;
+    const at = await callAndWait("hover", { tabId: tab, x: 10, y: 20, sessionId: "hover" });
+    assert.deepEqual([at.x, at.y, at.route], [10, 20, "input"]);
+    assert.deepEqual(mouse, ["mouseMoved"]);
+    assert.match(await refuses("hover", { tabId: tab, sessionId: "hover" }), /provide either index/);
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "hover" });
+  }
+});
+
 /** A page with one file input at index 3, recording the DevTools calls an upload makes. */
 function playFileInput({ multiple = false, via = "input", label = "Attachments", names } = {}) {
   const calls = [];

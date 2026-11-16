@@ -13,21 +13,28 @@ name = "munim-computer-use"
 path = "src/main.rs"
 
 [dependencies]
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-base64 = "0.22.1"
-# Window capture on both targets; encodes to PNG through `image`.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
+# Window capture on both targets; encodes to PNG through `image` (JPEG goes
+# through `jpeg-encoder`, below).
 xcap = "0.9.8"
 # Local IPC for the Chrome bridge: named pipes on Windows, Unix sockets on Linux.
-interprocess = "2.4.4"
-image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+interprocess = "2.4.8"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+# SIMD (AVX2/SSE4.1/NEON) downscaling for screenshots and OCR input; the
+# `image` crate's scalar filter was most of a screenshot's encode time.
+fast_image_resize = "6.1.0"
+# JPEG screenshots: SIMD (AVX2, run-time detected) and RGBA in, about a third
+# of the `image` crate's JPEG encoder time.
+jpeg-encoder = { version = "0.7.1", features = ["simd"] }
 
 [target.'cfg(windows)'.dependencies]
 # Friendly wrapper over the UI Automation COM API. Raw `windows` bindings would
 # put several hundred lines of COM plumbing between us and every tool call.
 uiautomation = "0.25.1"
 # The LocalSystem service behind secure-desktop capture (secure_desktop.rs).
-windows-service = "0.8"
+windows-service = "0.8.1"
 windows = { version = "0.62.2", features = [
   "Win32_Foundation",
   "Win32_UI_Input_KeyboardAndMouse",
@@ -69,10 +76,10 @@ windows = { version = "0.62.2", features = [
 [target.'cfg(any(windows, target_os = "linux"))'.dependencies]
 # clipboard_read / clipboard_write: the Win32 clipboard and the X11 CLIPBOARD
 # selection. Text only, so the image feature (and its dependencies) stay off.
-arboard = { version = "3.6.1", default-features = false }
+arboard = { version = "3.7.0", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = "0.2.191"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # AT-SPI is the only general accessibility surface on Linux. It is async-first,

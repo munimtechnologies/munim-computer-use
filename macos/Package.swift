@@ -1,4 +1,4 @@
-// swift-tools-version:5.9
+// swift-tools-version:6.1
 import PackageDescription
 
 // Desktop control MCP server. macOS only: it talks to the Accessibility API,
@@ -23,4 +23,8 @@ let package = Package(
       path: "Sources",
     ),
   ],
+  // Swift 6 language mode would turn this server's main-thread hops and
+  // shared registries into strict-concurrency errors; the code is written for
+  // and tested in Swift 5 mode, which the 6.x toolchains keep supporting.
+  swiftLanguageModes: [.v5],
 )

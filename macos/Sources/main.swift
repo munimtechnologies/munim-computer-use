@@ -1923,6 +1923,137 @@ func toolActivateApp(_ args: [String: Any]) -> String {
     return "activated \(resolved.app.localizedName ?? query) (pid \(resolved.app.processIdentifier))"
 }
 
+// MARK: - Launching apps
+
+/// The folders macOS keeps apps in, searched for an app by name.
+let applicationFolders: [URL] = {
+    var folders = [
+        "/Applications", "/Applications/Utilities", "/System/Applications",
+        "/System/Applications/Utilities", "/System/Library/CoreServices/Applications",
+    ].map { URL(fileURLWithPath: $0) }
+    folders.append(FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications"))
+    return folders
+}()
+
+struct InstalledApp {
+    let url: URL
+    /// The bundle's file name without .app: what Finder and list_apps show.
+    let name: String
+    let bundleId: String
+}
+
+func installedApps() -> [InstalledApp] {
+    var apps: [InstalledApp] = []
+    for folder in applicationFolders {
+        guard let items = try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) else { continue }
+        for url in items where url.pathExtension == "app" {
+            apps.append(InstalledApp(
+                url: url, name: url.deletingPathExtension().lastPathComponent,
+                bundleId: Bundle(url: url)?.bundleIdentifier ?? ""))
+        }
+    }
+    return apps
+}
+
+/// The one installed app `query` names: an exact name or bundle id (ignoring
+/// case), then a unique name that starts with it, then a unique name that
+/// contains it. Same rules and wording as the Rust server's launch::choose.
+func chooseInstalledApp(_ query: String, _ apps: [InstalledApp]) -> Result<InstalledApp, StepPlanError> {
+    let wanted = query.lowercased()
+    if let exact = apps.first(where: { $0.name.lowercased() == wanted || $0.bundleId.lowercased() == wanted }) {
+        return .success(exact)
+    }
+    let tests: [(String) -> Bool] = [{ $0.hasPrefix(wanted) }, { $0.contains(wanted) }]
+    for test in tests {
+        let found = apps.filter { test($0.name.lowercased()) }
+        if found.isEmpty { continue }
+        if found.count == 1 { return .success(found[0]) }
+        let names = Array(Set(found.map { $0.name })).sorted()
+        let shown = names.prefix(10).map { "\"\($0)\"" }.joined(separator: ", ")
+        let more = names.count > 10 ? " and \(names.count - 10) more" : ""
+        return .failure(StepPlanError(
+            "'\(query)' matches \(names.count) installed apps: \(shown)\(more) — pass the full name of the one you mean"))
+    }
+    return .failure(StepPlanError(
+        "no installed app is named '\(query)' — pass the name Applications lists, or call list_apps if it is already running"))
+}
+
+/// On-screen windows a process has at the normal window level.
+func onScreenWindowCount(pid: pid_t) -> Int {
+    let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+    return windows.filter {
+        ($0[kCGWindowOwnerPID as String] as? Int).map { pid_t($0) } == pid && ($0[kCGWindowLayer as String] as? Int) == 0
+    }.count
+}
+
+/// What `openApplication` answered, handed from its completion queue.
+final class LaunchAnswer: @unchecked Sendable {
+    var app: NSRunningApplication?
+    var error: Error?
+}
+
+/// launch_app: open an installed app through Launch Services without
+/// activating it, then wait for its first window. A running app is reported,
+/// not opened again.
+func toolLaunchApp(_ args: [String: Any]) -> String {
+    guard let query = (args["app"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !query.isEmpty else {
+        return "error: missing required argument 'app'"
+    }
+    let wait = (args["wait_seconds"] as? Double) ?? 10
+    guard wait.isFinite, wait >= 0, wait <= 30 else { return "error: wait_seconds must be between 0 and 30" }
+    let app: InstalledApp
+    if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: query) {
+        app = InstalledApp(url: url, name: url.deletingPathExtension().lastPathComponent, bundleId: query)
+    } else {
+        switch chooseInstalledApp(query, installedApps()) {
+        case .success(let found): app = found
+        case .failure(let error): return "error: \(error.message)"
+        }
+    }
+    let target = app.url.standardizedFileURL
+    if let running = NSWorkspace.shared.runningApplications.first(where: {
+        (!app.bundleId.isEmpty && $0.bundleIdentifier == app.bundleId) || $0.bundleURL?.standardizedFileURL == target
+    }) {
+        let pid = running.processIdentifier
+        return "\(running.localizedName ?? app.name) is already running (pid \(pid)) — nothing was started. "
+            + "Read it with get_app_state app=\"\(pid)\", or bring it forward with activate_app"
+    }
+    if let refusal = PolicyStore.checkApp(name: app.name, id: app.bundleId.isEmpty ? app.name : app.bundleId) {
+        return refusal
+    }
+    let configuration = NSWorkspace.OpenConfiguration()
+    // In the background: the user keeps the app they are in.
+    configuration.activates = false
+    configuration.addsToRecentItems = false
+    configuration.promptsUserIfNeeded = false
+    let answered = DispatchSemaphore(value: 0)
+    let answer = LaunchAnswer()
+    NSWorkspace.shared.openApplication(at: app.url, configuration: configuration) { running, error in
+        answer.app = running
+        answer.error = error
+        answered.signal()
+    }
+    if answered.wait(timeout: .now() + 30) == .timedOut {
+        return "error: macOS did not answer the request to open \(app.name) within 30 s"
+    }
+    if let error = answer.error { return "error: could not open \(app.name): \(error.localizedDescription)" }
+    guard let opened = answer.app else { return "error: macOS opened nothing for \(app.name)" }
+    let pid = opened.processIdentifier
+    let deadline = Date().addingTimeInterval(wait)
+    var windows = onScreenWindowCount(pid: pid)
+    while windows == 0, Date() < deadline {
+        usleep(250_000)
+        windows = onScreenWindowCount(pid: pid)
+    }
+    let name = opened.localizedName ?? app.name
+    if windows > 0 {
+        return "launched \(app.name) — it is running as \(name) (pid \(pid)) with \(windows) window\(windows == 1 ? "" : "s"). "
+            + "Read it with get_app_state app=\"\(pid)\""
+    }
+    return "launched \(app.name) — it is running as \(name) (pid \(pid)), but showed no window within \(Int(wait)) s: "
+        + "it may still be loading, or run without one. Call wait, then list_apps"
+}
+
 // MARK: - Screen capture
 
 /// How a capture is encoded. PNG by default: agents read UI text, and PNG keeps
@@ -3753,6 +3884,66 @@ func toolBrowserType(_ args: [String: Any]) -> String {
     }
 }
 
+func toolBrowserHover(_ args: [String: Any]) -> String {
+    guard let tabId = args["tab_id"] as? Int else { return "error: missing required argument 'tab_id'" }
+    var params: [String: Any] = ["tabId": tabId]
+    if let index = args["index"] as? Int {
+        params["index"] = index
+    } else if let x = args["x"] as? Double, let y = args["y"] as? Double {
+        params["x"] = x
+        params["y"] = y
+    } else {
+        return "error: provide either index (from browser_snapshot), or both x and y"
+    }
+    return bridgeText(browserSessionCall("hover", withReturnState(params, args), args: args)) { payload in
+        withPageAfter(describeHover(payload, tabId: tabId), payload)
+    }
+}
+
+/// Where browser_hover rested the agent's pointer, and how it got there.
+/// Worded as the Windows and Linux server words it.
+func describeHover(_ payload: [String: Any], tabId: Int) -> String {
+    let at: String
+    if let target = payload["target"] as? String {
+        at = target
+    } else {
+        let x = (payload["x"] as? Double ?? 0).rounded()
+        let y = (payload["y"] as? Double ?? 0).rounded()
+        at = "(\(Int(x)), \(Int(y)))"
+    }
+    var line = "hovered over \(at) in tab \(tabId)"
+    if payload["route"] as? String == "input" {
+        line += " with the real mouse pointer; nothing was pressed"
+    } else {
+        let why = payload["why"] as? String ?? "real input could not reach it"
+        line += " as page events (\(why)); nothing was pressed. Hover handlers ran, CSS :hover styles do not apply"
+    }
+    return line + noteSuffix(payload)
+}
+
+func toolBrowserSelectOption(_ args: [String: Any]) -> String {
+    guard let tabId = args["tab_id"] as? Int else { return "error: missing required argument 'tab_id'" }
+    guard let index = args["index"] as? Int else { return "error: missing required argument 'index'" }
+    guard let values = args["values"] else { return "error: missing required argument 'values' (option values or labels)" }
+    // Passed through as given: the extension checks them, the same on every platform.
+    let params: [String: Any] = ["tabId": tabId, "index": index, "values": values]
+    return bridgeText(browserSessionCall("select_option", withReturnState(params, args), args: args)) { payload in
+        withPageAfter(describeSelectOption(payload, tabId: tabId), payload)
+    }
+}
+
+/// What browser_select_option chose, read back from the select, and whether
+/// the page saw a change. Worded as the Windows and Linux server words it.
+func describeSelectOption(_ payload: [String: Any], tabId: Int) -> String {
+    let target = payload["target"] as? String ?? "the select"
+    let selected = (payload["selected"] as? [Any] ?? []).compactMap { $0 as? String }.map { "\"\($0)\"" }
+    var line = "\(target) in tab \(tabId) now has \(selected.isEmpty ? "nothing" : selected.joined(separator: ", ")) selected"
+    line += payload["changed"] as? Bool == false
+        ? " — it already had that, so the page got no change event"
+        : " — the page got its input and change events"
+    return line + noteSuffix(payload)
+}
+
 func toolBrowserFill(_ args: [String: Any]) -> String {
     guard let tabId = args["tab_id"] as? Int else { return "error: missing required argument 'tab_id'" }
     guard let index = args["index"] as? Int else { return "error: missing required argument 'index'" }
@@ -4231,6 +4422,33 @@ let toolDefs: [[String: Any]] = [
         ],
         "annotations": [
             "title": "Activate app",
+            "readOnlyHint": false,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false,
+        ],
+    ],
+    [
+        "name": "launch_app",
+        "description": "Start an installed app that is not running yet, by the name the system's app list shows (the Start menu on Windows, the app launcher on Linux, Applications on macOS) or its id (bundle id on macOS, Start menu AppID on Windows, desktop file id on Linux), then wait for its first window. A unique start of a name is enough (\"calc\" for Calculator); several matches are listed instead of guessed. If the app is already running, nothing is started and the reply gives its pid: use get_app_state or activate_app. The reply names the running app and its pid for get_app_state. macOS opens it without bringing it to the front; on Windows and Linux its first window may come to the front, so the user's foreground rule applies. The user's app rules apply as they do to every app.",
+        "inputSchema": [
+            "type": "object",
+            "properties": [
+                "app": [
+                    "type": "string",
+                    "description": "App name as the system lists installed apps (\"Calculator\", \"Visual Studio Code\"), or its bundle id, Start menu AppID or desktop file id",
+                ],
+                "wait_seconds": [
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 30,
+                    "description": "How long to wait for the app's first window (default 10). 0 starts it and returns at once.",
+                ],
+            ],
+            "required": ["app"],
+        ],
+        "annotations": [
+            "title": "Launch app",
             "readOnlyHint": false,
             "destructiveHint": false,
             "idempotentHint": true,
@@ -5011,6 +5229,61 @@ let toolDefs: [[String: Any]] = [
         ],
     ],
     [
+        "name": "browser_hover",
+        "description": "Rest the agent's pointer on an element in one of the agent's tabs, by its browser_snapshot index (preferred) or at a point in page coordinates, to open a menu, submenu or tooltip that appears on hover. Nothing is pressed. Works on a background tab with real (trusted) mouse movement, without selecting the tab or raising its window; the element is scrolled into view and checked the way browser_click checks it, and when something else covers it the call fails, naming what is in front. Pass return_state with wait_for_selector to see what the hover opened in the same call. Use hover for native app windows.",
+        "inputSchema": [
+            "type": "object",
+            "properties": [
+                "session_id": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session.",
+                ],
+                "tab_id": [
+                    "type": "integer",
+                    "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs",
+                ],
+                "index": [
+                    "type": "integer",
+                    "description": "Element index from the latest browser_snapshot of this tab. Preferred over coordinates.",
+                ],
+                "x": [
+                    "type": "number",
+                    "description": "Page x coordinate in CSS pixels, used together with y when no index is given",
+                ],
+                "y": [
+                    "type": "number",
+                    "description": "Page y coordinate in CSS pixels, used together with x when no index is given",
+                ],
+                "return_state": [
+                    "type": "boolean",
+                    "description": "Append a current snapshot and readiness status after acting. Without wait_for_selector, only a short pause and bounded navigation wait are used; SPA readiness is not guaranteed. Snapshot indices replace earlier ones. A timeout does not mean the action failed: re-observe with browser_snapshot before repeating it.",
+                ],
+                "wait_for_selector": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2000,
+                    "description": "Wait for any visible element matching this CSS selector in the page or any of its frames (iframes), including open shadow roots (web components); a timeout says how many frames could not be searched. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI.",
+                ],
+                "wait_timeout_ms": [
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 10000,
+                    "description": "Bound for wait_for_selector in milliseconds (default 8000, maximum 10000; 0 checks once). Requires wait_for_selector. Timeout preserves action success and returns current state. Use browser_snapshot with the same wait to re-observe without repeating an action.",
+                ],
+            ],
+            "required": ["tab_id"],
+        ],
+        "annotations": [
+            "title": "Hover in browser",
+            "readOnlyHint": false,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false,
+        ],
+    ],
+    [
         "name": "browser_type",
         "description": "Type text into the field that currently has focus in one of the agent's tabs; browser_click the field first. Text is inserted at the caret without clearing existing content: to replace a field's whole value use browser_fill. Use browser_press_key for Enter, Tab, Backspace, arrows and shortcuts such as Cmd+A, and type_text for native apps. Never use the desktop press_key or type_text for a Chrome tab: those go to whichever Chrome window is in front, which can be the user's.",
         "inputSchema": [
@@ -5102,6 +5375,62 @@ let toolDefs: [[String: Any]] = [
         ],
         "annotations": [
             "title": "Fill field in browser",
+            "readOnlyHint": false,
+            "destructiveHint": true,
+            "idempotentHint": true,
+            "openWorldHint": false,
+        ],
+    ],
+    [
+        "name": "browser_select_option",
+        "description": "Choose an option of a native select (dropdown) in one of the agent's tabs, by the select's browser_snapshot index and the option's value or visible label, the way a person's choice in Chrome's dropdown lands: the selection changes and the page gets its input and change events. Chrome draws a select's dropdown outside the page, where browser_snapshot and browser_click cannot reach it, so use this instead of clicking. A label matches whole, ignoring case when nothing matches exactly. Several values choose several options of a select that allows multiple. Nothing is chosen when an option is missing or disabled, and the reply lists the options. Snapshots show each select's current choice. Works in a background tab without selecting it or raising its window. For a custom dropdown built from other elements, open it with browser_click and click its option.",
+        "inputSchema": [
+            "type": "object",
+            "properties": [
+                "session_id": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session.",
+                ],
+                "tab_id": [
+                    "type": "integer",
+                    "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs",
+                ],
+                "index": [
+                    "type": "integer",
+                    "description": "Element index of the select from the latest browser_snapshot of this tab.",
+                ],
+                "values": [
+                    "type": "array",
+                    "items": [
+                        "type": "string",
+                    ],
+                    "minItems": 1,
+                    "maxItems": 100,
+                    "description": "Option values or visible labels to choose. One for an ordinary select; several only for a select that allows multiple, which then holds exactly these.",
+                ],
+                "return_state": [
+                    "type": "boolean",
+                    "description": "Append a current snapshot and readiness status after acting. Without wait_for_selector, only a short pause and bounded navigation wait are used; SPA readiness is not guaranteed. Snapshot indices replace earlier ones. A timeout does not mean the action failed: re-observe with browser_snapshot before repeating it.",
+                ],
+                "wait_for_selector": [
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2000,
+                    "description": "Wait for any visible element matching this CSS selector in the page or any of its frames (iframes), including open shadow roots (web components); a timeout says how many frames could not be searched. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI.",
+                ],
+                "wait_timeout_ms": [
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 10000,
+                    "description": "Bound for wait_for_selector in milliseconds (default 8000, maximum 10000; 0 checks once). Requires wait_for_selector. Timeout preserves action success and returns current state. Use browser_snapshot with the same wait to re-observe without repeating an action.",
+                ],
+            ],
+            "required": ["tab_id", "index", "values"],
+        ],
+        "annotations": [
+            "title": "Choose option in browser",
             "readOnlyHint": false,
             "destructiveHint": true,
             "idempotentHint": true,
@@ -5404,20 +5733,18 @@ func advertisedToolDefs() -> [[String: Any]] {
 // MARK: - Server identity
 
 let serverVersion = "0.13.0"
-/// Protocol revisions this server speaks. A client asking for one gets it
-/// echoed back; anything else gets the oldest, which every client understands.
-let supportedProtocolVersions: Set<String> = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
-let fallbackProtocolVersion = "2024-11-05"
-
-func negotiatedProtocolVersion(_ params: [String: Any]) -> String {
-    if let requested = params["protocolVersion"] as? String, supportedProtocolVersions.contains(requested) {
-        return requested
-    }
-    return fallbackProtocolVersion
-}
+/// Who this server is, as `initialize` and every modern result say it.
+let serverInfo: [String: Any] = [
+    "name": "mt-desktop",
+    "title": "Munim Computer Use",
+    "version": serverVersion,
+    "websiteUrl": "https://munimtech.com/munim-computer-use",
+]
+/// The tools capability, the same under every protocol revision.
+let serverCapabilities: [String: Any] = ["tools": ["listChanged": false]]
 
 /// Returned in the `initialize` result; identical in the Rust server.
-let serverInstructions = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. In a Chrome tab the agent works in, use browser_click, browser_type, browser_fill (to replace a field's value) and browser_press_key (keys and shortcuts such as cmd+a); they act on that tab in the background without bringing Chrome forward. Never use the desktop click, press_key or type_text on a Chrome tab: they go to whichever Chrome window is in front, which can be the user's. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Pass return_state on an action to get current state back in the same call. Use run_steps for several actions you already know, like click, type, press return: one call, stopping at the first that fails. For delayed browser UI, use wait_for_selector with return_state and inspect readiness; a loaded tab is not SPA readiness. A timeout does not undo the action: re-observe with browser_snapshot and the same wait before repeating a non-idempotent action. Use browser_read to read a page's text and browser_screenshot to see an agent tab; both work while the tab stays in the background and include frames, so never bring a tab to front to look at it. When a page opens a JavaScript alert, confirm or prompt, browser_snapshot shows it and browser_handle_dialog answers it; browser_page_errors lists a page's exceptions, console errors and failed requests. Never ask for, or type, a password or code yourself: browser_request_credentials lets the user enter it without you seeing it. The user's Computer Use policy can block apps and sites or require their approval; when a call says so, do not work around it. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf."
+let serverInstructions = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. In a Chrome tab the agent works in, use browser_click, browser_type, browser_fill (to replace a field's value) and browser_press_key (keys and shortcuts such as cmd+a); they act on that tab in the background without bringing Chrome forward. Choose in a native select (dropdown) with browser_select_option, and open menus that appear on hover with browser_hover. Never use the desktop click, press_key or type_text on a Chrome tab: they go to whichever Chrome window is in front, which can be the user's. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Pass return_state on an action to get current state back in the same call. Use run_steps for several actions you already know, like click, type, press return: one call, stopping at the first that fails. For delayed browser UI, use wait_for_selector with return_state and inspect readiness; a loaded tab is not SPA readiness. A timeout does not undo the action: re-observe with browser_snapshot and the same wait before repeating a non-idempotent action. Use browser_read to read a page's text and browser_screenshot to see an agent tab; both work while the tab stays in the background and include frames, so never bring a tab to front to look at it. When a page opens a JavaScript alert, confirm or prompt, browser_snapshot shows it and browser_handle_dialog answers it; browser_page_errors lists a page's exceptions, console errors and failed requests. Never ask for, or type, a password or code yourself: browser_request_credentials lets the user enter it without you seeing it. The user's Computer Use policy can block apps and sites or require their approval; when a call says so, do not work around it. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf."
 
 // MARK: - Clipboard
 
@@ -5514,6 +5841,7 @@ func dispatchTool(_ name: String, _ args: [String: Any]) -> String {
     case "press_key": return toolPressKey(args)
     case "scroll": return toolScroll(args)
     case "activate_app": return toolActivateApp(args)
+    case "launch_app": return toolLaunchApp(args)
     case "list_displays": return toolListDisplays(args)
     case "right_click": return toolRightClick(args)
     case "drag": return toolDrag(args)
@@ -5536,6 +5864,8 @@ func dispatchTool(_ name: String, _ args: [String: Any]) -> String {
     case "browser_click": return toolBrowserClick(args)
     case "browser_type": return toolBrowserType(args)
     case "browser_fill": return toolBrowserFill(args)
+    case "browser_select_option": return toolBrowserSelectOption(args)
+    case "browser_hover": return toolBrowserHover(args)
     case "browser_upload_file": return toolBrowserUploadFile(args)
     case "browser_request_credentials": return toolBrowserRequestCredentials(args)
     case "browser_press_key": return toolBrowserPressKey(args)
@@ -5738,7 +6068,7 @@ func callTool(_ name: String, _ args: [String: Any]) -> [String: Any] {
     // list_displays / browser_* do not need Accessibility — Screen
     // Recording / Chrome bridge only. Keep them ahead of the AX gate so
     // the Screen Recording-only flow can still recover (Bot finding).
-    if name == "list_displays" || name.hasPrefix("browser_") || name.hasPrefix("clipboard_") {
+    if name == "list_displays" || name == "launch_app" || name.hasPrefix("browser_") || name.hasPrefix("clipboard_") {
         let out = dispatch(name, args)
         return textResult(out, isError: out.hasPrefix("error:"))
     }
@@ -5766,8 +6096,10 @@ func respond(id: Any, result: [String: Any]) {
     send(["jsonrpc": "2.0", "id": id, "result": result])
 }
 
-func respondError(id: Any, code: Int, message: String) {
-    send(["jsonrpc": "2.0", "id": id, "error": ["code": code, "message": message]])
+func respondError(id: Any, code: Int, message: String, data: [String: Any]? = nil) {
+    var error: [String: Any] = ["code": code, "message": message]
+    if let data { error["data"] = data }
+    send(["jsonrpc": "2.0", "id": id, "error": error])
 }
 
 func textResult(_ s: String, isError: Bool = false) -> [String: Any] {
@@ -5916,23 +6248,48 @@ while let line = readLine(strippingNewline: true) {
     }
 
     let id = msg["id"]
+    let requestParams = msg["params"] as? [String: Any] ?? [:]
+
+    // A modern (2026-07-28) request names its revision in `_meta`; one that
+    // cannot be served under any revision is refused before anything runs.
+    // Notifications are never answered, so only requests are checked.
+    var era = ProtocolEra.legacy
+    if let id {
+        switch classifyRequest(method, requestParams) {
+        case .success(let chosen): era = chosen
+        case .failure(let refusal):
+            respondError(id: id, code: refusal.code, message: refusal.message, data: refusal.data)
+            continue
+        }
+    }
+    /// The answer in the envelope its revision expects: unchanged for legacy,
+    /// with `resultType` and the server's identity for modern.
+    func answer(_ result: [String: Any], cacheable: Bool = false) {
+        guard case .modern = era else { return respond(id: id ?? NSNull(), result: result) }
+        let body = cacheable ? cacheableResult(result) : result
+        respond(id: id ?? NSNull(), result: completeModernResult(body, serverInfo: serverInfo))
+    }
 
     switch method {
     case "initialize":
         respond(id: id ?? NSNull(), result: [
-            "protocolVersion": negotiatedProtocolVersion(msg["params"] as? [String: Any] ?? [:]),
-            "capabilities": ["tools": ["listChanged": false]],
-            "serverInfo": [
-                "name": "mt-desktop",
-                "title": "Munim Computer Use",
-                "version": serverVersion,
-                "websiteUrl": "https://munimtech.com/munim-computer-use",
-            ],
+            "protocolVersion": negotiatedProtocolVersion(requestParams),
+            "capabilities": serverCapabilities,
+            "serverInfo": serverInfo,
             "instructions": serverInstructions,
         ])
 
+    case "server/discover":
+        // Only a modern request gets here: classifyRequest refuses one without `_meta`.
+        guard id != nil else { break }
+        answer([
+            "supportedVersions": supportedProtocolVersions,
+            "capabilities": serverCapabilities,
+            "instructions": serverInstructions,
+        ], cacheable: true)
+
     case "tools/list":
-        respond(id: id ?? NSNull(), result: ["tools": advertisedToolDefs()])
+        answer(["tools": advertisedToolDefs()], cacheable: true)
 
     case "tools/call":
         // Pointer fade is keyed to Computer Use tool traffic: stay up while
@@ -5942,18 +6299,18 @@ while let line = readLine(strippingNewline: true) {
             defer { AgentCursor.shared.noteDesktopToolFinished() }
 
             guard let id else { break }
-            let params = msg["params"] as? [String: Any] ?? [:]
-            guard let name = params["name"] as? String else {
+            guard let name = requestParams["name"] as? String else {
                 respondError(id: id, code: -32602, message: "missing tool name")
                 break
             }
-            let args = params["arguments"] as? [String: Any] ?? [:]
+            let args = requestParams["arguments"] as? [String: Any] ?? [:]
 
-            respond(id: id, result: name == "run_steps" ? runSteps(args) : callTool(name, args))
+            answer(name == "run_steps" ? runSteps(args) : callTool(name, args))
         }
 
     case "ping":
-        respond(id: id ?? NSNull(), result: [:])
+        // Gone from the modern revision; still answered for clients that probe with it.
+        answer([:])
 
     case "notifications/cancelled":
         // Host aborted the turn — drop the pointer immediately.

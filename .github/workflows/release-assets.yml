@@ -55,7 +55,7 @@ jobs:
           test "$reported" = '"version":"${{ inputs.version }}"'
       - name: Package
         run: tar -czf "munim-computer-use-linux-${{ matrix.arch }}.tar.gz" -C target/release munim-computer-use
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           retention-days: 1
           name: linux-${{ matrix.arch }}
@@ -72,7 +72,7 @@ jobs:
         run: |
           node scripts/build-extension.mjs --out dist/chrome-extension
           (cd dist/chrome-extension && zip -qr ../../munim-computer-use-chrome-extension.zip .)
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           retention-days: 1
           name: chrome-extension
@@ -85,7 +85,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       TAG: v${{ inputs.version }}
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           path: assets
           merge-multiple: true

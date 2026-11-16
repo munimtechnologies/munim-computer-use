@@ -1065,7 +1065,7 @@ fn normalise(_command: &str, args: &Value) -> Value {
     if let Some(session) = args.get("session_id").filter(|v| !v.is_null()) {
         map.insert("sessionId".into(), session.clone());
     }
-    for key in ["url", "text", "key", "modifiers", "index", "x", "y", "all", "query", "offset", "limit", "fields", "reason", "paths", "action", "format", "quality"] {
+    for key in ["url", "text", "key", "modifiers", "index", "x", "y", "all", "query", "offset", "limit", "fields", "reason", "paths", "action", "format", "quality", "values"] {
         if let Some(value) = args.get(key) {
             map.insert(key.into(), value.clone());
         }
@@ -1221,6 +1221,8 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
                 ),
                 "fill" => describe_fill(tab, result, args),
                 "upload_file" => describe_upload(tab, result, args),
+                "select_option" => describe_select_option(tab, result),
+                "hover" => describe_hover(tab, result),
                 "press" => {
                     let mut line = format!(
                         "pressed {} in tab {tab}",
@@ -1297,6 +1299,50 @@ fn describe_fill(tab: i64, result: &Value, args: &Value) -> String {
     if let Some(note) = result.get("note").and_then(Value::as_str) {
         line.push_str(&format!(" — {note}"));
     }
+    line
+}
+
+/// What browser_select_option chose, read back from the select, and whether
+/// the page saw a change. Worded as the macOS server words it.
+fn describe_select_option(tab: i64, result: &Value) -> String {
+    let target = result.get("target").and_then(Value::as_str).unwrap_or("the select");
+    let selected: Vec<String> = result
+        .get("selected")
+        .and_then(Value::as_array)
+        .map(|labels| labels.iter().filter_map(Value::as_str).map(|label| format!("\"{label}\"")).collect())
+        .unwrap_or_default();
+    let chosen = if selected.is_empty() { "nothing".to_string() } else { selected.join(", ") };
+    let mut line = format!("{target} in tab {tab} now has {chosen} selected");
+    line.push_str(if result.get("changed").and_then(Value::as_bool) == Some(false) {
+        " — it already had that, so the page got no change event"
+    } else {
+        " — the page got its input and change events"
+    });
+    line.push_str(&note_suffix(result));
+    line
+}
+
+/// Where browser_hover rested the agent's pointer, and how it got there.
+fn describe_hover(tab: i64, result: &Value) -> String {
+    let at = match result.get("target").and_then(Value::as_str) {
+        Some(target) => target.to_string(),
+        None => format!(
+            "({}, {})",
+            result.get("x").and_then(Value::as_f64).unwrap_or(0.0).round(),
+            result.get("y").and_then(Value::as_f64).unwrap_or(0.0).round()
+        ),
+    };
+    let mut line = format!("hovered over {at} in tab {tab}");
+    match result.get("route").and_then(Value::as_str) {
+        Some("input") => line.push_str(" with the real mouse pointer; nothing was pressed"),
+        _ => {
+            let why = result.get("why").and_then(Value::as_str).unwrap_or("real input could not reach it");
+            line.push_str(&format!(
+                " as page events ({why}); nothing was pressed. Hover handlers ran, CSS :hover styles do not apply"
+            ));
+        }
+    }
+    line.push_str(&note_suffix(result));
     line
 }
 
@@ -1883,6 +1929,26 @@ mod tests {
     use std::time::Instant;
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn select_option_and_hover_say_what_happened() {
+        let chosen = describe(
+            "select_option",
+            &json!({ "selected": ["Large"], "changed": true, "target": "[7] select \"Size\"" }),
+            &json!({ "tab_id": 9, "index": 7, "values": ["large"] }),
+        );
+        assert_eq!(chosen, "[7] select \"Size\" in tab 9 now has \"Large\" selected — the page got its input and change events");
+        let same = describe("select_option", &json!({ "selected": ["A", "B"], "changed": false, "target": "[2] select" }), &json!({ "tab_id": 9 }));
+        assert!(same.contains("\"A\", \"B\" selected — it already had that"), "{same}");
+        assert_eq!(normalise("select_option", &json!({ "tab_id": 9, "index": 7, "values": ["a"] }))["values"], json!(["a"]));
+
+        let real = describe("hover", &json!({ "hovered": true, "route": "input", "target": "[3] a \"Products\"" }), &json!({ "tab_id": 4 }));
+        assert_eq!(real, "hovered over [3] a \"Products\" in tab 4 with the real mouse pointer; nothing was pressed");
+        let events = describe("hover", &json!({ "route": "page-events", "why": "the tab is in the background", "x": 10.4, "y": 20 }), &json!({ "tab_id": 4 }));
+        assert!(events.starts_with("hovered over (10, 20) in tab 4 as page events (the tab is in the background)"), "{events}");
+        let after = describe("hover", &json!({ "route": "input", "target": "[3] a", "snapshot": { "title": "Shop", "url": "https://shop.example/", "elements": [] } }), &json!({ "tab_id": 4 }));
+        assert!(after.contains("page after the action"), "{after}");
+    }
 
     #[test]
     fn read_shows_the_text_and_where_to_continue() {

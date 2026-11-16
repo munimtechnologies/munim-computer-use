@@ -44,7 +44,7 @@ jobs:
       - run: cargo test --locked
       - name: Install Python for Windows native-host regression
         if: runner.os == 'Windows'
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - name: Windows native-host backend EOF and restart
@@ -57,18 +57,23 @@ jobs:
         if: runner.os == 'Windows'
         working-directory: .
         run: node scripts/run-steps.test.mjs windows-linux/target/debug/munim-computer-use.exe
+      - name: MCP protocol eras over stdio (2026-07-28 and legacy)
+        if: runner.os == 'Windows'
+        working-directory: .
+        run: node scripts/mcp-protocol.test.mjs windows-linux/target/debug/munim-computer-use.exe
       - name: browser tools end to end (real Chrome)
         if: runner.os == 'Linux'
         working-directory: .
         run: |
           cargo build --release --locked --manifest-path windows-linux/Cargo.toml
+          node scripts/mcp-protocol.test.mjs windows-linux/target/release/munim-computer-use
           chrome=$(npx -y @puppeteer/browsers install chrome@stable --path "$RUNNER_TEMP/cft" | tail -1 | sed 's/^[^ ]* //')
           node scripts/snapshot-dom.test.mjs --chrome "$chrome"
           node scripts/e2e-browser.mjs --server "$PWD/windows-linux/target/release/munim-computer-use" --chrome "$chrome"
 
   swift:
     name: swift build (macOS)
-    runs-on: macos-15
+    runs-on: macos-26
     defaults:
       run:
         working-directory: macos
@@ -78,6 +83,9 @@ jobs:
       - name: run_steps over stdio
         working-directory: .
         run: node scripts/run-steps.test.mjs macos/.build/release/munim-computer-use
+      - name: MCP protocol eras over stdio (2026-07-28 and legacy)
+        working-directory: .
+        run: node scripts/mcp-protocol.test.mjs macos/.build/release/munim-computer-use
       - name: bridge keeps serving new peers with many connected
         working-directory: .
         run: node scripts/bridge-peers.test.mjs macos/.build/release/munim-computer-use 120

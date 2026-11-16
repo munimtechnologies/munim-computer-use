@@ -223,6 +223,28 @@ pages["/upload"] = `<title>Upload</title>
     document.getElementById('pick').onclick = () => document.getElementById('doc').click();
     document.getElementById('form').addEventListener('submit', () => { window.submitted = true; });
   </script>`;
+// Native selects, which Chrome draws outside the page, and a menu that opens
+// on hover (by CSS and by a mouseenter handler). The page logs what it saw.
+pages["/choose"] = `<title>Choose</title>
+  <style>#sub { display: none } #products:hover #sub { display: block }</style>
+  <nav><div id="products" role="button" aria-haspopup="true" tabindex="0">Products<div id="sub"><a href="#laptops">Laptops</a></div></div>
+    <button id="help">Help</button><div id="tip" hidden><a href="#docs">Docs</a></div></nav>
+  <label for="size">Size</label><select id="size" name="size"><option value="s">Small</option><option value="m" selected>Medium</option><option value="l">Large</option><option value="xl" disabled>Extra large</option></select>
+  <label for="colors">Colors</label><select id="colors" multiple><option>Red</option><option>Green</option><option>Blue</option></select>
+  <script>
+    window.events = [];
+    for (const id of ['size', 'colors']) {
+      const el = document.getElementById(id);
+      el.addEventListener('input', () => events.push(['input', id]));
+      el.addEventListener('change', () => events.push(['change', id, [...el.selectedOptions].map((o) => o.value)]));
+    }
+    window.hovers = [];
+    document.getElementById('help').addEventListener('mouseenter', (e) => {
+      hovers.push(['mouseenter', e.isTrusted]);
+      document.getElementById('tip').hidden = false;
+    });
+    document.getElementById('help').addEventListener('mousedown', () => hovers.push(['mousedown']));
+  </script>`;
 // #66: JavaScript dialogs. Each button's result lands in the title, which a
 // snapshot shows once the dialog is answered.
 pages["/dialogs"] = `<title>Dialogs</title>
@@ -513,7 +535,8 @@ let tab;
 check("tools/list advertises browser_read and browser_request_credentials", async () => {
   const reply = await rpc("tools/list");
   const names = reply.result.tools.map((entry) => entry.name);
-  assert.equal(names.length, 38);
+  assert.equal(names.length, 41);
+  for (const name of ["launch_app", "browser_select_option", "browser_hover"]) assert.ok(names.includes(name), `${name} is advertised`);
   assert.ok(names.includes("browser_screenshot"));
   assert.ok(names.includes("browser_read") && names.includes("browser_request_credentials"));
   assert.ok(names.includes("browser_handle_dialog") && names.includes("browser_page_errors"));
@@ -1140,6 +1163,66 @@ check("a blocked site gets no files", async () => {
   }
   assert.equal(await evaluateIn(atUpload, "document.getElementById('one').files.length"), 0);
   await ok("browser_close_tab", { tab_id: uploadTab });
+});
+
+// ── native selects and hover menus ──
+
+let chooseTab;
+const atChoose = (url) => url === `${base}/choose`;
+
+check("browser_select_option chooses by label or value; the page gets input and change; snapshots show the choice", async () => {
+  chooseTab = Number(/tab_id=(\d+)/.exec(await ok("browser_open_tab", { url: `${base}/choose` }))[1]);
+  await sleep(500);
+  const snapshot = await ok("browser_snapshot", { tab_id: chooseTab });
+  assert.match(snapshot, /select "Size" \("Medium" selected of 4 options\)/, snapshot);
+  const size = indexOf(snapshot, 'select "Size"');
+  const text = await ok("browser_select_option", { tab_id: chooseTab, index: size, values: ["large"], return_state: true });
+  assert.match(text, /^\[\d+\] select "Size" in tab \d+ now has "Large" selected — the page got its input and change events/, text);
+  assert.match(text, /select "Size" \("Large" selected of 4 options\)/, text);
+  assert.equal(await evaluateIn(atChoose, "document.getElementById('size').value"), "l");
+  assert.deepEqual(await evaluateIn(atChoose, "events"), [["input", "size"], ["change", "size", ["l"]]]);
+  const same = await ok("browser_select_option", { tab_id: chooseTab, index: size, values: ["l"] });
+  assert.match(same, /it already had that, so the page got no change event/, same);
+  assert.equal((await evaluateIn(atChoose, "events")).length, 2, "no events for an unchanged choice");
+});
+
+check("a multiple select holds exactly the values given; a missing, disabled or extra choice changes nothing", async () => {
+  const snapshot = await ok("browser_snapshot", { tab_id: chooseTab });
+  const colors = indexOf(snapshot, 'select "Colors"');
+  const size = indexOf(snapshot, 'select "Size"');
+  const text = await ok("browser_select_option", { tab_id: chooseTab, index: colors, values: ["Blue", "Red"] });
+  assert.match(text, /now has "Red", "Blue" selected/, text);
+  assert.deepEqual(await evaluateIn(atChoose, "[...document.getElementById('colors').selectedOptions].map((o) => o.value)"), ["Red", "Blue"]);
+  const before = (await evaluateIn(atChoose, "events")).length;
+  const missing = await tool("browser_select_option", { tab_id: chooseTab, index: size, values: ["Huge"] });
+  assert.equal(missing.isError, true, missing.text);
+  assert.match(missing.text, /nothing chosen: element \d+ has no option "Huge"\. Its options: "Small" \(value "s"\), "Medium" \(value "m"\)/);
+  const disabled = await tool("browser_select_option", { tab_id: chooseTab, index: size, values: ["Extra large"] });
+  assert.match(disabled.text, /option "Extra large" of element \d+ is disabled/);
+  const two = await tool("browser_select_option", { tab_id: chooseTab, index: size, values: ["s", "m"] });
+  assert.match(two.text, /takes one choice/);
+  const notSelect = await tool("browser_select_option", { tab_id: chooseTab, index: indexOf(snapshot, 'button "Help"'), values: ["x"] });
+  assert.match(notSelect.text, /is button, not a native select/);
+  assert.equal(await evaluateIn(atChoose, "document.getElementById('size').value"), "l");
+  assert.equal((await evaluateIn(atChoose, "events")).length, before, "refused choices fired no events");
+});
+
+check("browser_hover opens hover menus with real pointer movement and presses nothing", async () => {
+  const snapshot = await ok("browser_snapshot", { tab_id: chooseTab });
+  const help = await ok("browser_hover", {
+    tab_id: chooseTab, index: indexOf(snapshot, 'button "Help"'), return_state: true, wait_for_selector: "#tip a", wait_timeout_ms: 3000,
+  });
+  assert.match(help, /^hovered over \[\d+\] button "Help" in tab \d+ with the real mouse pointer; nothing was pressed/, help);
+  assert.match(help, /readiness: met/);
+  assert.match(help, /a "Docs"/);
+  assert.deepEqual(await evaluateIn(atChoose, "hovers"), [["mouseenter", true]], "a trusted mouseenter, and no press");
+  // CSS :hover follows the real pointer too.
+  const menu = await ok("browser_hover", {
+    tab_id: chooseTab, index: indexOf(snapshot, 'div "Products"'), return_state: true, wait_for_selector: "#sub a", wait_timeout_ms: 3000,
+  });
+  assert.match(menu, /readiness: met/, menu);
+  assert.match(menu, /a "Laptops"/, menu);
+  await ok("browser_close_tab", { tab_id: chooseTab });
 });
 
 // Headless Chrome reports every tab hidden, the front one too, so only a

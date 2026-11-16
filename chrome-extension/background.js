@@ -1634,6 +1634,15 @@ function controlStateInPage(el) {
   // A file input says how many files it holds, so a staged upload shows.
   const files = el.tagName === "INPUT" && el.type === "file" ? el.files?.length || 0 : 0;
   if (files) parts.push(files === 1 ? "1 file" : `${files} files`);
+  // A native select says what it holds, so browser_select_option can be checked
+  // and an agent does not open it to find out.
+  if (el.tagName === "SELECT") {
+    const shown = (option) => String(option.label || option.text || "").replace(/\s+/g, " ").trim().slice(0, 40);
+    const chosen = [...el.selectedOptions].map((option) => `"${shown(option)}"`);
+    const count = el.options.length;
+    const list = chosen.length > 3 ? `${chosen.slice(0, 3).join(", ")} and ${chosen.length - 3} more` : chosen.join(", ");
+    parts.push(`${list || "nothing"} selected of ${count === 1 ? "1 option" : `${count} options`}`);
+  }
   if (el.matches(":disabled") || el.getAttribute("aria-disabled") === "true") parts.push("disabled");
   return parts.join(", ");
 }
@@ -3186,6 +3195,175 @@ async function fillElement(tabId, index, text, access) {
   };
 }
 
+/// Most option values one browser_select_option call may name.
+const SELECT_MAX_VALUES = 100;
+
+/// Choose options of a native select by value or visible label, the way a
+/// person's choice in Chrome's popup lands: the options change, then the page
+/// gets input and change events. Chrome draws a select's popup outside the
+/// page, where neither a snapshot nor a click can reach it, which is why this
+/// exists. A label matches whole, case-insensitively when nothing matches
+/// exactly; a missing or disabled option changes nothing and lists the options.
+const SELECT_OPTION_JS = (index, wanted) => `(() => {
+  const dom = (${pageDomInPage.toString()})();
+  const el = dom.byIndex(${index});
+  if (!el) return { ok: false, reason: 'element ${index} is no longer on the page — call browser_snapshot again' };
+  const clean = (text) => String(text || '').replace(/\\s+/g, ' ').trim();
+  if (el.tagName !== 'SELECT') {
+    const role = el.getAttribute('role');
+    return { ok: false, reason: 'element ${index} is ' + el.tagName.toLowerCase() + (role ? '[role=' + role + ']' : '') +
+      ', not a native select. A custom dropdown is opened with browser_click, then its option is clicked' };
+  }
+  if (el.matches(':disabled')) return { ok: false, reason: 'element ${index} is disabled' };
+  const wanted = ${JSON.stringify(wanted)};
+  if (wanted.length > 1 && !el.multiple) {
+    return { ok: false, reason: 'element ${index} takes one choice (it has no multiple attribute) and ' + wanted.length + ' were given' };
+  }
+  const options = [...el.options];
+  const label = (option) => clean(option.label || option.text);
+  const pick = (value) => options.find((option) => option.value === value) ||
+    options.find((option) => label(option) === clean(value)) ||
+    options.find((option) => label(option).toLowerCase() === clean(value).toLowerCase());
+  const listed = () => options.slice(0, 40).map((option) => ({ value: option.value, label: label(option), disabled: option.disabled }));
+  const chosen = [];
+  const missing = [];
+  for (const value of wanted) {
+    const option = pick(value);
+    if (!option) missing.push(value);
+    else if (option.disabled) return { ok: false, reason: 'option "' + label(option) + '" of element ${index} is disabled' };
+    else if (!chosen.includes(option)) chosen.push(option);
+  }
+  if (missing.length) return { ok: false, missing, options: listed(), more: Math.max(0, options.length - 40) };
+  el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+  el.focus({ preventScroll: true });
+  const before = options.map((option) => option.selected);
+  if (el.multiple) for (const option of options) option.selected = chosen.includes(option);
+  else chosen[0].selected = true;
+  const changed = options.some((option, at) => option.selected !== before[at]);
+  // A person's choice fires these only when the selection changed.
+  if (changed) {
+    el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  const name = clean(el.getAttribute('aria-label') || el.labels?.[0]?.innerText || el.getAttribute('name') || el.id).slice(0, 60);
+  return { ok: true, tag: 'select', label: name, changed, selected: [...el.selectedOptions].map(label) };
+})()`;
+
+/// browser_select_option: choose one option (or several, on a multiple select)
+/// of a snapshotted native select. Works in a background tab: nothing is
+/// pressed and Chrome's popup never opens.
+async function selectOption(tabId, index, values, access) {
+  if (!Number.isInteger(index) || index < 0) {
+    throw new Error("index must be an element index from browser_snapshot");
+  }
+  const wanted = typeof values === "string" ? [values] : values;
+  if (!Array.isArray(wanted) || wanted.length === 0 || wanted.length > SELECT_MAX_VALUES ||
+      !wanted.every((value) => typeof value === "string")) {
+    throw new Error(`values must list 1 to ${SELECT_MAX_VALUES} option values or labels, as strings`);
+  }
+  const frame = await liveFrameForIndex(tabId, index, access);
+  let result;
+  try {
+    result = await evaluateValue(tabId, SELECT_OPTION_JS(index, wanted), "select failed", frame);
+  } catch (error) {
+    // The page's change handler opened a dialog: the choice is made, the page waits.
+    if (!error?.opened) throw error;
+    return openedDialog(error.dialog, { selected: wanted, changed: true, target: `[${index}] select` });
+  }
+  if (!result.ok && result.missing) {
+    const options = (result.options || [])
+      .map((option) => `"${option.label}"${option.value !== option.label ? ` (value "${option.value}")` : ""}${option.disabled ? " disabled" : ""}`)
+      .join(", ");
+    throw new Error(
+      `nothing chosen: element ${index} has no option ${result.missing.map((value) => JSON.stringify(value)).join(" or ")}. ` +
+        `Its options: ${options || "none"}${result.more ? `, and ${result.more} more` : ""}`,
+    );
+  }
+  if (!result.ok) throw new Error(result.reason || "select failed");
+  await markTab(tabId);
+  return {
+    selected: result.selected,
+    changed: result.changed,
+    target: describeTarget(index, result) + (frame ? ` in frame "${frame.name || "frame"}"` : ""),
+  };
+}
+
+/// The pointer's arrival as page events, for a tab real input cannot reach:
+/// handlers that open menus on hover respond; CSS :hover does not follow.
+const HOVER_EVENTS_JS = (index) => `(() => {
+  const el = (${pageDomInPage.toString()})().byIndex(${index});
+  if (!el) return { ok: false, reason: 'element ${index} is no longer on the page' };
+  const r = el.getBoundingClientRect();
+  const x = r.left + r.width / 2;
+  const y = r.top + r.height / 2;
+  const base = { bubbles: true, cancelable: true, composed: true, view: window, clientX: x, clientY: y, button: 0, buttons: 0 };
+  const pointer = { pointerId: 1, pointerType: 'mouse', isPrimary: true, width: 1, height: 1 };
+  const fire = (Type, type, init) => el.dispatchEvent(new Type(type, { ...base, ...init }));
+  fire(PointerEvent, 'pointerover', pointer);
+  fire(PointerEvent, 'pointerenter', { ...pointer, bubbles: false, cancelable: false });
+  fire(MouseEvent, 'mouseover', {});
+  fire(MouseEvent, 'mouseenter', { bubbles: false, cancelable: false });
+  fire(PointerEvent, 'pointermove', pointer);
+  fire(MouseEvent, 'mousemove', {});
+  return { ok: true };
+})()`;
+
+/// browser_hover: rest the agent's pointer on a snapshotted element, to open a
+/// menu or tooltip that appears on hover. Found, scrolled into view and checked
+/// the way a click is; nothing is pressed.
+async function hoverElement(tabId, index, access) {
+  if (!Number.isInteger(index) || index < 0) {
+    throw new Error("index must be an element index from browser_snapshot");
+  }
+  const frame = await liveFrameForIndex(tabId, index, access);
+  const found = await evaluateValue(tabId, CLICK_TARGET_JS(index), "hover failed", frame);
+  if (!found.ok) throw new Error(found.reason || "hover failed");
+  const target = describeTarget(index, found) + (frame ? ` in frame "${frame.name || "frame"}"` : "");
+  const point = await pointInPage(tabId, frame, found.x, found.y);
+  if (point.why && !found.covered) {
+    found.covered = true;
+    found.why = point.why;
+  }
+  if (found.covered) {
+    await evaluateValue(tabId, CLICK_PROBE_JS(true), "hover failed", frame).catch(() => {});
+    throw new Error(
+      `not hovered: ${target} cannot be reached — ${found.why}. ` +
+        "Close or scroll away what is in front of it, then browser_snapshot again",
+    );
+  }
+  const { x, y } = point;
+  let route = "page-events";
+  let why = found.why;
+  if (found.reachable) {
+    try {
+      await send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none", buttons: 0, pointerType: "mouse" });
+      const seen = await evaluateValue(tabId, CLICK_PROBE_JS(false), "hover failed", frame).catch(() => ({ gone: true }));
+      if (seen.hover || seen.gone) route = "input";
+      else why = "real input did not reach it";
+    } finally {
+      await evaluateValue(tabId, CLICK_PROBE_JS(true), "hover failed", frame).catch(() => {});
+    }
+  }
+  if (route !== "input") {
+    const fired = await evaluateValue(tabId, HOVER_EVENTS_JS(index), "hover failed", frame);
+    if (!fired.ok) throw new Error(fired.reason || "hover failed");
+  }
+  const cursor = await paintCursor(tabId, x, y);
+  await markTab(tabId);
+  return { hovered: true, x, y, route, ...(route === "input" ? {} : { why }), target, cursor };
+}
+
+/// browser_hover at page coordinates (CSS pixels of the visible page).
+async function hoverAt(tabId, x, y) {
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    throw new Error("provide either index (from browser_snapshot), or both x and y");
+  }
+  await send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none", buttons: 0, pointerType: "mouse" });
+  const cursor = await paintCursor(tabId, x, y);
+  await markTab(tabId);
+  return { hovered: true, x, y, route: "input", cursor };
+}
+
 async function finishBackspace(tabId, frame = undefined) {
   const res = await evaluateIn(tabId, frame, { expression: EDIT_FINISH_JS, returnByValue: true, userGesture: true });
   const edit = res?.result?.value || {};
@@ -4345,6 +4523,22 @@ const handlers = {
     await checkTab(clientId, p.tabId, p.sites, "type in");
     noteAgentInput(clientId, p.tabId);
     return withState(p, await fillElement(p.tabId, p.index, p.text, p));
+  },
+  select_option: async (p) => {
+    validateReadiness(p, true);
+    const clientId = requireClientId(p);
+    assertOwned(clientId, p.tabId);
+    await checkTab(clientId, p.tabId, p.sites, "choose an option in");
+    noteAgentInput(clientId, p.tabId);
+    return withState(p, await selectOption(p.tabId, p.index, p.values, p));
+  },
+  hover: async (p) => {
+    validateReadiness(p, true);
+    const clientId = requireClientId(p);
+    assertOwned(clientId, p.tabId);
+    await checkTab(clientId, p.tabId, p.sites, "point at");
+    const result = p.index !== undefined ? await hoverElement(p.tabId, p.index, p) : await hoverAt(p.tabId, p.x, p.y);
+    return withState(p, result);
   },
   upload_file: async (p) => {
     validateReadiness(p, true);
