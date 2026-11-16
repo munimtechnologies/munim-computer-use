@@ -30,8 +30,11 @@ pub fn recognize(image: &RgbaImage, frame: &CaptureFrame) -> Result<Vec<OcrText>
     let image = if !(1.0..=1.05).contains(&ratio) {
         let width = ((f64::from(image.width()) * ratio).floor() as u32).max(1);
         let height = ((f64::from(image.height()) * ratio).floor() as u32).max(1);
-        scaled =
-            image::imageops::resize(image, width, height, image::imageops::FilterType::Triangle);
+        // SIMD bilinear, as screenshots use (capture.rs): an up-to-2x scale of
+        // a whole window is tens of milliseconds with the scalar filter.
+        scaled = crate::capture::resize_rgba(image, width, height).unwrap_or_else(|| {
+            image::imageops::resize(image, width, height, image::imageops::FilterType::Triangle)
+        });
         &scaled
     } else {
         image
