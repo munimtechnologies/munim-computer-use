@@ -134,11 +134,16 @@ enum PolicyStore {
 
     /// nil when the app may be used; otherwise the error line for the model.
     static func checkApp(_ app: NSRunningApplication) -> String? {
+        let name = app.localizedName ?? "this app"
+        return checkApp(name: name, id: app.bundleIdentifier ?? name)
+    }
+
+    /// The same check by name and bundle id, for an app that is not running
+    /// yet (launch_app).
+    static func checkApp(name: String, id: String) -> String? {
         let policy = current()
         guard policy.hasAppRules else { return nil }
         if let error = policy.error { return "error: \(error) — fix it before using apps" }
-        let name = app.localizedName ?? "this app"
-        let id = app.bundleIdentifier ?? name
         switch policy.appRule(name: name, id: id) {
         case .allow:
             return nil

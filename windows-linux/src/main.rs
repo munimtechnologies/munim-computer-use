@@ -25,9 +25,11 @@ mod install;
 // Only the Windows and Linux backends press keys; macOS builds compile this for tests.
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 mod keys;
+mod launch;
 mod live;
 mod platform;
 mod policy;
+mod protocol;
 #[cfg(windows)]
 mod secure_desktop;
 mod settle;
@@ -41,11 +43,6 @@ use serde_json::{Value, json};
 use platform::outline::OcrMode;
 use platform::{Desktop, DesktopError, Point, ScrollDirection, StateOptions};
 
-/// Protocol revisions this server speaks, newest first. The tool surface is the
-/// same in all of them; a client asking for one gets it echoed back.
-const SUPPORTED_PROTOCOL_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
-/// Answered to clients that ask for anything else, including older drafts.
-const FALLBACK_PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "mt-desktop";
 const SERVER_TITLE: &str = "Munim Computer Use";
 const SERVER_WEBSITE: &str = "https://munimtech.com/munim-computer-use";
@@ -212,6 +209,23 @@ fn main() {
         #[cfg_attr(not(windows), allow(unused_mut))]
         let mut params = request.get("params").cloned().unwrap_or(json!({}));
 
+        // A modern (2026-07-28) request names its revision in `_meta`; one that
+        // cannot be served under any revision is refused before anything runs.
+        let era = match protocol::classify(&method, &params) {
+            Ok(era) => era,
+            Err(error) => {
+                let mut body = json!({ "code": error.code, "message": error.message });
+                if let Some(data) = error.data {
+                    body["data"] = data;
+                }
+                let response = json!({ "jsonrpc": "2.0", "id": id, "error": body });
+                if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
+                    break;
+                }
+                continue;
+            }
+        };
+
         #[cfg(any(windows, target_os = "linux"))]
         let _tool_guard = (method == "tools/call").then(|| DesktopToolGuard::enter());
 
@@ -225,8 +239,12 @@ fn main() {
         let routed: Option<Value> = None;
 
         let outcome = match routed {
-            Some(result) => Ok(result),
-            None => dispatch(&method, &params, desktop.as_deref_mut(), &mut browser),
+            // The secure desktop helper answered a tools/call: same envelope rule.
+            Some(result) => Ok(match era {
+                protocol::Era::Modern(_) => protocol::complete_modern_result(result, &server_info()),
+                protocol::Era::Legacy => result,
+            }),
+            None => dispatch_in(&era, &method, &params, desktop.as_deref_mut(), &mut browser),
         };
         let response = match outcome {
             Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
@@ -252,14 +270,24 @@ fn main() {
     platform::agent_cursor::AgentCursor::shared().hide();
 }
 
-/// Echo the client's protocol version when it is one we speak, else fall back.
+/// Echo the client's protocol version when it is a legacy one we speak, else fall back.
 fn negotiate_protocol_version(params: &Value) -> &'static str {
-    let requested = params.get("protocolVersion").and_then(Value::as_str);
-    SUPPORTED_PROTOCOL_VERSIONS
-        .iter()
-        .copied()
-        .find(|version| Some(*version) == requested)
-        .unwrap_or(FALLBACK_PROTOCOL_VERSION)
+    protocol::negotiate_legacy_version(params)
+}
+
+/// Who this server is, as `initialize` and every modern result say it.
+fn server_info() -> Value {
+    json!({
+        "name": SERVER_NAME,
+        "title": SERVER_TITLE,
+        "version": SERVER_VERSION,
+        "websiteUrl": SERVER_WEBSITE
+    })
+}
+
+/// The tools capability, the same under every revision.
+fn server_capabilities() -> Value {
+    json!({ "tools": { "listChanged": false } })
 }
 
 /// A JSON-RPC level failure: the request itself was unusable.
@@ -267,6 +295,32 @@ struct RpcError(i64, String);
 
 fn method_not_found(method: &str) -> RpcError {
     RpcError(-32601, format!("unknown method '{method}'"))
+}
+
+/// Answer one request under the revision `classify` chose for it. A modern
+/// request gets the same answer as a legacy one, in the modern envelope.
+fn dispatch_in(
+    era: &protocol::Era,
+    method: &str,
+    params: &Value,
+    desktop: Option<&mut (dyn Desktop + '_)>,
+    browser: &mut browser::BrowserBridge,
+) -> Result<Value, RpcError> {
+    let protocol::Era::Modern(_) = era else {
+        return dispatch(method, params, desktop, browser);
+    };
+    let result = match method {
+        "server/discover" => protocol::cacheable(json!({
+            "supportedVersions": protocol::supported_versions(),
+            "capabilities": server_capabilities(),
+            "instructions": tools::SERVER_INSTRUCTIONS
+        })),
+        "tools/list" => protocol::cacheable(dispatch(method, params, desktop, browser)?),
+        // `initialize` never reaches here (classify keeps it legacy), and the
+        // modern revision has no ping; anything else answers as it always has.
+        _ => dispatch(method, params, desktop, browser)?,
+    };
+    Ok(protocol::complete_modern_result(result, &server_info()))
 }
 
 fn dispatch(
@@ -278,13 +332,8 @@ fn dispatch(
     match method {
         "initialize" => Ok(json!({
             "protocolVersion": negotiate_protocol_version(params),
-            "capabilities": { "tools": { "listChanged": false } },
-            "serverInfo": {
-                "name": SERVER_NAME,
-                "title": SERVER_TITLE,
-                "version": SERVER_VERSION,
-                "websiteUrl": SERVER_WEBSITE
-            },
+            "capabilities": server_capabilities(),
+            "serverInfo": server_info(),
             "instructions": tools::SERVER_INSTRUCTIONS
         })),
         "tools/list" => Ok(json!({ "tools": tools::tool_defs() })),
@@ -449,6 +498,13 @@ fn call_tool(
             Err(error) => text_result(format!("error: {error}"), true),
         };
     }
+    // Launching reads the system's app list, not the accessibility tree.
+    if name == "launch_app" {
+        return match launch_app(&args) {
+            Ok(text) => text_result(text, false),
+            Err(error) => text_result(format!("error: {error}"), true),
+        };
+    }
     if name == "wait" {
         return match wait_seconds(&args) {
             Ok(text) => text_result(text, false),
@@ -467,6 +523,34 @@ fn call_tool(
         Ok(value) => value,
         Err(error) => text_result(format!("error: {error}"), true),
     }
+}
+
+/// launch_app: start an installed app that is not running, and wait for its
+/// window. A running app is reported, not started again.
+fn launch_app(args: &Value) -> Result<String, DesktopError> {
+    let query = arg_str(args, "app")
+        .filter(|query| !query.trim().is_empty())
+        .ok_or_else(|| DesktopError::new("missing required argument 'app'"))?;
+    let wait = arg_f64(args, "wait_seconds").unwrap_or(launch::DEFAULT_WAIT_SECS);
+    if !wait.is_finite() || !(0.0..=launch::MAX_WAIT_SECS).contains(&wait) {
+        return Err(DesktopError::new(format!(
+            "wait_seconds must be between 0 and {:.0}",
+            launch::MAX_WAIT_SECS
+        )));
+    }
+    let installed = launch::installed()?;
+    let app = launch::choose(query, &installed)?;
+    let running = apps::list_apps().unwrap_or_default();
+    if let Some(info) = launch::already_running(app, query, &running) {
+        return Ok(format!(
+            "{} is already running (pid {}) — nothing was started. Read it with get_app_state app=\"{}\",              or bring it forward with activate_app",
+            info.name, info.pid, info.pid
+        ));
+    }
+    policy::check_app(&app.name, &app.id)?;
+    // A new app's first window usually comes to the front.
+    policy::check_foreground(&format!("open {}, whose first window may come to the front", app.name))?;
+    launch::launch_and_wait(app, std::time::Duration::from_secs_f64(wait))
 }
 
 /// The most steps one `run_steps` call may hold.
@@ -1153,6 +1237,8 @@ mod tests {
             assert_eq!(negotiate_protocol_version(&json!({ "protocolVersion": version })), version);
         }
         assert_eq!(negotiate_protocol_version(&json!({ "protocolVersion": "2099-01-01" })), "2024-11-05");
+        // The modern revision has no handshake, so initialize never selects it.
+        assert_eq!(negotiate_protocol_version(&json!({ "protocolVersion": "2026-07-28" })), "2024-11-05");
         assert_eq!(negotiate_protocol_version(&json!({})), "2024-11-05");
     }
 
@@ -1171,6 +1257,46 @@ mod tests {
         assert_eq!(result["serverInfo"]["name"], json!("mt-desktop"));
         assert_eq!(result["serverInfo"]["title"], json!("Munim Computer Use"));
         assert!(result["instructions"].as_str().is_some_and(|text| text.contains("get_app_state")));
+    }
+
+    #[test]
+    fn a_modern_request_gets_the_same_answer_in_the_modern_envelope() {
+        let mut browser = crate::browser::BrowserBridge::inert();
+        let modern = super::protocol::Era::Modern("2026-07-28");
+        let discovered = super::dispatch_in(&modern, "server/discover", &json!({}), None, &mut browser)
+            .ok()
+            .expect("discover succeeds");
+        assert_eq!(discovered["resultType"], json!("complete"));
+        assert_eq!(discovered["supportedVersions"][0], json!("2026-07-28"));
+        assert_eq!(discovered["capabilities"]["tools"], json!({ "listChanged": false }));
+        assert_eq!(discovered["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], json!("mt-desktop"));
+        assert_eq!(discovered["cacheScope"], json!("private"));
+        assert!(discovered["instructions"].as_str().is_some_and(|text| text.contains("get_app_state")));
+
+        let listed = super::dispatch_in(&modern, "tools/list", &json!({}), None, &mut browser).ok().expect("lists");
+        let legacy = super::dispatch("tools/list", &json!({}), None, &mut browser).ok().expect("lists");
+        assert_eq!(listed["tools"], legacy["tools"], "one tool surface for both eras");
+        assert!(listed["ttlMs"].as_u64().is_some_and(|ttl| ttl > 0));
+        assert!(legacy.get("resultType").is_none(), "legacy answers are unchanged");
+
+        let called = super::dispatch_in(&modern, "tools/call", &json!({ "name": "wait", "arguments": { "seconds": 0.01 } }), None, &mut browser)
+            .ok()
+            .expect("calls");
+        assert_eq!(called["resultType"], json!("complete"));
+        assert_eq!(called["isError"], json!(false));
+        assert!(super::dispatch_in(&modern, "nope/nope", &json!({}), None, &mut browser).is_err());
+    }
+
+    #[test]
+    fn launch_app_checks_its_arguments_before_looking_for_apps() {
+        let missing = super::launch_app(&json!({})).unwrap_err();
+        assert_eq!(missing.0, "missing required argument 'app'");
+        let blank = super::launch_app(&json!({ "app": "  " })).unwrap_err();
+        assert_eq!(blank.0, "missing required argument 'app'");
+        let long = super::launch_app(&json!({ "app": "Calculator", "wait_seconds": 99 })).unwrap_err();
+        assert!(long.0.contains("wait_seconds must be between 0 and 30"), "{}", long.0);
+        let negative = super::launch_app(&json!({ "app": "Calculator", "wait_seconds": -1 })).unwrap_err();
+        assert!(negative.0.contains("wait_seconds"), "{}", negative.0);
     }
 
     /// A backend that records calls and returns a fixed outline.

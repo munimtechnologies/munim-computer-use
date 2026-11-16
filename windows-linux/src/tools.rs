@@ -24,7 +24,7 @@ pub fn browser_control_enabled() -> bool {
 }
 
 /// Returned in the `initialize` result; identical in the Swift server.
-pub const SERVER_INSTRUCTIONS: &str = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. In a Chrome tab the agent works in, use browser_click, browser_type, browser_fill (to replace a field's value) and browser_press_key (keys and shortcuts such as cmd+a); they act on that tab in the background without bringing Chrome forward. Never use the desktop click, press_key or type_text on a Chrome tab: they go to whichever Chrome window is in front, which can be the user's. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Pass return_state on an action to get current state back in the same call. Use run_steps for several actions you already know, like click, type, press return: one call, stopping at the first that fails. For delayed browser UI, use wait_for_selector with return_state and inspect readiness; a loaded tab is not SPA readiness. A timeout does not undo the action: re-observe with browser_snapshot and the same wait before repeating a non-idempotent action. Use browser_read to read a page's text and browser_screenshot to see an agent tab; both work while the tab stays in the background and include frames, so never bring a tab to front to look at it. When a page opens a JavaScript alert, confirm or prompt, browser_snapshot shows it and browser_handle_dialog answers it; browser_page_errors lists a page's exceptions, console errors and failed requests. Never ask for, or type, a password or code yourself: browser_request_credentials lets the user enter it without you seeing it. The user's Computer Use policy can block apps and sites or require their approval; when a call says so, do not work around it. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf.";
+pub const SERVER_INSTRUCTIONS: &str = "Munim Computer Use operates this computer's desktop apps and, through the browser_* tools, the user's signed-in Chrome. Look, act, verify: call list_apps to find the app, then get_app_state (narrow it with query) before acting, and act on element ids such as e12 rather than screen coordinates. Ids belong to one snapshot, so call get_app_state again after the UI changes. Use screenshot to check a result or to see content the accessibility tree cannot describe, and zoom to read small text. Where the platform allows, input is delivered to the target app in the background and the agent has its own pointer, so the user can keep working; call activate_app only when a keystroke needs keyboard focus. For web pages prefer the browser_* tools, which work in the agent's own tab group, and release any tab adopted with browser_use_tab when done. In a Chrome tab the agent works in, use browser_click, browser_type, browser_fill (to replace a field's value) and browser_press_key (keys and shortcuts such as cmd+a); they act on that tab in the background without bringing Chrome forward. Choose in a native select (dropdown) with browser_select_option, and open menus that appear on hover with browser_hover. Never use the desktop click, press_key or type_text on a Chrome tab: they go to whichever Chrome window is in front, which can be the user's. For concurrent tasks sharing this MCP server, pass a distinct session_id on every browser call for each task; keep it stable, including cleanup. Separate sessions share website logins and cookies. Desktop apps and clipboard are not session-isolated. Pass return_state on an action to get current state back in the same call. Use run_steps for several actions you already know, like click, type, press return: one call, stopping at the first that fails. For delayed browser UI, use wait_for_selector with return_state and inspect readiness; a loaded tab is not SPA readiness. A timeout does not undo the action: re-observe with browser_snapshot and the same wait before repeating a non-idempotent action. Use browser_read to read a page's text and browser_screenshot to see an agent tab; both work while the tab stays in the background and include frames, so never bring a tab to front to look at it. When a page opens a JavaScript alert, confirm or prompt, browser_snapshot shows it and browser_handle_dialog answers it; browser_page_errors lists a page's exceptions, console errors and failed requests. Never ask for, or type, a password or code yourself: browser_request_credentials lets the user enter it without you seeing it. The user's Computer Use policy can block apps and sites or require their approval; when a call says so, do not work around it. Ask the user before anything irreversible, such as sending, deleting, purchasing or submitting forms on their behalf.";
 
 pub fn tool_defs() -> Value {
     let Value::Array(defs) = all_tool_defs() else {
@@ -285,6 +285,33 @@ fn all_tool_defs() -> Value {
             },
             "annotations": {
                 "title": "Activate app",
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "launch_app",
+            "description": "Start an installed app that is not running yet, by the name the system's app list shows (the Start menu on Windows, the app launcher on Linux, Applications on macOS) or its id (bundle id on macOS, Start menu AppID on Windows, desktop file id on Linux), then wait for its first window. A unique start of a name is enough (\"calc\" for Calculator); several matches are listed instead of guessed. If the app is already running, nothing is started and the reply gives its pid: use get_app_state or activate_app. The reply names the running app and its pid for get_app_state. macOS opens it without bringing it to the front; on Windows and Linux its first window may come to the front, so the user's foreground rule applies. The user's app rules apply as they do to every app.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "app": {
+                        "type": "string",
+                        "description": "App name as the system lists installed apps (\"Calculator\", \"Visual Studio Code\"), or its bundle id, Start menu AppID or desktop file id"
+                    },
+                    "wait_seconds": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 30,
+                        "description": "How long to wait for the app's first window (default 10). 0 starts it and returns at once."
+                    }
+                },
+                "required": ["app"]
+            },
+            "annotations": {
+                "title": "Launch app",
                 "readOnlyHint": false,
                 "destructiveHint": false,
                 "idempotentHint": true,
@@ -1065,6 +1092,61 @@ fn all_tool_defs() -> Value {
             }
         },
         {
+            "name": "browser_hover",
+            "description": "Rest the agent's pointer on an element in one of the agent's tabs, by its browser_snapshot index (preferred) or at a point in page coordinates, to open a menu, submenu or tooltip that appears on hover. Nothing is pressed. Works on a background tab with real (trusted) mouse movement, without selecting the tab or raising its window; the element is scrolled into view and checked the way browser_click checks it, and when something else covers it the call fails, naming what is in front. Pass return_state with wait_for_selector to see what the hover opened in the same call. Use hover for native app windows.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session."
+                    },
+                    "tab_id": {
+                        "type": "integer",
+                        "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs"
+                    },
+                    "index": {
+                        "type": "integer",
+                        "description": "Element index from the latest browser_snapshot of this tab. Preferred over coordinates."
+                    },
+                    "x": {
+                        "type": "number",
+                        "description": "Page x coordinate in CSS pixels, used together with y when no index is given"
+                    },
+                    "y": {
+                        "type": "number",
+                        "description": "Page y coordinate in CSS pixels, used together with x when no index is given"
+                    },
+                    "return_state": {
+                        "type": "boolean",
+                        "description": "Append a current snapshot and readiness status after acting. Without wait_for_selector, only a short pause and bounded navigation wait are used; SPA readiness is not guaranteed. Snapshot indices replace earlier ones. A timeout does not mean the action failed: re-observe with browser_snapshot before repeating it."
+                    },
+                    "wait_for_selector": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2000,
+                        "description": "Wait for any visible element matching this CSS selector in the page or any of its frames (iframes), including open shadow roots (web components); a timeout says how many frames could not be searched. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
+                    },
+                    "wait_timeout_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 10000,
+                        "description": "Bound for wait_for_selector in milliseconds (default 8000, maximum 10000; 0 checks once). Requires wait_for_selector. Timeout preserves action success and returns current state. Use browser_snapshot with the same wait to re-observe without repeating an action."
+                    }
+                },
+                "required": ["tab_id"]
+            },
+            "annotations": {
+                "title": "Hover in browser",
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
             "name": "browser_type",
             "description": "Type text into the field that currently has focus in one of the agent's tabs; browser_click the field first. Text is inserted at the caret without clearing existing content: to replace a field's whole value use browser_fill. Use browser_press_key for Enter, Tab, Backspace, arrows and shortcuts such as Cmd+A, and type_text for native apps. Never use the desktop press_key or type_text for a Chrome tab: those go to whichever Chrome window is in front, which can be the user's.",
             "inputSchema": {
@@ -1156,6 +1238,62 @@ fn all_tool_defs() -> Value {
             },
             "annotations": {
                 "title": "Fill field in browser",
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "browser_select_option",
+            "description": "Choose an option of a native select (dropdown) in one of the agent's tabs, by the select's browser_snapshot index and the option's value or visible label, the way a person's choice in Chrome's dropdown lands: the selection changes and the page gets its input and change events. Chrome draws a select's dropdown outside the page, where browser_snapshot and browser_click cannot reach it, so use this instead of clicking. A label matches whole, ignoring case when nothing matches exactly. Several values choose several options of a select that allows multiple. Nothing is chosen when an option is missing or disabled, and the reply lists the options. Snapshots show each select's current choice. Works in a background tab without selecting it or raising its window. For a custom dropdown built from other elements, open it with browser_click and click its option.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Stable task or thread ID. Pass the same value on every browser call for this task. Different IDs isolate tabs and cleanup within one MCP process. Omit for the default process session."
+                    },
+                    "tab_id": {
+                        "type": "integer",
+                        "description": "tab_id of one of the agent's tabs, from browser_open_tab or browser_list_tabs"
+                    },
+                    "index": {
+                        "type": "integer",
+                        "description": "Element index of the select from the latest browser_snapshot of this tab."
+                    },
+                    "values": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "minItems": 1,
+                        "maxItems": 100,
+                        "description": "Option values or visible labels to choose. One for an ordinary select; several only for a select that allows multiple, which then holds exactly these."
+                    },
+                    "return_state": {
+                        "type": "boolean",
+                        "description": "Append a current snapshot and readiness status after acting. Without wait_for_selector, only a short pause and bounded navigation wait are used; SPA readiness is not guaranteed. Snapshot indices replace earlier ones. A timeout does not mean the action failed: re-observe with browser_snapshot before repeating it."
+                    },
+                    "wait_for_selector": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2000,
+                        "description": "Wait for any visible element matching this CSS selector in the page or any of its frames (iframes), including open shadow roots (web components); a timeout says how many frames could not be searched. On actions requires return_state=true. Returns readiness met, timeout or error; only this condition is checked, not general app readiness. Prefer a selector specific to the expected new UI."
+                    },
+                    "wait_timeout_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 10000,
+                        "description": "Bound for wait_for_selector in milliseconds (default 8000, maximum 10000; 0 checks once). Requires wait_for_selector. Timeout preserves action success and returns current state. Use browser_snapshot with the same wait to re-observe without repeating an action."
+                    }
+                },
+                "required": ["tab_id", "index", "values"]
+            },
+            "annotations": {
+                "title": "Choose option in browser",
                 "readOnlyHint": false,
                 "destructiveHint": true,
                 "idempotentHint": true,
@@ -1446,7 +1584,7 @@ fn all_tool_defs() -> Value {
 mod tests {
     use super::{all_tool_defs, tool_defs};
 
-    /// The macOS server advertises exactly these 38 tools. Drifting apart would
+    /// The macOS server advertises exactly these 41 tools. Drifting apart would
     /// silently give a model different capabilities per platform.
     #[test]
     fn advertises_the_macos_tool_surface() {
@@ -1458,7 +1596,7 @@ mod tests {
             .map(|tool| tool["name"].as_str().expect("tool has a name"))
             .collect();
 
-        assert_eq!(names.len(), 38, "tool count drifted from the macOS server");
+        assert_eq!(names.len(), 41, "tool count drifted from the macOS server");
         for expected in [
             "list_apps",
             "get_app_state",
@@ -1467,6 +1605,7 @@ mod tests {
             "press_key",
             "scroll",
             "activate_app",
+            "launch_app",
             "screenshot",
             "list_displays",
             "right_click",
@@ -1490,8 +1629,10 @@ mod tests {
             "browser_screenshot",
             "browser_page_errors",
             "browser_click",
+            "browser_hover",
             "browser_type",
             "browser_fill",
+            "browser_select_option",
             "browser_upload_file",
             "browser_request_credentials",
             "browser_press_key",
