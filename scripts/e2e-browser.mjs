@@ -535,7 +535,8 @@ let tab;
 check("tools/list advertises browser_read and browser_request_credentials", async () => {
   const reply = await rpc("tools/list");
   const names = reply.result.tools.map((entry) => entry.name);
-  assert.equal(names.length, 38);
+  assert.equal(names.length, 41);
+  for (const name of ["launch_app", "browser_select_option", "browser_hover"]) assert.ok(names.includes(name), `${name} is advertised`);
   assert.ok(names.includes("browser_screenshot"));
   assert.ok(names.includes("browser_read") && names.includes("browser_request_credentials"));
   assert.ok(names.includes("browser_handle_dialog") && names.includes("browser_page_errors"));
