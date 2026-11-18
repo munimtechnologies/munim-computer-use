@@ -769,7 +769,10 @@ function playClick({ found, hover = true, press = true, gone = false }) {
     if (expression.includes("scrollIntoView")) return { result: { value: { ok: true, tag: "div", label: "More", x: 5, y: 6, ...found } } };
     if (expression.includes("window.__cuClickProbe")) {
       probes += 1;
-      if (probes === 1) return { result: { value: { hover } } };
+      if (probes === 1) {
+        log.hoverAwaited = params.awaitPromise === true && expression.includes("probe.seen.hover");
+        return { result: { value: { hover } } };
+      }
       return { result: { value: gone && probes === 2 ? { gone: true } : { hover, press } } };
     }
     if (expression.includes("'pointerdown'")) {
@@ -788,6 +791,7 @@ test("a click in a shown tab is a real press once the hover reached the element"
   assert.equal(log.pageEvents, 0, "the press was played twice");
   assert.equal(result.route, "input");
   assert.equal(result.target, '[4] div "More"');
+  assert.ok(log.hoverAwaited, "the hover check waits for a move Chrome delivers with the next frame");
   pageEval = () => ({ result: { value: {} } });
 });
 

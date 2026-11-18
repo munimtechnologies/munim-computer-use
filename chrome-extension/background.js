@@ -2450,6 +2450,41 @@ const CLICK_PROBE_JS = (finish) => `(() => {
   return { ...probe.seen };
 })()`;
 
+/// How long a hover may take to reach the page. Chrome dispatches mouse moves
+/// with the page's next frame, and one for a frame from another site through
+/// that frame's own process, so the move can land after Input.dispatchMouseEvent
+/// has answered. Read once at once, the probe sometimes had not seen it yet,
+/// and a click on an element that had not moved was refused as moved (the
+/// macOS e2e "frames in a background tab" flake).
+const HOVER_WAIT_MS = 400;
+
+/// The probe once it has seen the hover, or as it is after HOVER_WAIT_MS.
+/// Woken by the move itself, not by polling: Chrome runs a hidden page's
+/// timers about once a second. The probe's own listeners were added first, so
+/// by the time these run it has already recorded the move.
+const CLICK_HOVER_JS = `new Promise((done) => {
+  const probe = window.__cuClickProbe;
+  if (!probe) return done({ gone: true });
+  if (probe.seen.hover) return done({ ...probe.seen });
+  const types = ['pointerover', 'pointermove', 'mousemove'];
+  let timer;
+  const finish = () => {
+    clearTimeout(timer);
+    for (const type of types) removeEventListener(type, check, true);
+    done({ ...probe.seen });
+  };
+  const check = () => { if (probe.seen.hover) finish(); };
+  for (const type of types) addEventListener(type, check, true);
+  timer = setTimeout(finish, ${HOVER_WAIT_MS});
+})`;
+
+/// What the click probe saw of a mouse move just sent, waiting for it to land.
+async function hoverSeen(tabId, frame, failure) {
+  const res = await evaluateIn(tabId, frame, { expression: CLICK_HOVER_JS, returnByValue: true, awaitPromise: true });
+  if (res?.exceptionDetails) throw new Error(res.exceptionDetails.text || failure);
+  return res?.result?.value || {};
+}
+
 /// The press as page events, for a tab real input cannot reach. Carries what
 /// a real mouse press carries (button state, pointer type, a click count), so
 /// controls that check those (menus that open only when buttons === 1) still
@@ -2565,7 +2600,7 @@ async function clickElement(tabId, index, access) {
       // Hover first and check it reached the element: a press at a point the
       // page reads differently (zoom, a layout shift) would hit something else.
       await send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none", buttons: 0, pointerType: "mouse" });
-      if ((await evaluateValue(tabId, CLICK_PROBE_JS(false), "click failed", frame)).hover) {
+      if ((await hoverSeen(tabId, frame, "click failed")).hover) {
         const press = { x, y, button: "left", clickCount: 1, pointerType: "mouse" };
         try {
           await send(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...press, buttons: 1 });
@@ -3373,7 +3408,7 @@ async function hoverElement(tabId, index, access) {
   if (found.reachable) {
     try {
       await send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none", buttons: 0, pointerType: "mouse" });
-      const seen = await evaluateValue(tabId, CLICK_PROBE_JS(false), "hover failed", frame).catch(() => ({ gone: true }));
+      const seen = await hoverSeen(tabId, frame, "hover failed").catch(() => ({ gone: true }));
       if (seen.hover || seen.gone) route = "input";
       else why = "real input did not reach it";
     } finally {

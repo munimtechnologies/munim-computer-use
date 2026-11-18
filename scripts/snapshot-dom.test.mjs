@@ -326,6 +326,23 @@ try {
     })()`), true);
     console.log("PASS blocked background controls cannot be clicked; shadow controls click and hit-test by index");
 
+    // A mouse move Chrome delivers with the next frame (or through a frame's
+    // own process) lands after the DevTools call answers: the hover check
+    // waits for it instead of refusing the click as "moved", and still gives
+    // up when no hover comes.
+    if (source.includes("const CLICK_HOVER_JS =")) {
+      const hoverWait = vm.runInNewContext(source.slice(source.indexOf("const HOVER_WAIT_MS ="), source.indexOf("\n/// What the click probe saw")) + "; CLICK_HOVER_JS");
+      const late = await evaluate(`(() => { const seen = { hover: false }; window.__cuClickProbe = { seen, done() {} };
+        setTimeout(() => { seen.hover = true; dispatchEvent(new MouseEvent('mousemove')); }, 120); return ${hoverWait}; })()`);
+      assert.equal(late.hover, true, "a hover that lands 120 ms late is seen");
+      const started = Date.now();
+      const never = await evaluate(`(() => { window.__cuClickProbe = { seen: { hover: false }, done() {} }; return ${hoverWait}; })()`);
+      assert.equal(never.hover, false);
+      assert.ok(Date.now() - started < 2000, "a hover that never comes is given up on");
+      assert.deepEqual(await evaluate(`(() => { delete window.__cuClickProbe; return ${hoverWait}; })()`), { gone: true });
+      console.log("PASS the click's hover check waits for a late mouse move and gives up on a missing one");
+    }
+
     // A background tab can lack a hit-test stack; the shadow dialog still wins.
     await evaluate('globalThis.savedHitTest = document.elementsFromPoint; document.elementsFromPoint = () => []; true');
     assert.equal((await snapshot()).scope, "modal");
