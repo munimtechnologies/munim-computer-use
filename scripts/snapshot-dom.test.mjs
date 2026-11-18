@@ -179,6 +179,31 @@ try {
     assert.equal((await snapshot()).scope, "page");
     console.log("PASS a role-less <ui-dialog> component over the page scopes the snapshot and is named");
 
+    // #80: Bing Webmaster's sign-in modal, as Fluent UI builds it. The page
+    // behind is aria-hidden, role=dialog sits on a wrapper with no height
+    // whose fixed child draws the modal, and each choice is a pointer card
+    // holding only a logo whose name is its SVG <title>.
+    const logo = (name) => `<svg width="120" height="32"><title>${name}</title><rect width="120" height="32"/></svg>`;
+    await set(`<div aria-hidden="true">${buttons(38)}</div>` +
+      '<div style="position:fixed;inset:0"><div><div role="dialog" aria-modal="true">' +
+      '<div role="document" style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center">' +
+      '<div aria-hidden="true" style="position:absolute;inset:0;background:rgba(0,0,0,.4)"></div>' +
+      '<div style="position:relative;width:360px;background:white"><div aria-hidden="true" tabindex="0"></div>' +
+      '<div>Choose an account convenient to you</div>' +
+      `<div class="card" tabindex="0" style="cursor:pointer;height:64px">${logo("logo_microsoft")}</div>` +
+      `<div class="card" tabindex="-1" style="cursor:pointer;height:64px">${logo("logo_google")}</div>` +
+      `<div class="card" tabindex="-1" style="cursor:pointer;height:64px"><img alt="Facebook" width="120" height="32" src="data:image/gif;base64,R0lGODlhAQABAAAAACw="></div>` +
+      '<div aria-hidden="true" tabindex="0"></div></div></div></div></div></div>');
+    const signIn = await snapshot();
+    assert.equal(signIn.scope, "modal", JSON.stringify(signIn));
+    assert.deepEqual(signIn.elements.map((el) => el.tag + " " + el.label),
+      ["div[clickable] logo_microsoft", "div[clickable] logo_google", "div[clickable] Facebook"]);
+    // An icon-only button is named by its picture too; an empty pointer
+    // wrapper with no picture name is still noise.
+    await set(`<button>${logo("Settings")}</button><div style="cursor:pointer;width:40px;height:40px"><svg width="20" height="20"></svg></div>`);
+    assert.deepEqual((await snapshot()).elements.map((el) => el.tag + " " + el.label), ["button Settings"]);
+    console.log("PASS a no-height Fluent dialog wrapper scopes the snapshot and logo-only cards are named by their picture");
+
     // #72: an inline editor that is a contenteditable span says it is editable.
     await set('<h1><span contenteditable="">Weekly sync</span></h1><span contenteditable="plaintext-only">Notes</span><span contenteditable="false">Fixed</span><div role="textbox" contenteditable="true">Body</div>');
     assert.deepEqual((await snapshot()).elements.map((el) => el.tag + " " + el.label),
