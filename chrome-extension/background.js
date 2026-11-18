@@ -1743,13 +1743,31 @@ const SNAPSHOT_JS = `((options = {}) => {
   const roleDialogs = dom.queryAll(document, 'dialog:modal,[role=dialog]:not([aria-modal=false i]),[role=alertdialog]:not([aria-modal=false i]),[aria-modal=true i]');
   const namedDialogs = dom.queryAll(document, '*').filter((el) => /-(dialog|modal)$/.test(el.localName) &&
     !el.matches('[aria-modal=false i]') && !roleDialogs.includes(el));
+  // Where a dialog is drawn. Fluent UI (Microsoft's sites) puts role=dialog
+  // on a wrapper with no height and draws the modal in a position: fixed
+  // child, so the dialog's own box is empty while its content fills the
+  // window (#80). Such a dialog is measured, and judged visible, by its first
+  // descendant that has a size.
+  const drawn = new Map();
+  const drawnOf = (dialog) => {
+    if (drawn.has(dialog)) return drawn.get(dialog);
+    let at = { el: dialog, r: dialog.getBoundingClientRect() };
+    if (at.r.width < 2 || at.r.height < 2) {
+      for (const inner of dom.queryAll(dialog, '*')) {
+        const r = inner.getBoundingClientRect();
+        if (r.width >= 2 && r.height >= 2) { at = { el: inner, r }; break; }
+      }
+    }
+    drawn.set(dialog, at);
+    return at;
+  };
   const dialogs = [...roleDialogs, ...namedDialogs].filter((dialog) => {
-    if (!visible(dialog)) return false;
+    if (!visible(drawnOf(dialog).el)) return false;
     if (dialog.matches('dialog:modal,[aria-modal=true i]')) return true;
     // An implicit ARIA dialog is not automatically modal. Preserve full-page
     // overlays, but never let a corner widget or bottom banner hide the page.
     const x = innerWidth / 2, y = innerHeight / 2;
-    const r = dialog.getBoundingClientRect();
+    const r = drawnOf(dialog).r;
     const painted = dom.stack(x, y);
     if (x >= r.left && x < r.right && y >= r.top && y < r.bottom &&
         (!painted.length || dom.contains(dialog, painted[0]))) return true;
@@ -1771,7 +1789,7 @@ const SNAPSHOT_JS = `((options = {}) => {
   const candidates = dialogs.filter((dialog) => !native.length || native.some((layer) => dom.contains(layer, dialog))).reverse();
   let modal = null;
   for (const candidate of candidates) {
-    const r = candidate.getBoundingClientRect();
+    const r = drawnOf(candidate).r;
     const left = Math.max(0, r.left), right = Math.min(innerWidth, r.right);
     const top = Math.max(0, r.top), bottom = Math.min(innerHeight, r.bottom);
     if (left >= right || top >= bottom) continue;
@@ -1786,7 +1804,7 @@ const SNAPSHOT_JS = `((options = {}) => {
   // A background tab can lack a hit-test stack. Keep its visible dialog usable
   // rather than falling back to the background document and losing it again.
   if (!modal) modal = candidates.find((dialog) => {
-    const r = dialog.getBoundingClientRect();
+    const r = drawnOf(dialog).r;
     return r.right > 0 && r.bottom > 0 && r.left < innerWidth && r.top < innerHeight;
   }) || null;
   // A select, combobox or menu inside the modal often renders its options in a
@@ -1816,7 +1834,7 @@ const SNAPSHOT_JS = `((options = {}) => {
       }
     } catch {}
   }
-  const bounds = modal ? modal.getBoundingClientRect() : null;
+  const bounds = modal ? drawnOf(modal).r : null;
   const inScope = (el) => {
     if (!modal || dom.contains(modal, el)) return true;
     if (floating.some((root) => dom.contains(root, el))) return true;
@@ -1832,12 +1850,30 @@ const SNAPSHOT_JS = `((options = {}) => {
   // Rows and cells are labelled cell by cell, so "Ana | Admin | Active" reads
   // as one row rather than run-together text.
   const cellText = (el) => (el.innerText || '').split(/[\\t\\n]+/).map((part) => part.replace(/\\s+/g, ' ').trim()).filter(Boolean).join(' | ');
+  // A control drawn only as a picture has no text, so it is named by what
+  // the picture says it is: an image's alt, an SVG's <title>, or a label or
+  // title inside it. Bing's sign-in cards are a brand logo and nothing else,
+  // and without this they were dropped as empty (#80).
+  const pictureName = (el) => {
+    let looked = 0;
+    for (const inner of dom.queryAll(el, 'img[alt],svg title,[aria-label],[title]')) {
+      if (++looked > 20) break;
+      const shown = inner.localName === 'title' ? inner.closest('svg') : inner;
+      if (!shown || !visible(shown)) continue;
+      const name = (inner.localName === 'title' ? inner.textContent
+        : inner.getAttribute('aria-label') || inner.getAttribute('alt') || inner.getAttribute('title') || '').replace(/\\s+/g, ' ').trim();
+      if (name) return name;
+    }
+    return '';
+  };
   for (const el of dom.queryAll(document, '*')) {
     if (!listed(el) || !inScope(el) || !(visible(el) || hiddenFileInput(el, dom, visible))) continue;
     const kind = kindOf(el);
-    // Rows, cells and plain click targets are only worth listing by their
-    // text: an empty spacer row or an icon-only wrapper is noise.
-    if (kind && !(el.getAttribute('aria-label') || '').trim() && !(el.innerText || '').trim()) continue;
+    // Rows, cells and plain click targets are only worth listing by a name:
+    // an empty spacer row or a wrapper with nothing in it is noise.
+    const picture = kind === 'clickable' && !(el.getAttribute('aria-label') || '').trim() && !(el.innerText || '').trim()
+      ? (el.getAttribute('title') || '').trim() || pictureName(el) : '';
+    if (kind && !(el.getAttribute('aria-label') || '').trim() && !(el.innerText || '').trim() && !picture) continue;
     // A frame's controls are its own document's, searched separately. Mark
     // the frames in scope so that search knows which to enter (one behind
     // this page's dialog is not), and count the ones big enough to hold a
@@ -1867,7 +1903,7 @@ const SNAPSHOT_JS = `((options = {}) => {
       : toggle
       ? labelOf(el, dom).slice(0, 90)
       : (el.getAttribute('aria-label') || (field ? labelOf(el, dom, false) : '') || el.innerText || (secret ? '' : el.value) ||
-         el.getAttribute('title') || el.getAttribute('placeholder') || '')
+         el.getAttribute('title') || el.getAttribute('placeholder') || picture || (field ? '' : pictureName(el)))
         .replace(/\\s+/g, ' ').trim().slice(0, 90);
     const state = stateOf(el);
     // Text the page lets the user edit in place reads as a plain span or div
@@ -3387,6 +3423,29 @@ async function finishBackspace(tabId, frame = undefined) {
 
 const SCREENSHOT_MAX_WIDTH = 1400;
 const SCREENSHOT_QUALITY = 55;
+/** The screencast that keeps a background tab drawn while it is captured. */
+const SCREENCAST_HOLD = { format: "jpeg", quality: 1, maxWidth: 32, maxHeight: 32 };
+
+/// Page.captureScreenshot, with a timeout that says what it means. A capture
+/// changes nothing, so the generic "whether the action took effect is
+/// unknown" advice does not apply; what helps is knowing that the page itself
+/// may be fine and the tools that need no frame still work.
+async function capture(tabId, params) {
+  try {
+    return await send(tabId, "Page.captureScreenshot", params);
+  } catch (error) {
+    const message = error?.message || "";
+    if (!/^Page\.captureScreenshot timed out/.test(message)) throw error;
+    const state = /\(Chrome reports the tab [^)]*\)/.exec(message)?.[0];
+    throw new Error(
+      `Chrome did not hand back a frame of this tab within ${DEBUGGER_TIMEOUT_MS / 1000} s` +
+        `${state ? ` ${state}` : ""}. Chrome draws a tab it is not showing only when asked, and can ` +
+        "be slow to under load. browser_snapshot and browser_read need no frame and still work; " +
+        "browser_screenshot can be tried again. A JavaScript dialog that opened before the agent attached " +
+        "also stops the page drawing; only the user can answer it in Chrome.",
+    );
+  }
+}
 
 /**
  * The part of the page the tab shows, as the user would see it if they
@@ -3418,10 +3477,23 @@ async function screenshot(tabId, { format = "png", quality, maxWidth } = {}) {
     ...(format === "jpeg" ? { quality: quality ?? SCREENSHOT_QUALITY } : {}),
     ...(scale < 1 ? { clip: { x: view.x, y: view.y, width: view.width, height: view.height, scale } } : {}),
   };
-  let res = await send(tabId, "Page.captureScreenshot", params);
-  // A tab Chrome is not drawing hands back its last frame, or none; ask once
-  // more for it to be shown (#63) and capture again.
-  if (!res?.data && await redraw(tabId)) res = await send(tabId, "Page.captureScreenshot", params);
+  // Focus emulation keeps the page running, but Chrome keeps no compositor
+  // frame for a tab it is not showing, and Page.captureScreenshot waits for
+  // one: measured on Chrome 151, the first capture of a background tab took
+  // 7 to 11 s and every other one after it never answered (#79). A running
+  // screencast holds the tab as captured, so Chrome keeps drawing it, and each
+  // capture then answered in about 0.2 s. Its frames are tiny and nobody acks
+  // them, so Chrome sends one or two and waits; it ends with the capture.
+  const cast = await send(tabId, "Page.startScreencast", SCREENCAST_HOLD).then(() => true, () => false);
+  let res;
+  try {
+    res = await capture(tabId, params);
+    // A tab Chrome is not drawing hands back its last frame, or none; ask once
+    // more for it to be shown (#63) and capture again.
+    if (!res?.data && await redraw(tabId)) res = await capture(tabId, params);
+  } finally {
+    if (cast) await send(tabId, "Page.stopScreencast").catch(() => {});
+  }
   if (!res?.data) throw new Error(`Chrome returned no image for tab ${tabId}. ${NOT_DRAWN_NOTE}`);
   return {
     data: res.data,

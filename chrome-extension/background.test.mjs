@@ -2428,12 +2428,63 @@ test("screenshot captures a background tab at the size asked for, without showin
     assert.equal(updates.length, 0, "the tab or its window was brought forward");
     assert.equal(tabs.get(tab).active, false);
     assert.ok(!sent.some(([method]) => method === "Page.bringToFront"));
+    // #79: a screencast holds the background tab drawn for each capture, and
+    // ends with it.
+    const order = sent.map(([method]) => method).filter((method) => /^Page\.(startScreencast|captureScreenshot|stopScreencast)$/.test(method));
+    assert.deepEqual(order, ["Page.startScreencast", "Page.captureScreenshot", "Page.stopScreencast",
+      "Page.startScreencast", "Page.captureScreenshot", "Page.stopScreencast"]);
+    assert.ok(sent.find(([method]) => method === "Page.startScreencast")[1].maxWidth <= 64, "held with tiny frames");
     assert.match(await refuses("screenshot", { tabId: tab, format: "gif", sessionId: "shot1" }), /format must be png or jpeg/);
   } finally {
     chrome.tabs.update = update;
     chrome.windows.update = windowUpdate;
     pageEval = () => ({ result: { value: {} } });
     await call("close_all_tabs", { sessionId: "shot1" });
+  }
+});
+
+// #79: a capture Chrome never answers says what that means, and still ends
+// the screencast that held the tab.
+test("a screenshot that times out names the cause and ends its screencast", async () => {
+  const tab = (await call("open_tab", { url: "https://shop.example/about", sessionId: "shot2" })).tabId;
+  const realSet = extensionContext.setTimeout;
+  const realClear = extensionContext.clearTimeout;
+  const deadlines = new Set();
+  extensionContext.setTimeout = (fn, ms, ...rest) => {
+    if (ms !== 6000) return realSet(fn, ms, ...rest);
+    const timer = { fn };
+    deadlines.add(timer);
+    return timer;
+  };
+  extensionContext.clearTimeout = (timer) => { if (!deadlines.delete(timer)) realClear(timer); };
+  const sent = [];
+  let stalled = false;
+  pageEval = (method, params) => {
+    sent.push(method);
+    if ((params.expression ?? "").includes("devicePixelRatio")) {
+      return { result: { value: { width: 800, height: 600, x: 0, y: 0, dpr: 1, shown: true } } };
+    }
+    if (method === "Page.captureScreenshot") {
+      stalled = true;
+      return new Promise(() => {});
+    }
+    return { result: { value: {} } };
+  };
+  try {
+    const failure = refuses("screenshot", { tabId: tab, sessionId: "shot2" });
+    for (let n = 0; n < 50 && !stalled; n++) await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(stalled, "the capture is in flight");
+    for (const timer of [...deadlines]) timer.fn();
+    const message = await failure;
+    assert.match(message, /did not hand back a frame of this tab within 6 s/);
+    assert.match(message, /browser_snapshot and browser_read need no frame/);
+    assert.doesNotMatch(message, /Whether the action took effect is unknown/, "a capture changes nothing");
+    assert.equal(sent.at(-1), "Page.stopScreencast");
+  } finally {
+    extensionContext.setTimeout = realSet;
+    extensionContext.clearTimeout = realClear;
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "shot2" });
   }
 });
 
