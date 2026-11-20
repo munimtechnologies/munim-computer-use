@@ -23,6 +23,10 @@ pub struct OwnerRecord {
     pub extension_connected: bool,
     pub host_connections: u32,
     pub peer_endpoint: bool,
+    /// How the owner's token differs from an ordinary process of the user
+    /// (`elevated (as administrator)`, a sandbox); empty when it does not, or
+    /// from servers before 0.14.2, which do not say.
+    pub context: String,
 }
 
 impl OwnerRecord {
@@ -35,6 +39,7 @@ impl OwnerRecord {
             "extensionConnected": self.extension_connected,
             "hostConnections": self.host_connections,
             "peerEndpoint": self.peer_endpoint,
+            "context": self.context,
         })
     }
 
@@ -51,6 +56,7 @@ impl OwnerRecord {
                 .and_then(|count| u32::try_from(count).ok())
                 .unwrap_or(0),
             peer_endpoint: value.get("peerEndpoint").and_then(Value::as_bool).unwrap_or(true),
+            context: value.get("context").and_then(Value::as_str).unwrap_or_default().to_string(),
         })
     }
 
@@ -61,7 +67,15 @@ impl OwnerRecord {
             _ => String::new(),
         };
         let exe = if self.exe.is_empty() { String::new() } else { format!(", {}", self.exe) };
-        format!("pid {} (munim-computer-use {}{exe}{started})", self.pid, self.version)
+        let context = if self.context.is_empty() { String::new() } else { format!(", running {}", self.context) };
+        format!("pid {} (munim-computer-use {}{exe}{started}{context})", self.pid, self.version)
+    }
+
+    /// Whether this owner opens the bridge to every process of its user,
+    /// whatever their elevation: 0.14.2 and later do (#84). Before, an
+    /// elevated owner's endpoints admitted only other elevated processes.
+    pub fn admits_any_context(&self) -> bool {
+        version_at_least(&self.version, (0, 14, 2))
     }
 
     /// Whether the extension is connected to this owner, in words.
@@ -75,6 +89,32 @@ impl OwnerRecord {
             ),
         }
     }
+}
+
+/// `0.14.2` ≥ `(0, 14, 2)`; anything unreadable counts as older.
+pub fn version_at_least(version: &str, wanted: (u64, u64, u64)) -> bool {
+    let mut parts = version.split(['.', '-', '+']).map(|part| part.parse::<u64>().ok());
+    match (parts.next().flatten(), parts.next().flatten(), parts.next().flatten()) {
+        (Some(major), Some(minor), Some(patch)) => (major, minor, patch) >= wanted,
+        _ => false,
+    }
+}
+
+/// This process's token context, as the owner record says it (#84).
+pub fn this_context() -> String {
+    static CONTEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CONTEXT
+        .get_or_init(|| {
+            #[cfg(windows)]
+            {
+                crate::platform::session::token_context().unwrap_or_default()
+            }
+            #[cfg(not(windows))]
+            {
+                String::new()
+            }
+        })
+        .clone()
 }
 
 pub fn unix_now() -> u64 {
@@ -117,8 +157,16 @@ pub fn read_owner_record() -> Option<OwnerRecord> {
     if record.pid == std::process::id() {
         return Some(record);
     }
-    let exe = process_exe(record.pid)?;
-    (record.exe.is_empty() || same_path(&exe, Path::new(&record.exe))).then_some(record)
+    match process_exe(record.pid) {
+        Some(exe) => (record.exe.is_empty() || same_path(&exe, Path::new(&record.exe))).then_some(record),
+        // An owner elevated or sandboxed away from this process may refuse to
+        // be opened (#84). A live munim-computer-use under that pid is still
+        // the owner that wrote the record, not one too old to write it.
+        None => processes()
+            .iter()
+            .any(|process| process.pid == record.pid && is_server_image(&process.name))
+            .then_some(record),
+    }
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -431,6 +479,7 @@ mod tests {
             extension_connected: false,
             host_connections: 0,
             peer_endpoint: true,
+            context: String::new(),
         };
         assert_eq!(OwnerRecord::from_json(&record.to_json()), Some(record.clone()));
         assert_eq!(
@@ -438,6 +487,22 @@ mod tests {
             r"pid 4242 (munim-computer-use 0.7.3, C:\tools\munim-computer-use.exe, started 3h ago)"
         );
         assert!(record.extension_state().contains("no connection from the extension since it started"));
+        assert!(!record.admits_any_context(), "0.7.3 opened the bridge to its own security context only");
+
+        let elevated = OwnerRecord { version: "0.14.2".into(), context: "elevated (as administrator)".into(), ..record };
+        assert_eq!(OwnerRecord::from_json(&elevated.to_json()), Some(elevated.clone()));
+        assert!(elevated.describe().ends_with("started 3h ago, running elevated (as administrator))"), "{}", elevated.describe());
+        assert!(elevated.admits_any_context());
+    }
+
+    #[test]
+    fn versions_compare_numerically() {
+        assert!(version_at_least("0.14.2", (0, 14, 2)));
+        assert!(version_at_least("0.15.0", (0, 14, 2)));
+        assert!(version_at_least("1.0.0-beta.1", (0, 14, 2)));
+        assert!(!version_at_least("0.14.1", (0, 14, 2)));
+        assert!(!version_at_least("0.9.10", (0, 14, 2)));
+        assert!(!version_at_least("?", (0, 14, 2)));
     }
 
     #[test]
