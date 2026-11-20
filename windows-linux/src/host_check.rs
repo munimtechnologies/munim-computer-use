@@ -755,7 +755,7 @@ fn ask_owner() -> OwnerReport {
                 .into()
         } else {
             format!(
-                "owner: did not record itself (servers before 0.7.3 do not); munim-computer-use processes \
+                "owner: left no record readable from here (servers before 0.7.3 write none); munim-computer-use processes \
                  running, one of which is probably the owner: {}",
                 servers.iter().map(|server| format!("pid {} ({})", server.pid, server.exe)).collect::<Vec<_>>().join(", ")
             )

@@ -301,6 +301,7 @@ impl Hub {
             extension_connected: lock(&self.extension).is_some(),
             host_connections: lock(&self.host).connections,
             peer_endpoint: self.peer_endpoint.load(Ordering::Relaxed),
+            context: bridge_diag::this_context(),
         }
     }
 
@@ -442,8 +443,8 @@ impl Hub {
                     let listed: Vec<String> =
                         servers.iter().take(6).map(|server| format!("pid {} ({})", server.pid, server.exe)).collect();
                     format!(
-                        "its owner did not record itself (servers before 0.7.3 do not); the other \
-                         munim-computer-use processes running now, one of which is probably the owner: {}",
+                        "its owner left no record this server can read (servers before 0.7.3 write none); the \
+                         other munim-computer-use processes running now, one of which is probably the owner: {}",
                         listed.join(", ")
                     )
                 }
@@ -465,11 +466,7 @@ impl Hub {
         }
         let denied = why.contains("different security contexts");
         match &owner {
-            Some(record) if denied => steps.push(format!(
-                "start this MCP server and pid {} from the same context so they can share the bridge, or end pid {} \
-                 (it is munim-computer-use) so this server can take the bridge over",
-                record.pid, record.pid
-            )),
+            Some(record) if denied => steps.push(denied_step(record)),
             Some(record) if !record.extension_connected => steps.push(format!(
                 "end pid {} if it is a stale or sandboxed server; this server then takes the bridge over",
                 record.pid
@@ -478,6 +475,13 @@ impl Hub {
                 "retry in a few seconds; if it keeps failing, end pid {} so this server can take the bridge over",
                 record.pid
             )),
+            None if denied && holder.contains("probably the owner") => steps.push(
+                "one of the processes above runs elevated (as administrator) or sandboxed, and if it is a build \
+                 before 0.14.2 it lets only processes in that same context join. Ending it, or updating the app \
+                 that started it to munim-computer-use 0.14.2 or later, lets this server take the bridge over; this \
+                 server retries every 2 seconds, so the next browser call after that works"
+                    .into(),
+            ),
             None if holder.contains("probably the owner") => steps.push(
                 "if one of the processes above is a stale or older server, ending it lets this server take the \
                  bridge over; otherwise retry in a few seconds"
@@ -495,6 +499,35 @@ impl Hub {
             .collect();
         let what = if said.is_empty() { what.trim_end_matches('.').to_string() } else { format!("{what}{said}") };
         (what, steps.join(". "))
+    }
+}
+
+/// What to do when the owner's endpoint refused this server, given what the
+/// owner says about itself (#84).
+fn denied_step(record: &OwnerRecord) -> String {
+    let pid = record.pid;
+    let then = "this server retries every 2 seconds, so the next browser call after that works";
+    if record.admits_any_context() {
+        // 0.14.2+ opens its endpoints to every process of its user, so a
+        // refusal means a real boundary: a sandbox or another account.
+        let context = if record.context.is_empty() { "in another sandbox or account".into() } else { record.context.clone() };
+        format!(
+            "pid {pid} runs {context}, and this server is outside it. Start both MCP servers as the same \
+             unsandboxed user, or end pid {pid} (it is munim-computer-use) so this server can take the bridge \
+             over; {then}"
+        )
+    } else {
+        let context = if record.context.is_empty() {
+            "elevated (as administrator) or sandboxed".to_string()
+        } else {
+            record.context.clone()
+        };
+        format!(
+            "pid {pid} is munim-computer-use {}, which lets only processes in its own security context join, and it \
+             probably runs {context}. Ending pid {pid}, or updating the app that started it to munim-computer-use \
+             0.14.2 or later, lets this server take the bridge over; {then}",
+            record.version
+        )
     }
 }
 
@@ -805,7 +838,39 @@ fn bind_bridge() -> Option<(interprocess::local_socket::Listener, Option<BridgeS
     #[cfg(windows)]
     {
         let name = bridge_pipe_name().to_ns_name::<GenericNamespaced>().ok()?;
-        ListenerOptions::new().name(name).create_sync().ok().map(|listener| (listener, None))
+        with_pipe_security(ListenerOptions::new().name(name)).create_sync().ok().map(|listener| (listener, None))
+    }
+}
+
+/// The access list both bridge pipes are created with: SYSTEM and this user,
+/// whatever the token (#84). The default list names the creator's token owner,
+/// which for an elevated server is the Administrators group, so an ordinary
+/// MCP server or Chrome's native host of the same user got "Access is denied"
+/// and the browser was unreachable until the elevated server exited. Other
+/// users and the network stay out (the pipe also rejects remote clients).
+#[cfg(windows)]
+fn pipe_security_sddl() -> Option<String> {
+    static SDDL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    SDDL.get_or_init(|| {
+        let sid = crate::platform::session::user_sid_string();
+        if sid.is_none() {
+            eprintln!("munim-computer-use: could not read this user's SID; the bridge keeps the default pipe access");
+        }
+        sid.map(|sid| format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})"))
+    })
+    .clone()
+}
+
+#[cfg(windows)]
+fn with_pipe_security(options: ListenerOptions<'_>) -> ListenerOptions<'_> {
+    use interprocess::os::windows::local_socket::ListenerOptionsExt;
+    use interprocess::os::windows::security_descriptor::SecurityDescriptor;
+    let descriptor = pipe_security_sddl()
+        .and_then(|sddl| widestring::U16CString::from_str(sddl).ok())
+        .and_then(|sddl| SecurityDescriptor::deserialize(&sddl).ok());
+    match descriptor {
+        Some(descriptor) => options.security_descriptor(descriptor),
+        None => options,
     }
 }
 
@@ -832,7 +897,7 @@ fn bind_rpc() -> Option<(interprocess::local_socket::Listener, Option<BridgeSock
     #[cfg(windows)]
     {
         let name = format!("{}.rpc", bridge_pipe_name()).to_ns_name::<GenericNamespaced>().ok()?;
-        ListenerOptions::new().name(name).create_sync().ok().map(|listener| (listener, None))
+        with_pipe_security(ListenerOptions::new().name(name)).create_sync().ok().map(|listener| (listener, None))
     }
 }
 
@@ -1925,7 +1990,7 @@ pub fn run_native_host() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BrowserBridge, CallError, Hub, Link, call_timeout, check_upload_paths, describe, describe_browser_screenshot, describe_snapshot, describe_tabs, drop_connection, normalise, route};
+    use super::{BrowserBridge, CallError, Hub, Link, call_timeout, denied_step, check_upload_paths, describe, describe_browser_screenshot, describe_snapshot, describe_tabs, drop_connection, normalise, route};
     use std::time::Instant;
     use serde_json::json;
     use std::time::Duration;
@@ -2082,6 +2147,43 @@ mod tests {
 
         assert!(error.contains("browser_open_tab"), "names the tool: {error}");
         assert!(error.contains("get_app_state"), "offers a path: {error}");
+    }
+
+    // #84: an owner that refused this server is named with its context, and
+    // an older one is told apart from a real sandbox boundary.
+    #[test]
+    fn a_refusing_owner_says_whether_ending_or_updating_it_helps() {
+        let old = crate::bridge_diag::OwnerRecord {
+            pid: 47748,
+            version: "0.14.1".into(),
+            exe: String::new(),
+            started_unix: 0,
+            extension_connected: false,
+            host_connections: 0,
+            peer_endpoint: true,
+            context: String::new(),
+        };
+        let step = denied_step(&old);
+        assert!(step.contains("munim-computer-use 0.14.1") && step.contains("0.14.2 or later"), "{step}");
+        assert!(step.contains("elevated (as administrator) or sandboxed"), "{step}");
+        assert!(step.contains("Ending pid 47748") && step.contains("retries every 2 seconds"), "{step}");
+
+        let sandboxed = crate::bridge_diag::OwnerRecord {
+            version: "0.14.2".into(),
+            context: "with a restricted (sandboxed) token".into(),
+            ..old
+        };
+        let step = denied_step(&sandboxed);
+        assert!(step.contains("pid 47748 runs with a restricted (sandboxed) token"), "{step}");
+        assert!(!step.contains("0.14.2 or later"), "an up-to-date owner is not told to update: {step}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_bridge_pipes_admit_this_user_whatever_its_elevation() {
+        let sddl = super::pipe_security_sddl().expect("this user's SID");
+        assert!(sddl.starts_with("D:P(A;;GA;;;SY)(A;;GA;;;S-1-"), "{sddl}");
+        assert!(!sddl.contains(";BA)") && !sddl.contains(";WD)"), "no group or everyone entries: {sddl}");
     }
 
     // #28: the owner of the bridge says so, and how long Chrome has been away.

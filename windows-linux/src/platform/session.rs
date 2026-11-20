@@ -327,6 +327,44 @@ impl Context {
     }
 }
 
+/// This process's user SID in string form (`S-1-5-21-…`), for the bridge
+/// pipes' access list. The same for this user's elevated, ordinary and
+/// low-integrity processes, unlike the token owner an elevated token names.
+pub fn user_sid_string() -> Option<String> {
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    let token = token_of(unsafe { GetCurrentProcess() })?;
+    let block = token_info(&token, TokenUser)?;
+    let mut text = PWSTR::null();
+    unsafe { ConvertSidToStringSidW(user_sid(&block), &mut text) }.ok()?;
+    let sid = unsafe { text.to_string() }.ok();
+    let _ = unsafe { LocalFree(Some(HLOCAL(text.0.cast()))) };
+    sid
+}
+
+/// How this process's token differs from an ordinary signed-in process, in
+/// words for the bridge owner record (#84): `elevated (as administrator)`,
+/// a sandbox, or `None` for an ordinary process.
+pub fn token_context() -> Option<String> {
+    let token = token_of(unsafe { GetCurrentProcess() })?;
+    let restricted = unsafe { IsTokenRestricted(token.0) }.is_ok();
+    context_words(integrity_rid(&token), restricted, is_app_container(&token))
+}
+
+fn context_words(integrity: Option<u32>, restricted: bool, app_container: bool) -> Option<String> {
+    if app_container {
+        return Some("in an AppContainer sandbox".into());
+    }
+    if restricted {
+        return Some("with a restricted (sandboxed) token".into());
+    }
+    match integrity {
+        Some(rid) if rid < MEDIUM_RID => Some(format!("at {} integrity (sandboxed)", integrity_name(rid))),
+        Some(rid) if rid >= 0x3000 => Some("elevated (as administrator)".into()),
+        _ => None,
+    }
+}
+
 /// One sentence for a tool result that came back empty or black, when this
 /// process's token or desktop explains it. Probed afresh each time: the input
 /// desktop changes when the screen locks or a UAC prompt opens.
@@ -369,6 +407,17 @@ mod tests {
         // Elevated is still the same user on the same desktop.
         let elevated = Context { integrity: Some(0x3000), ..ordinary() };
         assert!(elevated.desktop_problems().is_empty());
+    }
+
+    #[test]
+    fn the_bridge_owner_record_names_an_unusual_token() {
+        assert_eq!(context_words(Some(MEDIUM_RID), false, false), None);
+        assert_eq!(context_words(Some(0x3000), false, false).as_deref(), Some("elevated (as administrator)"));
+        assert!(context_words(Some(0x1000), false, false).unwrap().contains("low integrity"));
+        assert!(context_words(Some(MEDIUM_RID), true, false).unwrap().contains("restricted"));
+        assert!(context_words(Some(0x1000), false, true).unwrap().contains("AppContainer"));
+        // This test process is an ordinary one: its SID reads as a user SID.
+        assert!(user_sid_string().is_some_and(|sid| sid.starts_with("S-1-")));
     }
 
     #[test]

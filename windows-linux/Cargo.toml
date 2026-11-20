@@ -35,6 +35,8 @@ jpeg-encoder = { version = "0.7.1", features = ["simd"] }
 uiautomation = "0.25.1"
 # The LocalSystem service behind secure-desktop capture (secure_desktop.rs).
 windows-service = "0.8.1"
+# The bridge pipes' access list, as interprocess takes it (browser.rs, #84).
+widestring = "1.2.1"
 windows = { version = "0.62.2", features = [
   "Win32_Foundation",
   "Win32_UI_Input_KeyboardAndMouse",
