@@ -1233,6 +1233,7 @@ dependencies = [
  "serde",
  "serde_json",
  "uiautomation",
+ "widestring",
  "windows",
  "windows-service",
  "x11rb 0.14.0",
