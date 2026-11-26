@@ -1090,6 +1090,115 @@ func typeText(_ text: String, pid: pid_t) {
     synthesizeTypedText(text) { post($0, to: pid) }
 }
 
+/// What an accessibility insert did.
+enum AXInsert {
+    /// The field reads exactly as the insert should have left it.
+    case inserted
+    /// The field changed, but not to the text plus what was there (a
+    /// formatter, or the app rewrote it). The text went in: do not retype.
+    case changedDifferently
+    /// Not attempted, or the field is confirmed unchanged: keys may follow
+    /// without typing anything twice.
+    case notApplied
+    /// Sent, but the app did not confirm it (it did not answer in time, or
+    /// its value could not be read back). It may still land, so typing it
+    /// again could double it.
+    case unconfirmed(String)
+}
+
+/// Insert `text` at the caret of a native text field through accessibility,
+/// without lending the app keyboard focus. Keys need the focus loan, and
+/// while it lasts the person's own typing elsewhere is held (see
+/// UserKeyHold); this path never touches their keyboard. The text goes in
+/// literally: no smart-quote substitution or autocomplete that keys might
+/// set off, and the app's change notifications fire as for an edit.
+///
+/// Only for plain text into AppKit and SwiftUI fields and text views: web
+/// content and Electron (a page's scripts would not see the change; WebKit
+/// even reports success without changing the field), text with a line break
+/// or tab (a key there submits or moves focus, which an insert would not),
+/// and fields that will not say their contents (nothing to check against)
+/// all go through keys instead. Keys follow only when the field is confirmed
+/// unchanged, so nothing is typed twice.
+func insertTextWithoutFocus(_ text: String, into element: AXUIElement) -> AXInsert {
+    if envFlagDisabled("AX_TYPING") { return .notApplied }
+    // isNewline, not "\n"/"\r": Swift reads "\r\n" as one Character.
+    guard !text.isEmpty, !text.contains(where: { $0.isNewline || $0 == "\t" }) else { return .notApplied }
+    // A hung app would otherwise hold each call for the system's ~6 s.
+    AXUIElementSetMessagingTimeout(element, 1.5)
+    defer { AXUIElementSetMessagingTimeout(element, 0) }
+    // Search fields are AXTextField with a subrole.
+    let role = axString(element, kAXRoleAttribute as String) ?? ""
+    guard ["AXTextField", "AXTextArea", "AXComboBox"].contains(role),
+          axString(element, kAXSubroleAttribute as String) != "AXSecureTextField",
+          !isInWebContent(element)
+    else { return .notApplied }
+    // The field's text as it is, "" included (axString reads "" as nothing).
+    let value = { axCopy(element, kAXValueAttribute as String) as? String }
+    var settable: DarwinBoolean = false
+    guard AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute as CFString, &settable) == .success,
+          settable.boolValue,
+          let before = value(),
+          let rangeValue = axCopy(element, kAXSelectedTextRangeAttribute as String),
+          CFGetTypeID(rangeValue) == AXValueGetTypeID()
+    else { return .notApplied }
+    var range = CFRange()
+    guard AXValueGetValue(rangeValue as! AXValue, .cfRange, &range) else { return .notApplied }
+    let original = before as NSString
+    guard range.location >= 0, range.length >= 0, range.location + range.length <= original.length
+    else { return .notApplied }
+    let expected = original.replacingCharacters(in: NSRange(location: range.location, length: range.length), with: text)
+    let set = AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFString)
+    // A timed-out request is often still carried out once the app gets to it.
+    let timedOut = set == .cannotComplete
+    // Some fields apply the change a beat later; read back for up to ~0.5 s.
+    var read: String?
+    for attempt in 0..<10 {
+        if attempt > 0 { usleep(50_000) }
+        guard let after = value() else { continue }
+        read = after
+        if after == expected { break }
+        if after != before { break }
+        // An app that refused outright has changed nothing: stop early.
+        if set != .success && !timedOut { break }
+    }
+    guard let after = read else {
+        return .unconfirmed(timedOut ? "the app did not answer in time" : "its contents could not be read back")
+    }
+    if after == before {
+        // Unchanged. After a refusal, or a success the app ignored (WebKit
+        // does that), keys are safe; a timed-out request may still land.
+        return timedOut ? .unconfirmed("the app did not answer in time") : .notApplied
+    }
+    guard after == expected else { return .changedDifferently }
+    // Keys leave the caret after what they typed; make sure the insert did
+    // too, so the next call appends instead of landing before it or
+    // replacing a selection.
+    let caret = range.location + (text as NSString).length
+    var now = CFRange()
+    if let current = axCopy(element, kAXSelectedTextRangeAttribute as String),
+       CFGetTypeID(current) == AXValueGetTypeID(),
+       AXValueGetValue(current as! AXValue, .cfRange, &now),
+       now.location == caret, now.length == 0
+    {
+        return .inserted
+    }
+    var want = CFRange(location: caret, length: 0)
+    if let target = AXValueCreate(.cfRange, &want) {
+        AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, target)
+    }
+    return .inserted
+}
+
+/// The element that would take typed text in `pid`: its focused element,
+/// which an app keeps while it is in the background.
+func focusedTextTarget(pid: pid_t) -> AXUIElement? {
+    let app = AXUIElementCreateApplication(pid)
+    // A hung app would otherwise hold the call for the system's ~6 s.
+    AXUIElementSetMessagingTimeout(app, 1.5)
+    return axElement(app, kAXFocusedUIElementAttribute as String)
+}
+
 extension Array {
     func chunked(into size: Int) -> [[Element]] {
         stride(from: 0, to: count, by: size).map { Array(self[$0..<Swift.min($0 + size, count)]) }
@@ -1738,6 +1847,30 @@ func toolTypeText(_ args: [String: Any]) -> String {
         pid: pid, window: element.flatMap { axElement($0, kAXWindowAttribute as String) })
     {
         return "error: cannot type: \(refusal)"
+    }
+    // Without element_id the text goes to the app's focused element. A
+    // password field there is refused as one named by element_id is.
+    // Text found by OCR was clicked rather than focused, and accessibility
+    // focus need not follow such a click: keys go where the app's own focus
+    // is, so that path stays on keys.
+    let focused = element == nil && textPid == nil ? focusedTextTarget(pid: pid) : nil
+    if let focused, let refusal = refuseSecureFieldInput(focused, "the focused field") { return refusal }
+    // Native fields take the text through accessibility, which needs no
+    // keyboard focus: the person can keep typing in their own window.
+    if textPid == nil, let field = element ?? focused, pidOf(field) == pid {
+        let untouched = "accessibility insert, keyboard focus untouched"
+        switch insertTextWithoutFocus(text, into: field) {
+        case .inserted:
+            return "typed \(text.count) characters (\(untouched))"
+        case .changedDifferently:
+            return "typed \(text.count) characters (\(untouched)), but the field now reads differently from its "
+                + "old text plus these (a formatter or the app changed it) — check it with get_app_state"
+        case .unconfirmed(let why):
+            return "sent \(text.count) characters as an accessibility insert, but \(why), so it is not confirmed "
+                + "and was not typed again — check the field with get_app_state before retrying, which could type it twice"
+        case .notApplied:
+            break
+        }
     }
     withKeyboardFocus(pid: pid, window: element.flatMap { axElement($0, kAXWindowAttribute as String) },
                       keys: text.count) {
@@ -2746,7 +2879,10 @@ func toolDrag(_ args: [String: Any]) -> String {
 
 /// Refuse to write into a macOS password field unless explicitly allowed.
 ///
-/// `AXSecureTextField` is the role AppKit gives password inputs. Driving one
+/// Password inputs are `AXTextField` with the `AXSecureTextField` subrole
+/// (AppKit, SwiftUI and web pages alike); the role is checked too, for any
+/// app that reports it there. Checking the role alone matched none of them,
+/// so password fields took typed text. Driving one
 /// from an agent means a credential is being produced by a model and typed
 /// somewhere the user cannot see it echoed, and the transcript may keep it —
 /// so the default is to stop and let the human type it. Operator-style agents
@@ -2757,7 +2893,9 @@ func refuseSecureFieldInput(_ element: AXUIElement, _ id: String) -> String? {
     if Identity.current.tunable("ALLOW_SECURE_FIELD_INPUT") == "1" {
         return nil
     }
-    guard axString(element, kAXRoleAttribute as String) == "AXSecureTextField" else { return nil }
+    guard axString(element, kAXRoleAttribute as String) == "AXSecureTextField"
+        || axString(element, kAXSubroleAttribute as String) == "AXSecureTextField"
+    else { return nil }
 
     // Hand back rather than just refusing. Operator-class agents solve password
     // prompts by pausing and giving the human the keyboard — the credential is
