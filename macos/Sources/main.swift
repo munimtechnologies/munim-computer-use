@@ -5870,7 +5870,7 @@ func advertisedToolDefs() -> [[String: Any]] {
 
 // MARK: - Server identity
 
-let serverVersion = "0.14.2"
+let serverVersion = "0.15.0"
 /// Who this server is, as `initialize` and every modern result say it.
 let serverInfo: [String: Any] = [
     "name": "mt-desktop",
