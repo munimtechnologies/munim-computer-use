@@ -359,7 +359,7 @@ The desktop `press_key` and `type_text` go to whichever Chrome window is in fron
 
 ### Typing alongside the user
 
-The person at the computer can keep typing in their own windows while the agent types elsewhere. Browser tools never touch the OS keyboard. On the desktop, delivering keys or a click to a background app lends that app keyboard focus for the length of the action. On macOS, keys the person presses during that moment are held in a short-lived session event tap and replayed, in order, to their own window once it has focus again (set `MUNIM_COMPUTER_USE_HOLD_USER_KEYS=0` to turn this off). Windows holds and replays them the same way. A desktop `click` by `element_id` that has to use a position checks it with the app's own hit test first, and fails instead of clicking whatever else is there.
+The person at the computer can keep typing in their own windows while the agent types elsewhere. Browser tools never touch the OS keyboard. On macOS, `type_text` into a native text field or text view (AppKit or SwiftUI) inserts the text through accessibility, which needs no keyboard focus at all: nothing is lent, nothing of the person's is held, and the call reads the field back to confirm the text went in. The text goes in literally, without the smart quotes or autocomplete that keys could set off. Web content, Electron apps, terminals, text containing a line break or tab, and fields that refuse the insert still go as keys; keys follow only when the field is confirmed unchanged, so nothing is typed twice (`COMPUTER_USE_AX_TYPING=0` sends everything as keys). On the desktop, delivering keys or a click to a background app lends that app keyboard focus for the length of the action. On macOS, keys the person presses during that moment are held in a short-lived session event tap and replayed, in order, to their own window once it has focus again (set `MUNIM_COMPUTER_USE_HOLD_USER_KEYS=0` to turn this off). Windows holds and replays them the same way. A desktop `click` by `element_id` that has to use a position checks it with the app's own hit test first, and fails instead of clicking whatever else is there.
 
 ### Browser readiness and safe re-observation
 
@@ -520,6 +520,7 @@ Some agents run their commands in a sandbox: a restricted or low-integrity token
 | `COMPUTER_USE_AGENT_CURSOR_TASK_FADE_SECS` | How long the pointer stays after the last tool call (default 8) |
 | `COMPUTER_USE_ALLOW_SECURE_FIELD_INPUT=1`  | Allow typing into password fields (refused by default)          |
 | `COMPUTER_USE_REMOTE_CONTROL=1`            | Remote-desktop mode: input takes over the real pointer          |
+| `COMPUTER_USE_AX_TYPING=0`                 | macOS: type every `type_text` as keys, never as an accessibility insert |
 | `COMPUTER_USE_PARK_WINDOWS=0`              | macOS: do not move minimized or hidden windows to an invisible display to act on them |
 | `COMPUTER_USE_POLICY=<file>`               | Where to read the [app and site policy](#apps-and-sites-the-agent-may-use) (default `policy.json` in the support directory) |
 
