@@ -1455,16 +1455,26 @@ fn check_upload_paths(args: &Value) -> Result<(), String> {
 }
 
 /// What browser_upload_file left in the input: the files it holds, read back
-/// from the page, and whether the page saw them arrive. Staging is not
-/// sending, so the reply says the site has not received them. Worded as the
-/// macOS server words it.
+/// from the page, and whether the page saw them arrive. A page can act on its
+/// change event at once: sites that upload as soon as files are picked read
+/// them in the handler and then empty or replace the input, so an input that
+/// holds nothing afterwards is not a failed attach, and the reply never
+/// claims the site has not received them. Worded as the macOS server words it.
 fn describe_upload(tab: i64, result: &Value, args: &Value) -> String {
+    let names = |key: &str| -> Vec<&str> {
+        result
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|files| files.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default()
+    };
     let target = result.get("target").and_then(Value::as_str).unwrap_or("the file input");
-    let files: Vec<&str> = result
-        .get("files")
-        .and_then(Value::as_array)
-        .map(|files| files.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
+    let held = names("files");
+    let received = names("received");
+    let taken = result.get("taken").and_then(Value::as_str).filter(|_| !received.is_empty());
+    // What the page got: the files in its events when it took them away,
+    // otherwise what the input holds.
+    let files = if taken.is_some() { &received } else { &held };
     let sent = args.get("paths").and_then(Value::as_array).map_or(0, Vec::len);
     let mut line = format!(
         "attached {} file{} to {target} in tab {tab}",
@@ -1475,17 +1485,35 @@ fn describe_upload(tab: i64, result: &Value, args: &Value) -> String {
         line.push_str(&format!(": {}", files.join(", ")));
     }
     if files.len() != sent {
-        line.push_str(&format!(" — but {sent} were sent, so the input does not hold what was asked"));
+        line.push_str(&format!(" — but {sent} were sent, so the page did not get what was asked"));
     }
-    line.push_str(if result.pointer("/events/change").and_then(Value::as_bool) == Some(true) {
-        " — the page got its change event"
+    if let Some(taken) = taken {
+        line.push_str(if taken == "replaced" {
+            " — the page took them in its change event and then replaced the input with a new one"
+        } else {
+            " — the page took them in its change event and then emptied the input"
+        });
+        line.push_str(
+            ", as sites that upload as soon as files are picked do, so the upload has most likely started. \
+             No form was submitted. Do not attach them again: check the page for the upload's progress or result \
+             (a thumbnail, a file name, a link in the text) first.",
+        );
+        return line;
+    }
+    if result.pointer("/events/change").and_then(Value::as_bool) == Some(true) {
+        line.push_str(
+            " — the page got its change event. No form was submitted. The files are in the input, but a site \
+             that uploads as soon as files are picked may already be sending them, so check the page before \
+             attaching again. Submit the form or press the page's upload button yourself when that is wanted, \
+             then check the page.",
+        );
     } else {
-        " — the page got no change event, so it may not have noticed them"
-    });
-    line.push_str(
-        ". Nothing was submitted: the files are staged in the input, and the site has not received them. \
-         Submit the form or press the page's upload button yourself when that is wanted, then check the page.",
-    );
+        line.push_str(
+            " — the page got no change event, so it may not have noticed them. No form was submitted: the files \
+             are only staged in the input. Submit the form or press the page's upload button yourself when that \
+             is wanted, then check the page.",
+        );
+    }
     line
 }
 
@@ -2637,15 +2665,16 @@ mod tests {
         let text = describe(
             "upload_file",
             &json!({ "attached": true, "target": "[4] input[file] \"Attachments\"", "files": ["a.txt", "b.png"], "count": 2,
-                     "events": { "input": true, "change": true } }),
+                     "received": ["a.txt", "b.png"], "taken": null, "events": { "input": true, "change": true } }),
             &args,
         );
         assert!(
             text.starts_with("attached 2 files to [4] input[file] \"Attachments\" in tab 9: a.txt, b.png — the page got its change event."),
             "{text}"
         );
-        assert!(text.contains("Nothing was submitted"), "{text}");
-        assert!(text.contains("the site has not received them"), "{text}");
+        assert!(text.contains("No form was submitted"), "{text}");
+        assert!(text.contains("may already be sending them"), "{text}");
+        assert!(!text.contains("has not received"), "{text}");
         let quiet = describe(
             "upload_file",
             &json!({ "target": "[4] input[file]", "files": ["a.txt"], "events": { "input": false, "change": false } }),
@@ -2653,6 +2682,7 @@ mod tests {
         );
         assert!(quiet.starts_with("attached 1 file to [4] input[file] in tab 9: a.txt — but 2 were sent"), "{quiet}");
         assert!(quiet.contains("the page got no change event"), "{quiet}");
+        assert!(quiet.contains("only staged in the input"), "{quiet}");
         // return_state appends the page after the action, like every action.
         let with_state = describe(
             "upload_file",
@@ -2662,6 +2692,42 @@ mod tests {
             &args,
         );
         assert!(with_state.contains("page after the action"), "{with_state}");
+    }
+
+    #[test]
+    fn upload_to_a_page_that_takes_the_files_at_once_is_not_reported_as_failed() {
+        // #89: GitHub's comment box reads the files in its change handler,
+        // starts uploading them and empties the input.
+        let args = json!({ "tab_id": 9, "index": 4, "paths": ["C:\\a.png", "C:\\b.png"] });
+        let cleared = describe(
+            "upload_file",
+            &json!({ "target": "[4] input[file]", "files": [], "count": 0, "received": ["a.png", "b.png"], "taken": "cleared",
+                     "events": { "input": true, "change": true } }),
+            &args,
+        );
+        assert!(
+            cleared.starts_with("attached 2 files to [4] input[file] in tab 9: a.png, b.png — the page took them in its change event and then emptied the input"),
+            "{cleared}"
+        );
+        assert!(!cleared.contains("were sent"), "{cleared}");
+        assert!(!cleared.contains("has not received"), "{cleared}");
+        assert!(cleared.contains("upload has most likely started"), "{cleared}");
+        assert!(cleared.contains("Do not attach them again"), "{cleared}");
+        let replaced = describe(
+            "upload_file",
+            &json!({ "target": "[4] input[file]", "files": [], "received": ["a.png", "b.png"], "taken": "replaced",
+                     "events": { "change": true } }),
+            &args,
+        );
+        assert!(replaced.contains("then replaced the input with a new one"), "{replaced}");
+        // An extension too old to report what the page received keeps the
+        // plain count.
+        let old = describe(
+            "upload_file",
+            &json!({ "target": "[4] input[file]", "files": [], "events": { "change": true } }),
+            &args,
+        );
+        assert!(old.starts_with("attached 0 files to [4] input[file] in tab 9 — but 2 were sent"), "{old}");
     }
 
     #[test]
