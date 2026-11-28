@@ -352,9 +352,60 @@ test("cleanup closes the agent's tabs and releases the user's", async () => {
   assert.ok(tabs.has(userTab.id));
 });
 
-test("release_tab points agent-created tabs at close_tab", async () => {
-  const own = await call("open_tab", { url: "https://example.org" });
-  assert.match(await refuses("release_tab", { tabId: own.tabId }), /close it with close_tab/);
+// #93: a tab the agent opened can be handed to the user, and then no
+// cleanup closes it, not even the one its MCP server runs on exit.
+test("release_tab hands a tab the agent opened to the user, out of the group and safe from cleanup", async () => {
+  const own = await call("open_tab", { url: "https://example.org", clientId: "handoff-proc", sessionId: "h1" });
+  assert.notEqual(tabs.get(own.tabId).groupId, -1);
+  const released = await call("release_tab", { tabId: own.tabId, clientId: "handoff-proc", sessionId: "h1" });
+  assert.equal(released.released, own.tabId);
+  assert.equal(released.handedOff, true);
+  assert.equal(tabs.get(own.tabId).groupId, -1, "it leaves the agent's group");
+  assert.ok(executed.some((call) => call.tabId === own.tabId && call.fn === "restoreFavicon"));
+  await call("close_client_tabs", { clientId: "handoff-proc" });
+  assert.ok(tabs.has(own.tabId), "the server's exit cleanup left the handed-off tab open");
+  assert.ok(!removed.includes(own.tabId));
+  // It is the user's now: an agent can take it over again like any user tab.
+  const again = await call("use_tab", { tabId: own.tabId, clientId: "handoff-proc2" });
+  assert.equal(again.adopted, true);
+  await call("release_tab", { tabId: own.tabId, clientId: "handoff-proc2" });
+  await chrome.tabs.remove(own.tabId);
+});
+
+test("a tab closed by a server's exit cleanup says so when it is used or listed", async () => {
+  const tab = await call("open_tab", { url: "https://lms.example/quiz", clientId: "mcp-1764300000000000000-4242", sessionId: "quiz" });
+  tabs.get(tab.tabId).title = "Quiz attempt";
+  await call("close_client_tabs", { clientId: "mcp-1764300000000000000-4242" });
+  assert.ok(!tabs.has(tab.tabId));
+  const error = await refuses("snapshot", { tabId: tab.tabId, clientId: "mcp-1764300000000000000-4242", sessionId: "quiz" });
+  assert.match(error, new RegExp(`tab ${tab.tabId} is not one of this agent's tabs — it was closed by the cleanup of MCP server pid 4242, session_id "quiz", which ran when that MCP server exited`));
+  assert.match(error, /browser_release_tab/);
+  const listed = await call("list_tabs", { all: true, clientId: "someone-new" });
+  const entry = listed.recentlyClosed.find((closed) => closed.tabId === tab.tabId);
+  assert.equal(entry.reason, "server_exit");
+  assert.equal(entry.title, "Quiz attempt");
+  assert.equal(entry.url, "https://lms.example/quiz");
+  assert.match(entry.description, /MCP server pid 4242/);
+});
+
+test("closures by close_tab, close_all_tabs and the user are each told apart", async () => {
+  const one = await call("open_tab", { url: "https://one.example", sessionId: "why" });
+  await call("close_tab", { tabId: one.tabId, sessionId: "why" });
+  assert.match(await refuses("snapshot", { tabId: one.tabId, sessionId: "why" }), /closed by browser_close_tab from MCP client .*session_id "why"/);
+  const two = await call("open_tab", { url: "https://two.example", sessionId: "why" });
+  await call("close_all_tabs", { sessionId: "why" });
+  assert.match(await refuses("snapshot", { tabId: two.tabId, sessionId: "why" }), /closed by browser_close_all_tabs/);
+  const three = await call("open_tab", { url: "https://three.example", sessionId: "why" });
+  // The user closes it: Chrome removes it and fires onRemoved.
+  tabs.delete(three.tabId);
+  tabRemovedListener(three.tabId);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.match(await refuses("snapshot", { tabId: three.tabId, sessionId: "why" }), /closed outside the agent \(by the user, by the page itself, or by Chrome\)/);
+  // Each closure is logged once.
+  const listed = await call("list_tabs", { sessionId: "why" });
+  for (const id of [one.tabId, two.tabId, three.tabId]) {
+    assert.equal(listed.recentlyClosed.filter((closed) => closed.tabId === id).length, 1, `tab ${id}`);
+  }
 });
 
 // ── concurrent tasks ────────────────────────────────────────────────────────
