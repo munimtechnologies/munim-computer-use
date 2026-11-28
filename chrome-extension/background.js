@@ -3587,19 +3587,36 @@ const UPLOAD_TARGET_JS = (index) => `(() => {
 
 /// Called on the input (`this`): what it is, and a watch for the input and
 /// change events Chrome fires when its files are set, so the reply can say
-/// whether the page saw them.
+/// whether the page saw them. The watch also notes the files the input held
+/// when each event fired: sites that upload as soon as files are picked
+/// (GitHub's comment box) read them in their handler and then empty or
+/// replace the input, so what it holds afterwards is not what the page got.
+/// It listens on the window in the capture phase, ahead of the page's own
+/// handlers, so it sees the files before a handler takes them away.
 function fileInputInfoInPage() {
   const el = this;
   const target = el.__cuUploadTarget || { via: "input", label: "" };
   delete el.__cuUploadTarget;
   el.__cuUploadSeen?.done();
-  const seen = { input: false, change: false };
-  const listener = (e) => { if (e.target === el) seen[e.type] = true; };
-  el.addEventListener("input", listener, true);
-  el.addEventListener("change", listener, true);
+  const seen = { input: false, change: false, received: null };
+  const listener = (e) => {
+    if (e.target !== el) return;
+    seen[e.type] = true;
+    const names = Array.from(el.files || [], (file) => file.name);
+    if (seen.received === null || names.length > seen.received.length) seen.received = names;
+  };
+  // The input itself too: from inside a shadow root the window sees the
+  // event retargeted to the host.
+  const win = el.ownerDocument?.defaultView || window;
+  for (const node of [win, el]) {
+    node.addEventListener("input", listener, true);
+    node.addEventListener("change", listener, true);
+  }
   seen.done = () => {
-    el.removeEventListener("input", listener, true);
-    el.removeEventListener("change", listener, true);
+    for (const node of [win, el]) {
+      node.removeEventListener("input", listener, true);
+      node.removeEventListener("change", listener, true);
+    }
   };
   el.__cuUploadSeen = seen;
   return {
@@ -3612,7 +3629,9 @@ function fileInputInfoInPage() {
 }
 
 /// Called on the input after its files were set: what it holds now, read
-/// back from the input rather than assumed, and the events the page got.
+/// back from the input rather than assumed, the events the page got, the
+/// files it held when they fired, and whether the page has since taken the
+/// input out of the document (replaced it with a fresh one).
 function fileInputFilesInPage() {
   const el = this;
   const seen = el.__cuUploadSeen;
@@ -3622,6 +3641,8 @@ function fileInputFilesInPage() {
     names: Array.from(el.files || [], (file) => file.name),
     input: seen?.input === true,
     change: seen?.change === true,
+    received: Array.isArray(seen?.received) ? seen.received : [],
+    connected: el.isConnected,
   };
 }
 
@@ -3677,11 +3698,23 @@ async function uploadFiles(tabId, index, paths, access) {
     await send(tabId, "DOM.setFileInputFiles", { files: paths, objectId: handle.objectId }, session);
     const after = await call(fileInputFilesInPage);
     await markTab(tabId);
+    const files = after.names || [];
+    const received = Array.isArray(after.received) ? after.received : [];
+    // The page got files in its events and then emptied the input or swapped
+    // it for a new one: what sites that upload at once do. The files went to
+    // the page's handler, and an upload has likely started. A replaced input
+    // can still hold its files, out of the document where nothing reads them.
+    const taken = received.length === 0 ? null
+      : after.connected === false ? "replaced"
+      : received.length > files.length ? "cleared"
+      : null;
     return {
       attached: true,
       target,
-      files: after.names || [],
-      count: (after.names || []).length,
+      files,
+      count: files.length,
+      received,
+      taken,
       events: { input: after.input === true, change: after.change === true },
     };
   } finally {

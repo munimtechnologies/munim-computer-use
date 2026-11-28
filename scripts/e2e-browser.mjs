@@ -206,6 +206,8 @@ pages["/upload"] = `<title>Upload</title>
     <label for="photo" style="cursor:pointer;display:inline-block;padding:8px;border:1px solid #888">Choose photo</label>
     <input id="photo" type="file" name="photo" style="display:none">
     <button type="button" id="pick">Add document</button><input id="doc" type="file" name="doc" hidden aria-label="Document">
+    <label for="drop">Paste, drop, or click to add files</label><input id="drop" type="file" multiple>
+    <label for="swap">Add images</label><input id="swap" type="file" multiple>
     <button id="send">Send</button>
   </form>
   <p id="status">nothing yet</p>
@@ -221,6 +223,19 @@ pages["/upload"] = `<title>Upload</title>
       });
     }
     document.getElementById('pick').onclick = () => document.getElementById('doc').click();
+    // #89: inputs that upload as soon as files are picked, as GitHub's comment
+    // box does: read the files in the change handler, then empty the input,
+    // or swap it for a fresh one.
+    window.uploaded = [];
+    document.getElementById('drop').addEventListener('change', (e) => {
+      uploaded.push(...[...e.target.files].map((file) => file.name));
+      e.target.value = '';
+    });
+    document.getElementById('swap').addEventListener('change', (e) => {
+      uploaded.push(...[...e.target.files].map((file) => file.name));
+      const fresh = e.target.cloneNode();
+      e.target.replaceWith(fresh);
+    });
     document.getElementById('form').addEventListener('submit', () => { window.submitted = true; });
   </script>`;
 // Native selects, which Chrome draws outside the page, and a menu that opens
@@ -1058,8 +1073,9 @@ check("browser_upload_file stages one file; the page's change handler sees it an
   const wasActive = await uploadTabActive();
   const snapshot = await ok("browser_snapshot", { tab_id: uploadTab });
   const text = await ok("browser_upload_file", { tab_id: uploadTab, index: indexOf(snapshot, 'input\\[file\\] "Resume"'), paths: [cv] });
-  assert.match(text, /^attached 1 file to \[\d+\] input\[file\] "Resume" in tab \d+: cv\.txt — the page got its change event\. Nothing was submitted/, text);
-  assert.match(text, /the site has not received them/);
+  assert.match(text, /^attached 1 file to \[\d+\] input\[file\] "Resume" in tab \d+: cv\.txt — the page got its change event\. No form was submitted/, text);
+  assert.match(text, /may already be sending them, so check the page before attaching again/);
+  assert.doesNotMatch(text, /has not received/);
   assert.equal(await evaluateIn(atUpload, "document.getElementById('status').textContent"), "one: cv.txt (17 bytes)");
   assert.deepEqual(await pageChanges(), [["input", "one", true], ["change", "one", true, ["cv.txt"]]]);
   assert.deepEqual(await evaluateIn(atUpload, "[window.submitted, location.pathname]"), [false, "/upload"]);
@@ -1099,6 +1115,23 @@ check("a label for a hidden file input, and the hidden input itself, take files"
     ["input", "photo", true], ["change", "photo", true, ["first.txt"]],
     ["input", "doc", true], ["change", "doc", true, ["second.csv"]],
   ]);
+});
+
+check("a page that uploads in its change handler and empties the input is told apart from a failed attach (#89)", async () => {
+  const snapshot = await ok("browser_snapshot", { tab_id: uploadTab });
+  const text = await ok("browser_upload_file", {
+    tab_id: uploadTab, index: indexOf(snapshot, 'input\\[file\\] "Paste, drop, or click to add files"'), paths: [first, second],
+  });
+  assert.match(text, /^attached 2 files to \[\d+\] input\[file\] "Paste, drop, or click to add files" in tab \d+: first\.txt, second\.csv — the page took them in its change event and then emptied the input/, text);
+  assert.doesNotMatch(text, /were sent|has not received/);
+  assert.match(text, /Do not attach them again/);
+  assert.deepEqual(await evaluateIn(atUpload, "[document.getElementById('drop').files.length, window.uploaded]"), [0, ["first.txt", "second.csv"]]);
+  const swapSnapshot = await ok("browser_snapshot", { tab_id: uploadTab });
+  const swapped = await ok("browser_upload_file", {
+    tab_id: uploadTab, index: indexOf(swapSnapshot, 'input\\[file\\] "Add images"'), paths: [cv],
+  });
+  assert.match(swapped, /^attached 1 file to \[\d+\] input\[file\] "Add images" in tab \d+: cv\.txt — the page took them in its change event and then replaced the input with a new one/, swapped);
+  assert.deepEqual(await evaluateIn(atUpload, "[window.uploaded, window.submitted]"), [["first.txt", "second.csv", "cv.txt"], false]);
 });
 
 check("a missing file is refused before anything reaches the page", async () => {
