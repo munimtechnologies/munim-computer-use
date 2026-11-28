@@ -3702,9 +3702,11 @@ async function uploadFiles(tabId, index, paths, access) {
     const received = Array.isArray(after.received) ? after.received : [];
     // The page got files in its events and then emptied the input or swapped
     // it for a new one: what sites that upload at once do. The files went to
-    // the page's handler, and an upload has likely started.
-    const taken = received.length > files.length
-      ? (after.connected === false ? "replaced" : "cleared")
+    // the page's handler, and an upload has likely started. A replaced input
+    // can still hold its files, out of the document where nothing reads them.
+    const taken = received.length === 0 ? null
+      : after.connected === false ? "replaced"
+      : received.length > files.length ? "cleared"
       : null;
     return {
       attached: true,

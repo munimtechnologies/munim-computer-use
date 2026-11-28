@@ -1729,9 +1729,11 @@ test("upload_file tells a page that took the files and emptied or replaced the i
     assert.deepEqual(cleared.files, []);
     assert.deepEqual(cleared.received, ["one.png", "two.png"]);
     assert.equal(cleared.taken, "cleared");
-    playFileInput({ multiple: true, names: [], connected: false });
+    // A replaced input is out of the document, still holding its file.
+    playFileInput({ multiple: true, connected: false });
     const replaced = await callAndWait("upload_file", { tabId: tab, index: 3, paths: ["/a/one.png"], sessionId: "up5" });
     assert.equal(replaced.taken, "replaced");
+    assert.deepEqual(replaced.received, ["one.png"]);
     // An input that still holds what it got was not taken.
     playFileInput({ multiple: true });
     const kept = await callAndWait("upload_file", { tabId: tab, index: 3, paths: ["/a/one.png"], sessionId: "up5" });
