@@ -4167,18 +4167,41 @@ func toolBrowserUploadFile(_ args: [String: Any]) -> String {
 }
 
 /// What browser_upload_file left in the input: the files it holds, read back
-/// from the page, and whether the page saw them arrive. Staging is not
-/// sending, so the reply says the site has not received them.
+/// from the page, and whether the page saw them arrive. A page can act on its
+/// change event at once: sites that upload as soon as files are picked read
+/// them in the handler and then empty or replace the input, so an input that
+/// holds nothing afterwards is not a failed attach, and the reply never
+/// claims the site has not received them.
 func describeUpload(_ payload: [String: Any], tabId: Int, sent: Int) -> String {
     let target = payload["target"] as? String ?? "the file input"
-    let files = (payload["files"] as? [Any] ?? []).compactMap { $0 as? String }
+    let held = (payload["files"] as? [Any] ?? []).compactMap { $0 as? String }
+    let received = (payload["received"] as? [Any] ?? []).compactMap { $0 as? String }
+    let taken = received.isEmpty ? nil : payload["taken"] as? String
+    // What the page got: the files in its events when it took them away,
+    // otherwise what the input holds.
+    let files = taken != nil ? received : held
     var line = "attached \(files.count) file\(files.count == 1 ? "" : "s") to \(target) in tab \(tabId)"
     if !files.isEmpty { line += ": " + files.joined(separator: ", ") }
-    if files.count != sent { line += " — but \(sent) were sent, so the input does not hold what was asked" }
-    let change = (payload["events"] as? [String: Any])?["change"] as? Bool == true
-    line += change ? " — the page got its change event" : " — the page got no change event, so it may not have noticed them"
-    line += ". Nothing was submitted: the files are staged in the input, and the site has not received them. "
-        + "Submit the form or press the page's upload button yourself when that is wanted, then check the page."
+    if files.count != sent { line += " — but \(sent) were sent, so the page did not get what was asked" }
+    if let taken {
+        line += taken == "replaced"
+            ? " — the page took them in its change event and then replaced the input with a new one"
+            : " — the page took them in its change event and then emptied the input"
+        line += ", as sites that upload as soon as files are picked do, so the upload has most likely started. "
+            + "No form was submitted. Do not attach them again: check the page for the upload's progress or result "
+            + "(a thumbnail, a file name, a link in the text) first."
+        return line
+    }
+    if (payload["events"] as? [String: Any])?["change"] as? Bool == true {
+        line += " — the page got its change event. No form was submitted. The files are in the input, but a site "
+            + "that uploads as soon as files are picked may already be sending them, so check the page before "
+            + "attaching again. Submit the form or press the page's upload button yourself when that is wanted, "
+            + "then check the page."
+    } else {
+        line += " — the page got no change event, so it may not have noticed them. No form was submitted: the files "
+            + "are only staged in the input. Submit the form or press the page's upload button yourself when that "
+            + "is wanted, then check the page."
+    }
     return line
 }
 
@@ -5577,7 +5600,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "browser_upload_file",
-        "description": "Attach local files to a file input in one of the agent's tabs, by its browser_snapshot index, as if the user had picked them: Chrome sets the input's files and the page gets its usual input and change events. No file picker opens, the tab is not selected or raised, and no keyboard or mouse input is used. Snapshots list file inputs as input[file], including ones a page hides behind a styled upload button; the index of a label for one works too, and any other element is refused. Paths are absolute paths of regular files on the computer running Chrome and this server, which may not be the machine you run on; each is checked before anything is sent. Several paths need an input that takes several files (multiple). This only stages the files in the input: it never submits the form, and the site has not received them until the page shows it has. Submit or press the page's upload button yourself when the user wants that, then check the page. The reply names the files the input now holds. Never click a file input or its upload button to open the picker: the native dialog cannot be driven from here.",
+        "description": "Attach local files to a file input in one of the agent's tabs, by its browser_snapshot index, as if the user had picked them: Chrome sets the input's files and the page gets its usual input and change events. No file picker opens, the tab is not selected or raised, and no keyboard or mouse input is used. Snapshots list file inputs as input[file], including ones a page hides behind a styled upload button; the index of a label for one works too, and any other element is refused. Paths are absolute paths of regular files on the computer running Chrome and this server, which may not be the machine you run on; each is checked before anything is sent. Several paths need an input that takes several files (multiple). It never submits a form, but the page gets its change event, and many sites start uploading on it at once and then empty or replace the input; the reply names the files the page got and says when it took them that way. Check the page's own upload state before submitting or attaching again, so nothing is uploaded twice. Where the page waits for it, submit or press its upload button yourself when the user wants that, then check the page. Never click a file input or its upload button to open the picker: the native dialog cannot be driven from here.",
         "inputSchema": [
             "type": "object",
             "properties": [

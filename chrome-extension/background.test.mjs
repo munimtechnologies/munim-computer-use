@@ -1679,7 +1679,7 @@ test("hover moves a real pointer onto the element and presses nothing", async ()
 });
 
 /** A page with one file input at index 3, recording the DevTools calls an upload makes. */
-function playFileInput({ multiple = false, via = "input", label = "Attachments", names } = {}) {
+function playFileInput({ multiple = false, via = "input", label = "Attachments", names, received, connected = true } = {}) {
   const calls = [];
   pageEval = (method, params) => {
     calls.push([method, params]);
@@ -1692,7 +1692,8 @@ function playFileInput({ multiple = false, via = "input", label = "Attachments",
     if (method === "Runtime.callFunctionOn" && params.functionDeclaration.startsWith("function fileInputFilesInPage")) {
       const set = calls.find(([name]) => name === "DOM.setFileInputFiles");
       const files = names ?? (set ? set[1].files.map((file) => file.split("/").pop()) : []);
-      return { result: { value: { names: files, input: !!set, change: !!set } } };
+      const got = received ?? (set ? set[1].files.map((file) => file.split("/").pop()) : []);
+      return { result: { value: { names: files, input: !!set, change: !!set, received: got, connected } } };
     }
     return { result: { value: {} } };
   };
@@ -1717,6 +1718,28 @@ test("upload_file sets the files on the input by its handle and reads back what 
   } finally {
     pageEval = () => ({ result: { value: {} } });
     await call("close_all_tabs", { sessionId: "up1" });
+  }
+});
+
+test("upload_file tells a page that took the files and emptied or replaced the input from a failed attach (#89)", async () => {
+  const tab = (await call("open_tab", { url: "https://github.example/pull/1", sessionId: "up5" })).tabId;
+  try {
+    playFileInput({ multiple: true, names: [] });
+    const cleared = await callAndWait("upload_file", { tabId: tab, index: 3, paths: ["/a/one.png", "/a/two.png"], sessionId: "up5" });
+    assert.deepEqual(cleared.files, []);
+    assert.deepEqual(cleared.received, ["one.png", "two.png"]);
+    assert.equal(cleared.taken, "cleared");
+    playFileInput({ multiple: true, names: [], connected: false });
+    const replaced = await callAndWait("upload_file", { tabId: tab, index: 3, paths: ["/a/one.png"], sessionId: "up5" });
+    assert.equal(replaced.taken, "replaced");
+    // An input that still holds what it got was not taken.
+    playFileInput({ multiple: true });
+    const kept = await callAndWait("upload_file", { tabId: tab, index: 3, paths: ["/a/one.png"], sessionId: "up5" });
+    assert.equal(kept.taken, null);
+    assert.deepEqual(kept.files, ["one.png"]);
+  } finally {
+    pageEval = () => ({ result: { value: {} } });
+    await call("close_all_tabs", { sessionId: "up5" });
   }
 });
 
