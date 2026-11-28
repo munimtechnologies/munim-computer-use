@@ -188,8 +188,113 @@ async function restoreOwnedState() {
 }
 
 function ensureStateReady() {
-  if (!stateReady) stateReady = restoreOwnedState();
+  if (!stateReady) stateReady = restoreOwnedState().then(restoreClosedLog);
   return stateReady;
+}
+
+// ── closure provenance (#93) ────────────────────────────────────────────────
+//
+// An agent tab can go away in four ways: browser_close_tab, close_all_tabs,
+// the cleanup its MCP server runs when it exits or loses the bridge, or
+// something outside the agent (the user, the page, Chrome). Each closure of
+// an agent tab is logged with who closed it and why, so a tab that vanished
+// between turns is explained instead of guessed at. The log lives in session
+// storage, like ownership, so it survives the service worker sleeping.
+
+const CLOSED_LOG_KEY = "closedTabs";
+const CLOSED_LOG_LIMIT = 50;
+/** list_tabs shows closures from this long ago at most. */
+const CLOSED_SHOWN_MS = 60 * 60_000;
+/**
+ * @typedef {{ tabId: number, title: string, url: string, at: number, reason: string,
+ *   processId: string|null, sessionId: string|null }} ClosedTab
+ * @type {ClosedTab[]}
+ */
+let closedLog = [];
+
+async function restoreClosedLog() {
+  try {
+    const stored = await chrome.storage.session.get(CLOSED_LOG_KEY);
+    const entries = stored?.[CLOSED_LOG_KEY];
+    if (Array.isArray(entries)) closedLog = entries.filter((entry) => typeof entry?.tabId === "number");
+  } catch {
+    // No storage: the log starts empty.
+  }
+}
+
+/// Log that one of a client's tabs is being closed, and why. Called before
+/// the tab is removed, while its title and address can still be read.
+async function noteClosed(clientId, tabId, reason, tab = null) {
+  const state = clients.get(clientId);
+  let info = tab;
+  if (!info) info = await chrome.tabs.get(tabId).catch(() => null);
+  closedLog.push({
+    tabId,
+    title: String(info?.title || "").slice(0, 80),
+    url: String(info?.url || "").slice(0, 200),
+    at: Date.now(),
+    reason,
+    processId: state?.processId ?? clientId,
+    sessionId: state?.sessionId ?? null,
+  });
+  if (closedLog.length > CLOSED_LOG_LIMIT) closedLog = closedLog.slice(-CLOSED_LOG_LIMIT);
+  try {
+    await chrome.storage.session.set({ [CLOSED_LOG_KEY]: closedLog });
+  } catch {
+    // The log still holds it in memory.
+  }
+}
+
+/// `MCP server pid 4242, session_id "s1"`: the process id the servers send is
+/// `mcp-<nanos>-<pid>`, and an embedder's own id is named as it is.
+function closerName(entry) {
+  const pid = /^mcp-\d+-(\d+)$/.exec(String(entry.processId || ""))?.[1];
+  const server = pid ? `MCP server pid ${pid}` : `MCP client ${entry.processId || "unknown"}`;
+  return entry.sessionId ? `${server}, session_id "${entry.sessionId}"` : server;
+}
+
+function closedAgo(at) {
+  const seconds = Math.max(0, Math.round((Date.now() - at) / 1000));
+  if (seconds < 90) return `${seconds}s`;
+  if (seconds < 5400) return `${Math.round(seconds / 60)}m`;
+  return `${Math.round(seconds / 3600)}h`;
+}
+
+/// How one logged closure happened, in words.
+function describeClosed(entry) {
+  const who = closerName(entry);
+  const how = {
+    close_tab: `closed by browser_close_tab from ${who}`,
+    close_all_tabs: `closed by browser_close_all_tabs from ${who}`,
+    server_exit: `closed by the cleanup of ${who}, which ran when that MCP server exited or lost its link to ` +
+      "the browser bridge: a server's cleanup closes every tab it opened that was not handed to the user with " +
+      "browser_release_tab",
+    outside: `closed outside the agent (by the user, by the page itself, or by Chrome) while ${who} owned it`,
+  }[entry.reason] ?? `closed (${entry.reason}) while ${who} owned it`;
+  return `${how}, ${closedAgo(entry.at)} ago`;
+}
+
+/// Why a tab id names none of this agent's tabs: the closure, when one was logged.
+function notOwnedError(tabId) {
+  const entry = closedLog.findLast((logged) => logged.tabId === tabId);
+  const why = entry ? ` — it was ${describeClosed(entry)}` : "";
+  return new Error(`tab ${tabId} is not one of this agent's tabs${why}`);
+}
+
+/// The most recent closures, newest first, as list_tabs reports them.
+function recentClosures() {
+  const since = Date.now() - CLOSED_SHOWN_MS;
+  return closedLog
+    .filter((entry) => entry.at >= since)
+    .slice(-10)
+    .reverse()
+    .map((entry) => ({
+      tabId: entry.tabId,
+      title: entry.title,
+      url: entry.url,
+      reason: entry.reason,
+      description: describeClosed(entry),
+    }));
 }
 
 // ── native messaging ────────────────────────────────────────────────────────
@@ -457,7 +562,7 @@ async function listTabs(clientId, all = false) {
         attachable: isAttachable(tab.url),
       });
     }
-    return { groupId: state.groupId, tabs: out, clientId, scope: "all" };
+    return { groupId: state.groupId, tabs: out, clientId, scope: "all", recentlyClosed: recentClosures() };
   }
   // Snapshot first: the loop drops ids for tabs the user closed behind us.
   const known = Array.from(state.tabs);
@@ -476,7 +581,7 @@ async function listTabs(clientId, all = false) {
       forgetTab(clientId, tabId);
     }
   }
-  return { groupId: state.groupId, tabs: out, clientId, scope: "agent" };
+  return { groupId: state.groupId, tabs: out, clientId, scope: "agent", recentlyClosed: recentClosures() };
 }
 
 /// Chrome refuses a debugger attach on its own pages and on the Web Store, so
@@ -540,28 +645,34 @@ async function adoptTab(clientId, tabId) {
   };
 }
 
-/// Hand an adopted tab back to the user: detach the debugger, clear the agent
-/// cursor, restore the favicon we replaced. The tab itself is left alone.
+/// Hand one of the agent's tabs to the user: detach the debugger, clear the
+/// agent cursor, restore the favicon we replaced. An adopted tab goes back as
+/// it was. A tab the agent opened is handed off (#93): it leaves the agent's
+/// group and stays open where it is, the user's tab from now on, so no
+/// cleanup closes it, not even the one that runs when the MCP server exits.
 async function releaseTab(clientId, tabId) {
   const state = clientState(clientId);
-  if (!state.adopted.has(tabId)) {
-    if (state.tabs.has(tabId)) {
-      throw new Error(`tab ${tabId} was opened by the agent — close it with close_tab`);
-    }
-    throw new Error(`tab ${tabId} is not one of this agent's tabs`);
-  }
+  if (!state.tabs.has(tabId)) throw notOwnedError(tabId);
+  const handedOff = !state.adopted.has(tabId);
   await hideCursor(tabId);
   await detachTab(tabId);
   await unmarkTab(tabId);
+  if (handedOff) {
+    try {
+      await chrome.tabs.ungroup([tabId]);
+    } catch {
+      // Not in a group (a popup window), or already gone.
+    }
+  }
   forgetTab(clientId, tabId);
   if (state.tabs.size === 0 && state.groupId === null) clients.delete(clientId);
   await persistOwnedState();
-  return { released: tabId, clientId };
+  return { released: tabId, clientId, handedOff };
 }
 
 /// Close a captured set of one client's agent tabs. Only mutates that client's
 /// ownership so a peer MCP client's tabs survive.
-async function closeOwnedTabs(clientId, ids, expectedGroupId) {
+async function closeOwnedTabs(clientId, ids, expectedGroupId, reason = "close_all_tabs") {
   const state = clients.get(clientId);
   let released = 0;
   let closed = 0;
@@ -578,6 +689,7 @@ async function closeOwnedTabs(clientId, ids, expectedGroupId) {
       continue;
     }
     closed += 1;
+    await noteClosed(clientId, id, reason);
     if (state) state.tabs.delete(id);
     tabOwner.delete(id);
     attached.delete(id);
@@ -614,15 +726,13 @@ async function closeOwnedTabs(clientId, ids, expectedGroupId) {
   return { closed, released, clientId };
 }
 
-async function closeAllTabs(clientId) {
+async function closeAllTabs(clientId, reason = "close_all_tabs") {
   const state = clientState(clientId);
-  return closeOwnedTabs(clientId, Array.from(state.tabs), state.groupId);
+  return closeOwnedTabs(clientId, Array.from(state.tabs), state.groupId, reason);
 }
 
 function assertOwned(clientId, tabId) {
-  if (tabOwner.get(tabId) !== clientId) {
-    throw new Error(`tab ${tabId} is not one of this agent's tabs`);
-  }
+  if (tabOwner.get(tabId) !== clientId) throw notOwnedError(tabId);
 }
 
 // ── DevTools protocol ───────────────────────────────────────────────────────
@@ -4600,9 +4710,10 @@ const handlers = {
     // Closing a tab the user opened would destroy their work, so an adopted tab
     // is released instead. The reply says which happened.
     if (clientState(clientId).adopted.has(p.tabId)) return releaseTab(clientId, p.tabId);
-    await chrome.tabs.remove(p.tabId);
+    await noteClosed(clientId, p.tabId, "close_tab");
     forgetTab(clientId, p.tabId);
     await persistOwnedState();
+    await chrome.tabs.remove(p.tabId);
     return { closed: p.tabId };
   },
   navigate: async (p) => {
@@ -4733,7 +4844,7 @@ async function handleCommand(msg, replyPort) {
       const keys = new Set([...clients.keys(), ...commandQueues.keys()]);
       const owned = [...keys].filter((key) => key === processId ||
         clients.get(key)?.processId === processId);
-      const results = await Promise.all(owned.map((key) => enqueue(key, () => closeAllTabs(key))));
+      const results = await Promise.all(owned.map((key) => enqueue(key, () => closeAllTabs(key, "server_exit"))));
       return reply(replyPort, id, { closed: results.reduce((n, r) => n + r.closed, 0),
         released: results.reduce((n, r) => n + r.released, 0) });
     }
@@ -4786,6 +4897,12 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   forgetFrames(tabId);
   if (!tabOwner.has(tabId) && !attached.has(tabId)) return;
   const clientId = tabOwner.get(tabId);
+  // The agent's own closes forget the tab first, so an owned tab that goes
+  // here was closed by the user, the page or Chrome. Its title and address
+  // are gone with it. An adopted tab was the user's to close.
+  if (clientId && !clients.get(clientId)?.adopted.has(tabId)) {
+    void noteClosed(clientId, tabId, "outside", { title: "", url: "" });
+  }
   if (clientId) {
     const state = clients.get(clientId);
     state?.tabs.delete(tabId);

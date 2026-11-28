@@ -1318,7 +1318,15 @@ fn describe(command: &str, result: &Value, args: &Value) -> String {
                 .and_then(Value::as_i64)
                 .or_else(|| args.get("tab_id").and_then(Value::as_i64))
                 .unwrap_or(-1);
-            format!("released tab {tab} back to the user")
+            if result.get("handedOff").and_then(Value::as_bool) == Some(true) {
+                format!(
+                    "handed tab {tab} to the user: it left the agent's tab group and stays open as their tab, so no \
+                     cleanup closes it, including the one when this MCP server exits. browser_use_tab takes it over \
+                     again if needed"
+                )
+            } else {
+                format!("released tab {tab} back to the user")
+            }
         }
         "snapshot" => format!("{}{}", describe_readiness(result), describe_snapshot(result)),
         "read" => describe_read(result),
@@ -1788,6 +1796,30 @@ fn describe_credentials(result: &Value, args: &Value) -> String {
 }
 
 fn describe_tabs(result: &Value) -> String {
+    let mut text = describe_open_tabs(result);
+    // #93: which agent tabs went away lately, who closed each and why.
+    let closed = result.get("recentlyClosed").and_then(Value::as_array).cloned().unwrap_or_default();
+    if !closed.is_empty() {
+        text.push_str("\nagent tabs closed in the last hour (newest first):");
+        for entry in closed {
+            let title = entry.get("title").and_then(Value::as_str).unwrap_or("");
+            let url = entry.get("url").and_then(Value::as_str).unwrap_or("");
+            let page = match (title.is_empty(), url.is_empty()) {
+                (true, true) => String::new(),
+                (false, true) => format!("  {title}"),
+                (_, false) => format!("  {title}  [{url}]"),
+            };
+            text.push_str(&format!(
+                "\n  tab_id={}{page} — {}",
+                entry.get("tabId").and_then(Value::as_i64).unwrap_or(-1),
+                entry.get("description").and_then(Value::as_str).unwrap_or("closed")
+            ));
+        }
+    }
+    text
+}
+
+fn describe_open_tabs(result: &Value) -> String {
     let tabs = result.get("tabs").and_then(Value::as_array).cloned().unwrap_or_default();
     let every_tab = result.get("scope").and_then(Value::as_str) == Some("all");
     if tabs.is_empty() {
@@ -2503,6 +2535,39 @@ mod tests {
         }));
         assert!(rendered.starts_with("agent tab group"), "{rendered}");
         assert!(!rendered.contains("browser_use_tab"), "{rendered}");
+    }
+
+    // #93: a tab that vanished is explained by who closed it.
+    #[test]
+    fn tab_lists_name_recently_closed_agent_tabs_and_who_closed_them() {
+        let rendered = describe_tabs(&json!({
+            "scope": "agent",
+            "tabs": [],
+            "recentlyClosed": [
+                { "tabId": 12, "title": "Quiz attempt", "url": "https://lms.example/quiz", "reason": "server_exit",
+                  "description": "closed by the cleanup of MCP server pid 4242, which ran when that MCP server exited, 3m ago" },
+                { "tabId": 13, "title": "", "url": "", "reason": "outside",
+                  "description": "closed outside the agent (by the user, by the page itself, or by Chrome), 1m ago" }
+            ]
+        }));
+        assert!(rendered.starts_with("the agent has no tabs open yet"), "{rendered}");
+        assert!(rendered.contains("agent tabs closed in the last hour (newest first):"), "{rendered}");
+        assert!(
+            rendered.contains("  tab_id=12  Quiz attempt  [https://lms.example/quiz] — closed by the cleanup of MCP server pid 4242"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("  tab_id=13 — closed outside the agent"), "{rendered}");
+        assert!(!describe_tabs(&json!({ "tabs": [] })).contains("closed in the last hour"));
+    }
+
+    #[test]
+    fn releasing_a_tab_the_agent_opened_says_it_was_handed_off() {
+        let args = json!({ "tab_id": 7 });
+        let handed = describe("release_tab", &json!({ "released": 7, "handedOff": true }), &args);
+        assert!(handed.starts_with("handed tab 7 to the user"), "{handed}");
+        assert!(handed.contains("when this MCP server exits"), "{handed}");
+        let adopted = describe("release_tab", &json!({ "released": 7, "handedOff": false }), &args);
+        assert_eq!(adopted, "released tab 7 back to the user");
     }
 
     #[test]

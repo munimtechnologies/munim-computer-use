@@ -4309,12 +4309,33 @@ func toolBrowserReleaseTab(_ args: [String: Any]) -> String {
     guard BrowserBridge.shared.isConnected else {
         return "error: the MT Desktop MCP Chrome extension is not connected"
     }
-    return bridgeText(browserSessionCall("release_tab", ["tabId": tabId], args: args)) { _ in
-        "released tab \(tabId) back to the user"
+    return bridgeText(browserSessionCall("release_tab", ["tabId": tabId], args: args)) { payload in
+        if payload["handedOff"] as? Bool == true {
+            return "handed tab \(tabId) to the user: it left the agent's tab group and stays open as their tab, so no "
+                + "cleanup closes it, including the one when this MCP server exits. browser_use_tab takes it over "
+                + "again if needed"
+        }
+        return "released tab \(tabId) back to the user"
     }
 }
 
 func describeTabs(_ payload: [String: Any]) -> String {
+    var text = describeOpenTabs(payload)
+    // #93: which agent tabs went away lately, who closed each and why.
+    let closed = payload["recentlyClosed"] as? [[String: Any]] ?? []
+    if !closed.isEmpty {
+        text += "\nagent tabs closed in the last hour (newest first):"
+        for entry in closed {
+            let title = entry["title"] as? String ?? ""
+            let url = entry["url"] as? String ?? ""
+            let page = url.isEmpty ? (title.isEmpty ? "" : "  \(title)") : "  \(title)  [\(url)]"
+            text += "\n  tab_id=\(entry["tabId"] as? Int ?? -1)\(page) — \(entry["description"] as? String ?? "closed")"
+        }
+    }
+    return text
+}
+
+func describeOpenTabs(_ payload: [String: Any]) -> String {
     let tabs = payload["tabs"] as? [[String: Any]] ?? []
     let everyTab = (payload["scope"] as? String) == "all"
     if tabs.isEmpty {
@@ -5003,7 +5024,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "browser_open_tab",
-        "description": "Open a URL in a new background tab inside the agent's own labelled tab group in the user's signed-in Chrome, and return its tab_id for browser_snapshot, browser_click, browser_type and browser_navigate. The tab opens in the background, so the user's browsing is not interrupted. Use browser_use_tab instead when the user already has the page open and signed in. Requires the Computer Use Chrome extension; a limited fallback mode applies without it.",
+        "description": "Open a URL in a new background tab inside the agent's own labelled tab group in the user's signed-in Chrome, and return its tab_id for browser_snapshot, browser_click, browser_type and browser_navigate. The tab opens in the background, so the user's browsing is not interrupted. Use browser_use_tab instead when the user already has the page open and signed in. The agent's tabs close when this MCP server exits; hand one the user should keep to them with browser_release_tab. Requires the Computer Use Chrome extension; a limited fallback mode applies without it.",
         "inputSchema": [
             "type": "object",
             "properties": [
@@ -5029,7 +5050,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "browser_list_tabs",
-        "description": "List the tabs in the agent's own Chrome tab group, marking the active one, with the tab_id each other browser tool needs. Pass all=true to see every tab open in the browser, including the user's, so you can pick one to drive with browser_use_tab. Read-only.",
+        "description": "List the tabs in the agent's own Chrome tab group, marking the active one, with the tab_id each other browser tool needs. Pass all=true to see every tab open in the browser, including the user's, so you can pick one to drive with browser_use_tab. It also lists the agent tabs closed in the last hour, with who closed each one and why. Read-only.",
         "inputSchema": [
             "type": "object",
             "properties": [
@@ -5082,7 +5103,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "browser_release_tab",
-        "description": "Hand a tab taken over with browser_use_tab back to the user: the agent stops driving it and the page is left exactly as it is. Call it as soon as you are done with an adopted tab. Use browser_close_tab for tabs the agent opened itself.",
+        "description": "Hand one of the agent's tabs to the user. A tab taken over with browser_use_tab goes back as it was: the agent stops driving it and the page is left exactly as it is; call this as soon as you are done with it. A tab the agent opened is handed off: it leaves the agent's tab group and stays open where it is, as the user's tab, so no cleanup closes it — not browser_close_all_tabs, and not the cleanup that runs when this MCP server exits. Hand off a tab the user will keep working in (a form the agent filled in, a draft, a page they asked to see); the agent can take it over again later with browser_use_tab.",
         "inputSchema": [
             "type": "object",
             "properties": [
@@ -5808,7 +5829,7 @@ let toolDefs: [[String: Any]] = [
     ],
     [
         "name": "browser_close_all_tabs",
-        "description": "Close every tab the agent opened, including tabs its clicks opened, and remove its tab group. Tabs taken over with browser_use_tab are released back to the user, not closed. Call this when finished with the browser so no empty group is left in the user's tab strip. The MCP process also runs this automatically when the Computer Use session ends. Unsaved state in the agent's tabs is lost.",
+        "description": "Close every tab the agent opened, including tabs its clicks opened, and remove its tab group. Tabs taken over with browser_use_tab are released back to the user, not closed. Call this when finished with the browser so no empty group is left in the user's tab strip. The MCP process also runs this automatically when the Computer Use session ends, so hand a tab the user should keep to them with browser_release_tab first. Unsaved state in the agent's tabs is lost.",
         "inputSchema": [
             "type": "object",
             "properties": [
