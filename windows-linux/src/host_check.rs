@@ -209,6 +209,17 @@ pub fn check(identity: &Identity, extension_id: &str, launch: bool) -> Report {
     let ready = primary_ok && context_problems.is_empty() && extension_problem.is_none();
 
     let mut text = format!("extension: {origin} (pass --extension-id for another build)\n\n");
+    // A sandboxed, packaged or other-user process reads its own view of the
+    // registry and AppData, so a FAIL below can be that view only. Say so
+    // first, before anyone reinstalls a registration that is fine (#91).
+    if !context_problems.is_empty() {
+        text.push_str(&format!(
+            "NOTE  this check runs in a different security context from the signed-in user's Chrome: it {}. What \
+             it reads below is this process's view, so a missing key or manifest may only be missing from that \
+             view. Run check-native-host from the signed-in user's own terminal before reinstalling anything.\n\n",
+            context_problems.join("; and it ")
+        ));
+    }
     for finding in &findings {
         text.push_str(&format!(
             "{} · {}{}\n",
@@ -252,6 +263,10 @@ pub fn check(identity: &Identity, extension_id: &str, launch: bool) -> Report {
             .to_string()
     } else if primary_ok && let Some((said, step)) = &extension_problem {
         format!("\nnot ready — the host is fine, but: {said}. Next: {step}.\n")
+    } else if !context_problems.is_empty() {
+        "\nnot ready from this process's view — but it is not the signed-in user's Chrome context (see NOTE at the \
+         top), so run this again from that user's own terminal before fixing any FAIL above.\n"
+            .to_string()
     } else {
         "\nnot ready — fix the first FAIL or WARN above, then run this again.\n".to_string()
     });
