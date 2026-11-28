@@ -44,6 +44,14 @@ use crate::bridge_diag::{self, OwnerRecord};
 
 /// Timeout for extension replies; a stuck call must not wedge a turn.
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a call made while the bridge is starting up waits for the
+/// extension to connect before it is answered with the startup error (#91).
+const STARTUP_WAIT: Duration = Duration::from_secs(10);
+const STARTUP_GRACE: Duration = Duration::from_secs(bridge_diag::STARTUP_GRACE_SECS);
+/// Tabs survive a server restart, but the session that opened them does not.
+const TABS_AFTER_RESTART: &str = "If this server or the bridge owner restarted, tabs opened before it are still \
+     open but may no longer belong to this session: browser_list_tabs with all=true lists them, and \
+     browser_use_tab takes one back instead of opening the page again";
 
 fn new_browser_client_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -211,6 +219,9 @@ struct Hub {
     peer_endpoint: AtomicBool,
     /// Not yet joined: why the last attempt to reach the owner failed.
     join_error: Mutex<Option<String>>,
+    /// When this server started its owner election; never for a hub that
+    /// runs none (tests), which has no link to wait for.
+    started: Mutex<Option<Instant>>,
 }
 
 impl Hub {
@@ -225,7 +236,30 @@ impl Hub {
             host: Mutex::new(HostHistory::default()),
             peer_endpoint: AtomicBool::new(false),
             join_error: Mutex::new(None),
+            started: Mutex::new(None),
         })
+    }
+
+    /// Owner: how long ago it took the bridge, while Chrome has not connected
+    /// to it yet and it is recent enough that the extension's own retries
+    /// have not run out. Nothing is wrong in that window (#91).
+    fn starting_up(&self) -> Option<Duration> {
+        let since = (*lock(&self.owned_since))?.elapsed();
+        (since < STARTUP_GRACE && lock(&self.host).connections == 0).then_some(since)
+    }
+
+    /// A call that finds no link while this server is starting up waits a
+    /// little for one, so the first call after a restart does not fail on a
+    /// connection that is a few seconds away.
+    fn await_startup(&self) {
+        let fresh = if self.owns_bridge() {
+            self.starting_up().is_some()
+        } else {
+            lock(&self.started).is_some_and(|at| at.elapsed() < STARTUP_GRACE)
+        };
+        if fresh {
+            wait_until(STARTUP_WAIT, || self.connected());
+        }
     }
 
     fn connected(&self) -> bool {
@@ -244,6 +278,13 @@ impl Hub {
     }
 
     fn direct_call(&self, command: &str, params: Value, timeout: Duration) -> Result<Value, CallError> {
+        let mut timeout = timeout;
+        // A peer's call reaching an owner that only just took the bridge waits
+        // for Chrome, within the call's own time, so the peer's wait holds.
+        if lock(&self.extension).is_none() && self.starting_up().is_some() {
+            let waited = wait_until(STARTUP_WAIT.min(timeout / 2), || lock(&self.extension).is_some());
+            timeout = timeout.saturating_sub(waited);
+        }
         self.send(&self.extension, &self.pending, command, params, timeout, Link::NoHost)
     }
 
@@ -345,6 +386,19 @@ impl Hub {
         };
         let me = std::process::id();
         let (what, next) = match &link {
+            Link::NoHost if self.starting_up().is_some() => (
+                format!(
+                    "this MCP server (pid {me}) took the browser bridge {} ago, and Chrome's extension has not \
+                     connected to it yet",
+                    ago(self.starting_up().unwrap_or_default())
+                ),
+                format!(
+                    "this is expected right after a server starts or restarts: the extension reconnects on its own, \
+                     at the latest about a minute after the bridge changed hands. Wait 30 seconds and retry; \
+                     browser_list_tabs shows when it is back. Do not end processes or reload the extension for \
+                     this. If it still fails after a minute, {CHECK_HOST}. {TABS_AFTER_RESTART}. {DESKTOP_MEANWHILE}"
+                ),
+            ),
             Link::NoHost if self.owns_bridge() => {
                 let what = format!(
                     "this MCP server (pid {me}) owns the browser bridge, but Chrome's native host is not connected \
@@ -401,7 +455,20 @@ impl Hub {
                      server take over the bridge; otherwise reload the extension at chrome://extensions. \
                      {CHECK_HOST}. {DESKTOP_MEANWHILE}"
                 );
+                // The owner's record says when it took the bridge.
+                let owner_starting = pid.and_then(|pid| {
+                    bridge_diag::read_owner_record()
+                        .filter(|record| u64::from(record.pid) == pid)
+                        .and_then(|record| record.starting_up())
+                });
                 let next = match kind.as_str() {
+                    "no_host" if owner_starting.is_some() => format!(
+                        "{owner} took the bridge {} ago, and that is expected right after a server starts or \
+                         restarts: the extension reconnects to it on its own, at the latest about a minute after the \
+                         bridge changed hands. Wait 30 seconds and retry; do not end {owner} or reload the extension \
+                         for this. If it still fails after a minute: {stale} {TABS_AFTER_RESTART}",
+                        bridge_diag::ago_secs(owner_starting.unwrap_or_default())
+                    ),
                     "no_host" => match extension_problem() {
                         Some((said, step)) => format!("{said}, so {step}. Then: {stale}"),
                         None => stale,
@@ -467,6 +534,12 @@ impl Hub {
         let denied = why.contains("different security contexts");
         match &owner {
             Some(record) if denied => steps.push(denied_step(record)),
+            Some(record) if record.starting_up().is_some() => steps.push(format!(
+                "pid {} took the bridge {} ago, which is expected to settle on its own within a minute; retry in \
+                 30 seconds before ending anything",
+                record.pid,
+                bridge_diag::ago_secs(record.starting_up().unwrap_or_default())
+            )),
             Some(record) if !record.extension_connected => steps.push(format!(
                 "end pid {} if it is a stale or sandboxed server; this server then takes the bridge over",
                 record.pid
@@ -559,6 +632,15 @@ fn ago(elapsed: Duration) -> String {
         90..5400 => format!("{}m", seconds / 60),
         _ => format!("{}h", seconds / 3600),
     }
+}
+
+/// Poll `ready` until it holds or `limit` passes; how long that took.
+fn wait_until(limit: Duration, ready: impl Fn() -> bool) -> Duration {
+    let start = Instant::now();
+    while !ready() && start.elapsed() < limit {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    start.elapsed()
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -671,6 +753,9 @@ impl BrowserBridge {
         // anything reaches the extension.
         if command == "upload_file" {
             check_upload_paths(args)?;
+        }
+        if !self.connected() {
+            self.hub.await_startup();
         }
         if !self.connected() {
             return Err(self.hub.explain(command, args, CallError::Link(Link::NoHost)));
@@ -922,6 +1007,7 @@ pub(crate) fn connect_rpc() -> std::io::Result<Stream> {
 /// every MCP process gets the browser, each with its own tabs. When the owner
 /// exits its peers lose the RPC link and run the election again.
 fn run_bridge(hub: &Arc<Hub>) {
+    lock(&hub.started).get_or_insert_with(Instant::now);
     loop {
         if let Some((listener, _cleanup)) = bind_bridge() {
             *lock(&hub.owned_since) = Some(Instant::now());
@@ -2018,6 +2104,7 @@ pub fn run_native_host() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::{OwnerRecord, VERSION, bridge_diag};
     use super::{BrowserBridge, CallError, Hub, Link, call_timeout, denied_step, check_upload_paths, describe, describe_browser_screenshot, describe_snapshot, describe_tabs, drop_connection, normalise, route};
     use std::time::Instant;
     use serde_json::json;
@@ -2233,6 +2320,60 @@ mod tests {
         let error = hub.explain("open_tab", &json!({}), CallError::Link(Link::NoHost));
         assert!(error.contains("the last one disconnected 12s ago, after 2 connections"), "{error}");
         assert!(!error.contains("session_id"), "no session, no session note: {error}");
+    }
+
+    // #91: just after taking the bridge, a missing extension is expected, and
+    // the reply says to wait, not to end processes or reload the extension.
+    #[test]
+    fn a_fresh_owner_without_a_native_host_says_to_wait_not_to_end_anything() {
+        let hub = Hub::new();
+        *super::lock(&hub.owned_since) = Some(Instant::now() - Duration::from_secs(14));
+        let error = hub.explain("snapshot", &json!({}), CallError::Link(Link::NoHost));
+        assert!(error.contains("took the browser bridge 14s ago, and Chrome's extension has not connected"), "{error}");
+        assert!(error.contains("Wait 30 seconds and retry"), "{error}");
+        assert!(error.contains("Do not end processes or reload the extension"), "{error}");
+        assert!(error.contains("browser_list_tabs with all=true") && error.contains("browser_use_tab"), "{error}");
+        // Once Chrome has connected, a later loss is not startup any more.
+        super::lock(&hub.host).connections = 1;
+        assert!(hub.starting_up().is_none());
+        // Nor is an owner past the grace period.
+        super::lock(&hub.host).connections = 0;
+        *super::lock(&hub.owned_since) = Some(Instant::now() - Duration::from_secs(300));
+        assert!(hub.starting_up().is_none());
+    }
+
+    #[test]
+    fn a_peer_call_to_a_fresh_owner_waits_for_chrome_within_its_own_time() {
+        let hub = Hub::new();
+        *super::lock(&hub.owned_since) = Some(Instant::now());
+        let started = Instant::now();
+        let error = hub.direct_call("snapshot", json!({}), Duration::from_secs(2)).unwrap_err();
+        let waited = started.elapsed();
+        assert!(matches!(error, CallError::Link(Link::NoHost)));
+        assert!(waited >= Duration::from_millis(900) && waited < Duration::from_secs(3), "{waited:?}");
+        // A settled owner answers at once.
+        *super::lock(&hub.owned_since) = Some(Instant::now() - Duration::from_secs(300));
+        let started = Instant::now();
+        let _ = hub.direct_call("snapshot", json!({}), Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn an_owner_record_is_starting_up_only_while_fresh_and_unconnected() {
+        let record = |age: u64, connected: bool, connections: u32| OwnerRecord {
+            pid: 1,
+            version: VERSION.into(),
+            exe: String::new(),
+            started_unix: bridge_diag::unix_now() - age,
+            extension_connected: connected,
+            host_connections: connections,
+            peer_endpoint: true,
+            context: String::new(),
+        };
+        assert_eq!(record(14, false, 0).starting_up(), Some(14));
+        assert_eq!(record(300, false, 0).starting_up(), None);
+        assert_eq!(record(14, true, 1).starting_up(), None);
+        assert_eq!(record(14, false, 2).starting_up(), None);
     }
 
     // #28: the reported case — a peer whose owner has no extension connection.

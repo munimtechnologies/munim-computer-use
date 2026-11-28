@@ -78,6 +78,15 @@ impl OwnerRecord {
         version_at_least(&self.version, (0, 14, 2))
     }
 
+    /// Seconds since this owner took the bridge, while it is new enough that
+    /// the extension may simply not have reconnected to it yet (#91).
+    pub fn starting_up(&self) -> Option<u64> {
+        if self.extension_connected || self.host_connections > 0 || self.started_unix == 0 {
+            return None;
+        }
+        unix_now().checked_sub(self.started_unix).filter(|&seconds| seconds < STARTUP_GRACE_SECS)
+    }
+
     /// Whether the extension is connected to this owner, in words.
     pub fn extension_state(&self) -> String {
         match (self.extension_connected, self.host_connections) {
@@ -116,6 +125,11 @@ pub fn this_context() -> String {
         })
         .clone()
 }
+
+/// How long after a server takes the bridge a missing extension connection is
+/// expected rather than a fault: the extension retries a few times at once,
+/// then on a one-minute alarm, so it can take up to a minute to arrive (#91).
+pub const STARTUP_GRACE_SECS: u64 = 75;
 
 pub fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|elapsed| elapsed.as_secs()).unwrap_or(0)
